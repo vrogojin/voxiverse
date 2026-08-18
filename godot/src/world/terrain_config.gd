@@ -550,6 +550,14 @@ static func material_tables() -> Dictionary:
 		"struct_post": BlockCatalog.id_of(&"dark_oak_log"),
 		"struct_roof": BlockCatalog.id_of(&"dark_oak_log"),
 		"struct_window": BlockCatalog.id_of(&"glass"),
+		# COSMOS STRUCTURES P1b FIX (§12.4 alias trap): the low moon biome id (moon_biome_id(0) = 11 when
+		# FP_BIOME_SPACE_FIX is off, 21 when on). The C++ resolve_cell_core mirror airs biomes [lo, lo+2]
+		# above the surface, matching resolve_cell's is_moon_biome/_moon_cell interception — so a climate
+		# savanna/jungle column (B_SAVANNA=11 / B_JUNGLE=12, which alias the moon ids with the fix off)
+		# renders open air, NOT an Earth-terrain house, exactly as the GDScript oracle does. Single home so
+		# the near-gen + far tile-bake gens can never drift from moon_biome_id. Pure passthrough of an
+		# existing const — the GDScript oracle's own resolve/claim behaviour is unchanged.
+		"moon_biome_lo": moon_biome_id(0),
 		"strata_seq": PackedInt32Array(_STRATA_SEQ),
 		"band_seq": PackedInt32Array(_BAND_SEQ),
 		"ore_stone": PackedInt32Array(_ORE_STONE),

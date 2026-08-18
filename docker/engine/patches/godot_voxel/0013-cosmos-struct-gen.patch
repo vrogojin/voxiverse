@@ -37,10 +37,10 @@ index 35e125a..5c13009 100644
  
  // Ore distribution tables (terrain_config.gd:273-281). Constants, so mirrored directly.
 diff --git a/generators/cosmos/voxel_generator_cosmos.cpp b/generators/cosmos/voxel_generator_cosmos.cpp
-index 36600c1..3e849a7 100644
+index 36600c1..59e6f36 100644
 --- a/generators/cosmos/voxel_generator_cosmos.cpp
 +++ b/generators/cosmos/voxel_generator_cosmos.cpp
-@@ -158,6 +158,19 @@ bool VoxelGeneratorCosmos::setup(Dictionary config) {
+@@ -158,6 +158,23 @@ bool VoxelGeneratorCosmos::setup(Dictionary config) {
  	p.climate_biomes = bool(config.get("climate_biomes", false));
  	p.skin_block_exact = bool(config.get("skin_block_exact", false));
  
@@ -56,11 +56,15 @@ index 36600c1..3e849a7 100644
 +	p.struct_post = int(config.get("struct_post", 0));
 +	p.struct_roof = int(config.get("struct_roof", 0));
 +	p.struct_window = int(config.get("struct_window", 0));
++	// COSMOS STRUCTURES P1b FIX: TerrainConfig.moon_biome_id(0) (11 when FP_BIOME_SPACE_FIX is off, 21 when
++	// on). resolve_cell_core airs biomes [lo, lo+2] above the surface, mirroring GDScript resolve_cell's
++	// is_moon_biome/_moon_cell interception. Legacy sentinel -100 (key absent) never matches a real biome.
++	p.moon_biome_lo = int(config.get("moon_biome_lo", -100));
 +
  	p.facet_frame = PackedFloat64Array(config.get("facet_frame", PackedFloat64Array()));
  	p.facet_off = get_i32_param(config, "facet_off");
  	p.facet_r_blocks = double(config.get("facet_r_blocks", 0.0));
-@@ -1491,6 +1504,263 @@ Vector4i VoxelGeneratorCosmos::slope_run_targets(int r, int g) {
+@@ -1491,6 +1508,263 @@ Vector4i VoxelGeneratorCosmos::slope_run_targets(int r, int g) {
  			((r >> 12) & 15) - 4 + g);
  }
  
@@ -324,7 +328,28 @@ index 36600c1..3e849a7 100644
  // --- THE cell resolver -------------------------------------------------------------------------
  // Port of TerrainConfig.resolve_cell (the worker path: slope_run passed in, pcache non-null).
  int64_t VoxelGeneratorCosmos::resolve_cell_core(
-@@ -1541,6 +1811,15 @@ int64_t VoxelGeneratorCosmos::resolve_cell_core(
+@@ -1509,6 +1783,20 @@ int64_t VoxelGeneratorCosmos::resolve_cell_core(
+ 	if (biome == B_PILLAR) {
+ 		return y <= g ? p.id_bedrock : ID_AIR;
+ 	}
++	// COSMOS STRUCTURES P1b FIX (docs/COSMOS-STRUCTURES-DESIGN.md §12.4 alias trap): the Moon aliases biome
++	// ids 11/12/13 onto Earth's B_SAVANNA=11 / B_JUNGLE=12 whenever FP_BIOME_SPACE_FIX is OFF (moon_biome_id
++	// = 11+slot). GDScript resolve_cell intercepts such columns FIRST -> _moon_cell (terrain_config.gd:1365),
++	// which is AIRLESS above the surface (returns AIR for y > g). This C++ core previously had NO moon branch,
++	// so on a climate savanna/jungle column it kept rendering Earth terrain AND (once struct_gen shipped) the
++	// village claim -- so a house rendered where the GDScript oracle renders open air. That is the whole
++	// FP_CLIMATE_BIOMES-on G-SG-CPP village divergence (and the same root as the pre-existing claim<0 terrain
++	// delta). Mirror the oracle: on a moon-aliased biome, air above the surface, BEFORE slope / struct claim /
++	// cap. `moon_biome_lo` is StructureGen's moon_biome_id(0) crossed in from material_tables (11 fix-off / 21
++	// fix-on); the legacy sentinel -100 (config key absent) never matches a real biome, so an old pck stays
++	// byte-identical. y <= g is left to the shared Earth strata (the out-of-scope pre-existing terrain delta).
++	if (biome >= p.moon_biome_lo && biome <= p.moon_biome_lo + 2 && y > g) {
++		return ID_AIR;
++	}
+ 
+ 	// SHARP-SLOPE. slope_run is always >= 0 here (worker path hoists it); < 0 would mean recompute,
+ 	// which the emit loop never asks for.
+@@ -1541,6 +1829,15 @@ int64_t VoxelGeneratorCosmos::resolve_cell_core(
  			return with_snow_state(p, fid, with_shore_liquid(p, cc_pack(smat, smod, 0, 0), y, t), g, t);
  		}
  		if (y >= hi) {
@@ -340,7 +365,7 @@ index 36600c1..3e849a7 100644
  			if (y <= SEA_LEVEL) {
  				return sea_block(p, t, y);
  			}
-@@ -1555,6 +1834,16 @@ int64_t VoxelGeneratorCosmos::resolve_cell_core(
+@@ -1555,6 +1852,16 @@ int64_t VoxelGeneratorCosmos::resolve_cell_core(
  	}
  
  	if (y > g) {
@@ -357,7 +382,7 @@ index 36600c1..3e849a7 100644
  		if (y == g + 1) {
  			const int64_t cap = surface_cap(p, fid, x, z, g, biome, t);
  			if (cap != ID_AIR) {
-@@ -1852,7 +2141,12 @@ VoxelGenerator::Result VoxelGeneratorCosmos::generate_block(VoxelQueryData input
+@@ -1852,7 +2159,12 @@ VoxelGenerator::Result VoxelGeneratorCosmos::generate_block(VoxelQueryData input
  	const int oz = input.origin_in_voxels.z;
  	const unsigned int ch = VoxelBuffer::CHANNEL_TYPE;
  	const int sea = SEA_LEVEL;
@@ -372,7 +397,7 @@ index 36600c1..3e849a7 100644
  
  	// Cheap constant all-air early-outs (no noise).
 diff --git a/generators/cosmos/voxel_generator_cosmos.h b/generators/cosmos/voxel_generator_cosmos.h
-index 438cefd..3752c29 100644
+index 438cefd..29bbda0 100644
 --- a/generators/cosmos/voxel_generator_cosmos.h
 +++ b/generators/cosmos/voxel_generator_cosmos.h
 @@ -233,6 +233,15 @@ private:
@@ -413,7 +438,7 @@ index 438cefd..3752c29 100644
  	static Vector4 corner_targets(const Parameters &p, int fid, int x, int z);
  	static bool slope_fires_only(const Parameters &p, int fid, int x, int z, int g);
  	static int slope_run_pack(const Vector4i &tw, int g);
-@@ -431,6 +455,21 @@ private:
+@@ -431,6 +455,26 @@ private:
  		bool climate_biomes = false;
  		bool skin_block_exact = false;
  
@@ -431,6 +456,11 @@ index 438cefd..3752c29 100644
 +		int struct_post = 0;       // dark_oak_log
 +		int struct_roof = 0;       // dark_oak_log
 +		int struct_window = 0;     // glass
++		// COSMOS STRUCTURES P1b FIX: TerrainConfig.moon_biome_id(0). resolve_cell_core airs biomes
++		// [lo, lo+2] above the surface, mirroring GDScript resolve_cell's is_moon_biome/_moon_cell
++		// interception (the Moon aliases 11/12/13 onto Earth savanna/jungle when FP_BIOME_SPACE_FIX is off).
++		// Sentinel -100 (config key absent) never matches a real biome => byte-identical legacy.
++		int moon_biome_lo = -100;
 +
  		// COSMOS FACETED: the facet atlas as FROZEN NUMBERS, never as topology logic. `facet_frame` is
  		// FacetAtlas._frame (12 doubles per facet: origin, du, dv, dw) and `facet_off` is

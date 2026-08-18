@@ -67,6 +67,10 @@ var _player_abs_max: float = 0.0
 var _grav_sync_accum := 0.0           # throttle for the per-facet gravity resync (fixed-frame only, §10 decision 2)
 var _far: FarTerrain                  # far-distance analytic heightmap layer (LOD-DESIGN); null when disabled
 var _facet_ring: FacetFarRing         # COSMOS FACETED §5.2: the planet rendered around the active facet (faceted mode)
+var _obj_registry: ObjectRegistry = null   # COSMOS-OBJECT-LOD P1 (FP_OBJ_LOD_DEBRIS): live physical-object index; null off
+var _far_objects: FacetFarObjects = null   # COSMOS-OBJECT-LOD P1: the far-object DOT+CARD tier; null off (byte-identical)
+var _dev_space_obj: DevSpaceObject = null  # COSMOS-OBJECT-LOD P3 (FP_OBJ_LOD_SPACE): the dev CLASS_SPACE test object; null off
+var _dev_space_spawned := false            # one-shot latch — the dev object spawns on the first frame the player pos is known
 var _skin: Node3D = null              # COSMOS SEAMLESS-SCALES C3: the heightfield skin tier; null unless FP_SKIN_TIER
 var _facet_tex: FacetTexBaker = null  # COSMOS LOD-TEXTURE Phase 1: per-facet baked far texture; null unless FP_FACET_TEX
 # COSMOS-BACKGROUND-PREBAKE (FP_BG_PREBAKE): last update_streaming call's Time.get_ticks_usec(), for the
@@ -466,6 +470,17 @@ func _ready() -> void:
 		# module_world) the smooth-residency query so its want loop defers coarse M2 megablocks under a resident
 		# smooth tile — mirrors the block-LOD ladder's own set_smooth_query wiring (below). module_world stores it and
 		# re-forwards on each pool-reset rebuild. Only wired under the flag ⇒ the Callable stays unset off (byte-identical).
+		if CubeSphere.FP_OBJ_LOD_DEBRIS:
+			# COSMOS-OBJECT-LOD P1 (docs/COSMOS-OBJECT-LOD-DESIGN.md, FP_OBJ_LOD_DEBRIS): the object registry + far-object
+			# tier (DOT + CARD MultiMeshes childed to this ring so they inherit its frame/scale). The registry is fed by
+			# VoxelBody _enter_tree/_exit_tree (register_far_object); the tier is ticked each frame from _process. Off ⇒
+			# neither is constructed (byte-identical; the VoxelBody hook stays inert, register_far_object is a no-op).
+			_obj_registry = ObjectRegistry.new()
+			_far_objects = FacetFarObjects.new()
+			_far_objects.setup(_facet_ring, _obj_registry, ObjectLod.budget_bytes(1, 0.0, OS.get_processor_count()))
+			for c in get_children():
+				if c is VoxelBody:
+					_obj_registry.register(c)   # catch any debris already in the tree before setup ran
 		if CubeSphere.FP_M2_SMOOTH_DEFER and _module_world != null and _module_world.has_method("set_smooth_query"):
 			_module_world.call("set_smooth_query", Callable(_facet_ring, "is_smooth_resident"))
 		# COSMOS BLOCK-LOD P1 (docs/COSMOS-BLOCK-LOD-DESIGN.md §4): the L1 (2-block-pitch) megablock rim ring — real
@@ -845,6 +860,20 @@ func _process(delta: float) -> void:
 	# dirtied cluster re-floods once the removal burst settles). Cheap no-op when nothing is dirty; null off (byte-off).
 	if _structure_tracker != null:
 		_structure_tracker.tick(Time.get_ticks_msec())
+	# COSMOS-OBJECT-LOD P1 (docs/COSMOS-OBJECT-LOD-DESIGN.md, FP_OBJ_LOD_DEBRIS): tick the far-object tier each frame off
+	# the LIVE Camera3D (its fov + the device viewport height give K_px, zoom-aware). Mirrors how the far-tree tier is
+	# fed the live camera each frame (main.gd:332). Dirty-gated inside step() (dormant snapshot / awake-only rewrite), so
+	# a still scene costs one camera fetch + a rev/motion scan. Null off ⇒ never runs (byte-identical).
+	if _far_objects != null:
+		var _cam := get_viewport().get_camera_3d() if get_viewport() != null else null
+		if _cam != null:
+			# COSMOS-OBJECT-LOD P3 (FP_OBJ_LOD_SPACE): spawn the dev CLASS_SPACE object once the player pos is known, and
+			# feed the tier this frame's planet occluder (render centre + voxel radius, same world frame as the camera) so
+			# a beacon behind the planet is dropped (must-fix #4). OFF ⇒ neither runs (no dev object, no occluder) ⇒ byte-off.
+			if CubeSphere.FP_OBJ_LOD_SPACE:
+				_maybe_spawn_dev_space_object(_cam)
+				_far_objects.set_occluders([{"center": planet_render_centre(), "radius": FacetAtlas.R_BLOCKS}])
+			_far_objects.step(_cam, get_viewport().get_visible_rect().size.y)
 	# COSMOS-PERF UNATTENDED R3: also skip the main-thread snow step while the ORBITAL near field is frozen (composes
 	# with FP_SNOW_SKIP_AIRBORNE — either predicate suppresses the step; no snow accumulates visibly from orbit).
 	# FP_LOAD_DEFER (docs/COSMOS-FAST-LOAD-DESIGN.md §2.3): a third suppressor — skip the ~20-25 ms/frame snow step while
@@ -1743,6 +1772,58 @@ func placed_cells_window() -> Dictionary:
 ## (PERF): an unedited column's overlay is empty, so the collider skips its per-cell scan there.
 func is_edited_column(x: int, z: int) -> bool:
 	return _edit_columns.has(Vector2i(x, z))
+
+# --- COSMOS-OBJECT-LOD P1 (FP_OBJ_LOD_DEBRIS) registry hooks -------------------
+# Called by VoxelBody._enter_tree / _exit_tree (both gated on the flag). No-op when the registry doesn't exist
+# (flag off, or non-faceted with no ring), so the VoxelBody hook stays inert ⇒ byte-identical off.
+
+# --- COSMOS-OBJECT-LOD P3 (FP_OBJ_LOD_SPACE) dev test object ------------------
+# Spawn ONE CLASS_SPACE test object (DevSpaceObject) radially +2500 blocks above the player's spawn point so the P3
+# beacon ladder is live-verifiable. One-shot, deferred to the first frame the player position is known. Only reached
+# under FP_OBJ_LOD_SPACE (gated at the call site) ⇒ never spawned / registered with the flag off (byte-identical).
+const DEV_SPACE_ALT := 2500.0   # radial altitude above the player spawn (blocks)
+
+func _maybe_spawn_dev_space_object(cam: Camera3D) -> void:
+	if _dev_space_spawned or cam == null or _far_objects == null or _obj_registry == null:
+		return
+	_dev_space_spawned = true
+	# FRAME FIX (2026-08-18): the anchor + centre + spawn MUST all be in the SAME scene-global frame the tier + the
+	# DevSpaceObject's own mesh render in. `_last_player_pos` is the player's LATTICE pose (player.gd feeds
+	# update_streaming(position) — lattice), while planet_render_centre() is the render/scene frame — subtracting them
+	# gave a garbage `up` and placed the object thousands of blocks off the rendered scene (invisible everywhere). The
+	# CAMERA's global_transform.origin is the rendered player/eye in scene-global, the SAME frame as render_centre and
+	# VoxelBody.global_transform — so radial up = (cam_pos − render_centre) is correct and the object sits straight up.
+	var anchor := cam.global_transform.origin                  # scene-global: the rendered player/eye
+	var centre := planet_render_centre()                       # scene-global: the rendered planet centre
+	var up := anchor - centre
+	if up.length() < 0.001:
+		up = cam.global_transform.basis.y                      # degenerate fallback: the camera's own up (≈ radial on-surface)
+	up = up.normalized()
+	var spawn_pos := anchor + up * DEV_SPACE_ALT
+	_dev_space_obj = DevSpaceObject.new()
+	_dev_space_obj.name = "DevSpaceObject"
+	# FRAME FIX 2 (2026-08-18): a CLASS_SPACE object sits at a FIXED planet-absolute location and must RIDE the planet's
+	# render transform — else, when the player ascends and the floating origin recenters the camera to ~origin (scaled/
+	# orbit regime), a world_manager-parented object stays at its absolute coords and reads d=|c| (~8878) instead of the
+	# true ~700 (diagnosed live: cam→(1,-1,-1), d=8878). Parent it under the FacetFarRing (which folds T_active + the
+	# floating-origin anchor + SN3 scale, exactly like the planet + the debris tier), then set global_position so its
+	# ring-LOCAL pose is captured — it now tracks the planet at every altitude. Falls back to self if there's no ring.
+	if _facet_ring != null:
+		_facet_ring.add_child(_dev_space_obj)
+	else:
+		add_child(_dev_space_obj)
+	_dev_space_obj.global_position = spawn_pos                  # after reparent ⇒ local = ring⁻¹·spawn_pos (rides the ring)
+	_obj_registry.register(_dev_space_obj, ObjectLod.CLASS_SPACE)
+	print("  [FP_OBJ_LOD_SPACE] DevSpaceObject spawned at scene ", spawn_pos,
+		"  (cam ", anchor, " + radial_up*", DEV_SPACE_ALT, ")  |centre-dist| ", spawn_pos.distance_to(centre))
+
+func register_far_object(node: Object) -> void:
+	if _obj_registry != null:
+		_obj_registry.register(node)
+
+func unregister_far_object(node: Object) -> void:
+	if _obj_registry != null:
+		_obj_registry.unregister(node)
 
 # --- loose-body gate (PERF, GroundCollider exploration-jerkiness fix) ----------
 # The ground collider exists ONLY to catch loose VoxelBodies; the player moves analytically and

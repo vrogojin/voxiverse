@@ -94,6 +94,19 @@ var _settle_timer := 0.0          # s of continuous calm accumulated (reset by a
 var _coarse_timer := 0.0          # s of continuous coarse-calm (anti-livelock escape)
 var _active_age := 0.0            # s this body has been active (TREE-PHYS BOUND hard-freeze deadline)
 
+# COSMOS-OBJECT-LOD P1 (docs/COSMOS-OBJECT-LOD-DESIGN.md, FP_OBJ_LOD_DEBRIS). The far-render object-LOD hook — INERT
+# unless the world's ObjectRegistry owns this body (register happens in _enter_tree under the flag; every field below
+# is written/read only under CubeSphere.FP_OBJ_LOD_DEBRIS, so OFF is byte-identical). `_obj_rev` is bumped by every
+# _rebuild() so the tier can detect a mesh re-creation and RE-APPLY its L0 hide (must-fix #1: _rebuild() queue_frees
+# the MeshInstance3D and recreates it visible=true). `_far_hidden` is the last visibility the tier requested; the tier
+# owns re-application on rev change (this body does NOT self-reapply in _rebuild — faithful to the design). `_obj_extent`
+# / `_obj_local_center` cache the cell-AABB dimension (blocks) + local centre so the tier reads them O(1) (recomputed in
+# _rebuild, since break_cell/add_cell change the cluster).
+var _obj_rev := 0
+var _far_hidden := false
+var _obj_extent := 0.0
+var _obj_local_center := Vector3.ZERO
+
 # Shared, no-bounce, medium-friction physics material for dynamic pieces. Built
 # once and reused (RigidBody3D shares it freely — it is immutable here).
 static var _dyn_phys_mat: PhysicsMaterial
@@ -407,6 +420,66 @@ func wake() -> void:
 func is_awake() -> bool:
 	return not freeze and not sleeping
 
+# --- COSMOS-OBJECT-LOD P1 (FP_OBJ_LOD_DEBRIS) far-render hook ------------------------------------------------------
+# Every method below is either flag-gated or read-only metadata the tier consults; none alter shipped behaviour, so
+# with FP_OBJ_LOD_DEBRIS off the body is never registered and none of this is ever called (byte-identical).
+
+## Register/unregister with the world's ObjectRegistry at scene entry/exit — the single choke point covering BOTH
+## spawn paths (spawn_loose and _spawn_detached both set `world` then add_child ⇒ _enter_tree fires with world live).
+## Gated so OFF ⇒ no registry traffic at all. (Chosen over spawn_loose-only so break-detached canopy pieces — the very
+## debris the tier renders — are covered too; see the report.)
+func _enter_tree() -> void:
+	if CubeSphere.FP_OBJ_LOD_DEBRIS and world != null and world.has_method("register_far_object"):
+		world.register_far_object(self)
+
+func _exit_tree() -> void:
+	if CubeSphere.FP_OBJ_LOD_DEBRIS and world != null and world.has_method("unregister_far_object"):
+		world.unregister_far_object(self)
+
+## The tier hides/shows this body's render MeshInstance3D children (its L0 mesh) while a far card/dot stands in for it.
+## Latched into `_far_hidden` so the tier's rev-change re-application (must-fix #1) re-hides after a _rebuild().
+func set_far_hidden(hidden: bool) -> void:
+	_far_hidden = hidden
+	_apply_far_hidden()
+
+func _apply_far_hidden() -> void:
+	for child in get_children():
+		if child is MeshInstance3D:
+			(child as MeshInstance3D).visible = not _far_hidden
+
+## The rev the tier watches to know the mesh was re-created visible (and re-apply its hide). Bumped only in _rebuild().
+func obj_rev() -> int:
+	return _obj_rev
+
+## Object bounding extent (largest cell-AABB dimension, blocks) — the ObjectLod `extent` (r = extent/2). Cached in
+## _rebuild so it tracks break_cell/add_cell.
+func obj_extent() -> float:
+	return _obj_extent
+
+## The cluster's centre in planet-absolute (global) space — the tier maps this through the far-ring parent inverse.
+func obj_world_center() -> Vector3:
+	return global_transform * _obj_local_center
+
+## P1 objects are all CLASS_DEBRIS (dither-fade below 0.5 px). CLASS_SPACE ships/stations are P3.
+func obj_class() -> int:
+	return ObjectLod.CLASS_DEBRIS
+
+## Recompute the cached cell-AABB extent + local centre from `cells` (called by _rebuild under the flag). Empty ⇒ 0.
+func _obj_lod_recompute() -> void:
+	_obj_rev += 1
+	if cells.is_empty():
+		_obj_extent = 0.0
+		_obj_local_center = Vector3.ZERO
+		return
+	var lo := Vector3(INF, INF, INF)
+	var hi := Vector3(-INF, -INF, -INF)
+	for c: Vector3i in cells.keys():
+		lo = lo.min(Vector3(c))
+		hi = hi.max(Vector3(c) + Vector3.ONE)   # cell c occupies the unit cube [c, c+1]
+	var span := hi - lo
+	_obj_extent = maxf(span.x, maxf(span.y, span.z))
+	_obj_local_center = (lo + hi) * 0.5
+
 ## Enable per-frame settle logic ONLY for a dynamic (dropping) ground body; wood, a frozen
 ## (dormant) ground body, and a pristine cluster do ZERO per-frame script work.
 ## COSMOS-TREE-BUGS CHOP-LAG (FP_CHOP_DEBRIS_CALM): under the flag, an ACTIVE (not frozen — wood never
@@ -700,6 +773,12 @@ func _rebuild() -> void:
 	_apply_dynamic_props()      # damping / friction / ccd for dynamic pieces
 	_is_wood = _has_wood()      # cache once (avoids a per-frame cell scan in the settle loop)
 	_refresh_dormancy()         # dormant bodies run NO _physics_process
+	# COSMOS-OBJECT-LOD P1 (FP_OBJ_LOD_DEBRIS): _rebuild queue_freed the old MeshInstance3D and just re-created it
+	# visible=true, so any latched far-hide is now undone. Bump the rev (the tier watches it to re-apply the hide,
+	# must-fix #1) and refresh the cached extent/centre from the new cluster. This body does NOT self-reapply the hide
+	# (the tier owns re-application — see set_far_hidden). Off ⇒ never called (byte-identical).
+	if CubeSphere.FP_OBJ_LOD_DEBRIS:
+		_obj_lod_recompute()
 
 ## Lazily begin (once) and return the SurfaceTool for material `id`.
 func _tool_for_body(tools: Dictionary, id: int) -> SurfaceTool:

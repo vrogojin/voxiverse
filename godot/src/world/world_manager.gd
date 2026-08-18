@@ -1802,8 +1802,17 @@ func _maybe_spawn_dev_space_object(cam: Camera3D) -> void:
 	var spawn_pos := anchor + up * DEV_SPACE_ALT
 	_dev_space_obj = DevSpaceObject.new()
 	_dev_space_obj.name = "DevSpaceObject"
-	add_child(_dev_space_obj)
-	_dev_space_obj.global_position = spawn_pos
+	# FRAME FIX 2 (2026-08-18): a CLASS_SPACE object sits at a FIXED planet-absolute location and must RIDE the planet's
+	# render transform — else, when the player ascends and the floating origin recenters the camera to ~origin (scaled/
+	# orbit regime), a world_manager-parented object stays at its absolute coords and reads d=|c| (~8878) instead of the
+	# true ~700 (diagnosed live: cam→(1,-1,-1), d=8878). Parent it under the FacetFarRing (which folds T_active + the
+	# floating-origin anchor + SN3 scale, exactly like the planet + the debris tier), then set global_position so its
+	# ring-LOCAL pose is captured — it now tracks the planet at every altitude. Falls back to self if there's no ring.
+	if _facet_ring != null:
+		_facet_ring.add_child(_dev_space_obj)
+	else:
+		add_child(_dev_space_obj)
+	_dev_space_obj.global_position = spawn_pos                  # after reparent ⇒ local = ring⁻¹·spawn_pos (rides the ring)
 	_obj_registry.register(_dev_space_obj, ObjectLod.CLASS_SPACE)
 	print("  [FP_OBJ_LOD_SPACE] DevSpaceObject spawned at scene ", spawn_pos,
 		"  (cam ", anchor, " + radial_up*", DEV_SPACE_ALT, ")  |centre-dist| ", spawn_pos.distance_to(centre))

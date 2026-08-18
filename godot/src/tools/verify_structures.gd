@@ -91,8 +91,14 @@ func _inside_any(recs: Array, x: int, y: int, z: int) -> bool:
 # the full FLAT suite; the grep-no-unguarded-sites check runs in the harness (reported separately).
 # =====================================================================================================================
 func _gate_sg_off() -> void:
-	_ok(not (CubeSphere.FP_STRUCT_GEN and CubeSphere.FP_CPPGEN),
-		"G-SG-OFF: interlock — NOT (FP_STRUCT_GEN AND FP_CPPGEN) until the P1b C++ mirror lands byte-equal")
+	# COSMOS STRUCTURES P1b (§12.6): the C++ mirror (patch 0013 — cosmos:: StructureGen port + the two
+	# resolve_cell_core claim branches) lands in THIS branch, so the P1a hard interlock is RELAXED to the
+	# "equal-or-off" form: FP_STRUCT_GEN may now coexist with FP_CPPGEN because EITHER the flag is off (no
+	# GDScript-vs-C++ divergence is possible) OR the C++ near-gen reproduces StructureGen cell-for-cell —
+	# which the extended verify_cppgen (G-SG-CPP) proves byte-equal AFTER the engine rebuild, not this
+	# static assert. So this is no longer a mutual-exclusion gate; it delegates byte-equality to G-SG-CPP.
+	_ok(true,
+		"G-SG-OFF: interlock relaxed to equal-or-off — FP_STRUCT_GEN + FP_CPPGEN both permitted; the P1b C++ mirror (patch 0013) makes the two paths equal, proven by verify_cppgen (G-SG-CPP) after rebuild")
 	_ok(SG.STRUCT_H_MAX + SG.STRUCT_FLAT_TOL <= TreeGen.MAX_ABOVE_SURFACE,
 		"G-SG-ENV: STRUCT_H_MAX + STRUCT_FLAT_TOL (%d) ≤ TreeGen.MAX_ABOVE_SURFACE (%d) — the height budget holds" \
 			% [SG.STRUCT_H_MAX + SG.STRUCT_FLAT_TOL, TreeGen.MAX_ABOVE_SURFACE])

@@ -536,6 +536,20 @@ static func material_tables() -> Dictionary:
 		"id_acacia_log": BlockCatalog.id_of(&"acacia_log"), "id_acacia_leaf": BlockCatalog.id_of(&"acacia_leaves"),
 		"id_jungle_log": BlockCatalog.id_of(&"jungle_log"), "id_jungle_leaf": BlockCatalog.id_of(&"jungle_leaves"),
 		"id_cactus": BlockCatalog.id_of(&"cactus"),
+		# COSMOS STRUCTURES P1b (docs/COSMOS-STRUCTURES-DESIGN.md §12.6): the C++ village-generator mirror keys (patch
+		# 0013). struct_gen mirrors FP_STRUCT_GEN; struct_earth_facets = 6·K² is the body gate (Earth-only villages);
+		# the six ids are the frozen house materials resolved EXACTLY as StructureGen.warm_up does (stone foundation +
+		# floor, wood walls, dark_oak_log corner posts + roof, glass windows). Default-off ⇒ the C++ claim never runs ⇒
+		# byte-identical legacy (the 0011 "not supplied ⇒ legacy" sentinel discipline). Single home ⇒ near-gen + far
+		# tile-bake gens agree by construction.
+		"struct_gen": CubeSphere.FP_STRUCT_GEN,
+		"struct_earth_facets": FacetAtlas.facet_count(),
+		"struct_foundation": BlockCatalog.id_of(&"stone"),
+		"struct_floor": BlockCatalog.id_of(&"stone"),
+		"struct_wall": BlockCatalog.id_of(&"wood"),
+		"struct_post": BlockCatalog.id_of(&"dark_oak_log"),
+		"struct_roof": BlockCatalog.id_of(&"dark_oak_log"),
+		"struct_window": BlockCatalog.id_of(&"glass"),
 		"strata_seq": PackedInt32Array(_STRATA_SEQ),
 		"band_seq": PackedInt32Array(_BAND_SEQ),
 		"ore_stone": PackedInt32Array(_ORE_STONE),

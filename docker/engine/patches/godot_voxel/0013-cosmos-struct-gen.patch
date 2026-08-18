@@ -1,0 +1,437 @@
+diff --git a/generators/cosmos/cosmos_terrain.h b/generators/cosmos/cosmos_terrain.h
+index 35e125a..5c13009 100644
+--- a/generators/cosmos/cosmos_terrain.h
++++ b/generators/cosmos/cosmos_terrain.h
+@@ -130,6 +130,33 @@ constexpr int CACTUS_MIN = 1;
+ constexpr int CACTUS_MAX = 3;
+ constexpr double CACTUS_DENSITY = 0.3;
+ 
++// COSMOS STRUCTURES P1b (docs/COSMOS-STRUCTURES-DESIGN.md §12.4/§12.6) -- the procedural VILLAGE generator
++// constants + salts, a VERBATIM mirror of structure_gen.gd (StructureGen). Its _hash01 is a verbatim copy of
++// TreeGen._hash01, so the port reuses cosmos::tree_hash01 with these salts and inherits ZERO new transcription
++// traps. Salts 201-209 are disjoint from TreeGen's 11-125 and TerrainConfig's 101-105 / 7xx.
++constexpr int STRUCT_V = 192;            // village lattice pitch (columns)
++constexpr int STRUCT_HCELL = 32;         // house sub-lattice pitch inside a live village
++constexpr int STRUCT_HPV = 6;            // STRUCT_V / STRUCT_HCELL -- house sub-cells per axis in a village
++constexpr int STRUCT_FOOT_MAX = 11;      // footprint <= 11x11; jitter in [2, HCELL-dim-2] keeps it inside its H-cell
++constexpr int STRUCT_FOOT_MIN = 5;       // smallest footprint dimension
++constexpr double VILLAGE_CHANCE = 0.05;  // salt 201 gate on the (vx, vz) village cell
++constexpr double HOUSE_CHANCE = 0.55;    // salt 202 gate per (hx, hz) sub-cell inside a live village
++constexpr int STRUCT_H_MAX = 11;         // §12.2 tallest cell over base: walls <= 4 + roof <= 7
++constexpr int STRUCT_FLAT_TOL = 3;       // §12.2/§12.4 footprint-corner flatness gate (max-min column_top)
++constexpr int FOUNDATION_MAX = 4;        // cobble skirt filled below the floor
++constexpr int WALL_MIN = 3;              // wall course count in [3, 4]
++constexpr int WALL_MAX = 4;
++// StructureGen salt registry (structure_gen.gd:38-46). StructureGen OWNS 201-209.
++constexpr int SALT_VILLAGE = 201;        // village-cell gate
++constexpr int SALT_HOUSE = 202;          // per-house gate
++constexpr int SALT_JITX = 203;           // footprint x jitter
++constexpr int SALT_JITZ = 204;           // footprint z jitter
++constexpr int SALT_W = 205;              // footprint width
++constexpr int SALT_D = 206;              // footprint depth
++constexpr int SALT_WALLH = 207;          // wall-course count
++constexpr int SALT_DOOR = 208;           // door side (0..3)
++constexpr int SALT_ROOF = 209;           // roof type + material pick
++
+ constexpr int WORLD_BOTTOM_Y_C = WORLD_BOTTOM_Y;
+ 
+ // Ore distribution tables (terrain_config.gd:273-281). Constants, so mirrored directly.
+diff --git a/generators/cosmos/voxel_generator_cosmos.cpp b/generators/cosmos/voxel_generator_cosmos.cpp
+index 36600c1..3e849a7 100644
+--- a/generators/cosmos/voxel_generator_cosmos.cpp
++++ b/generators/cosmos/voxel_generator_cosmos.cpp
+@@ -158,6 +158,19 @@ bool VoxelGeneratorCosmos::setup(Dictionary config) {
+ 	p.climate_biomes = bool(config.get("climate_biomes", false));
+ 	p.skin_block_exact = bool(config.get("skin_block_exact", false));
+ 
++	// COSMOS STRUCTURES P1b (docs/COSMOS-STRUCTURES-DESIGN.md §12.6): mirror CubeSphere.FP_STRUCT_GEN + the
++	// village-house material ids + the Earth facet count (the body gate). Default false / 0 -- the 0011 "not
++	// supplied => legacy" sentinel discipline: an old pck without these keys never claims a structure cell, so
++	// an old-binary/new-pck (or vice-versa) pairing degrades to byte-identical legacy instead of diverging.
++	p.struct_gen = bool(config.get("struct_gen", false));
++	p.struct_earth_facets = int(config.get("struct_earth_facets", 0));
++	p.struct_foundation = int(config.get("struct_foundation", 0));
++	p.struct_floor = int(config.get("struct_floor", 0));
++	p.struct_wall = int(config.get("struct_wall", 0));
++	p.struct_post = int(config.get("struct_post", 0));
++	p.struct_roof = int(config.get("struct_roof", 0));
++	p.struct_window = int(config.get("struct_window", 0));
++
+ 	p.facet_frame = PackedFloat64Array(config.get("facet_frame", PackedFloat64Array()));
+ 	p.facet_off = get_i32_param(config, "facet_off");
+ 	p.facet_r_blocks = double(config.get("facet_r_blocks", 0.0));
+@@ -1491,6 +1504,263 @@ Vector4i VoxelGeneratorCosmos::slope_run_targets(int r, int g) {
+ 			((r >> 12) & 15) - 4 + g);
+ }
+ 
++// --- StructureGen (structure_gen.gd) -- the P1b village-generator mirror ------------------------
++// Line-for-line port of the StructureGen statics. `_hash01` is a verbatim copy of TreeGen._hash01, so
++// every hash reuses cosmos::tree_hash01 with the 201-209 salts -- no new hashing/int-width traps. The
++// floori-of-a-float-division for the lattice indices is the SAME negative-coordinate trap the tree port
++// documents (integer division truncates toward zero across half the world); done via cosmos::floori.
++
++// Port of StructureGen._is_earth: villages exist on EARTH facets ONLY (FACETED + body 0 == fid < 6*K*K).
++// The Moon aliases biome ids 11/12/13, so a biome-only site test would place villages on moon columns.
++bool VoxelGeneratorCosmos::struct_is_earth(const Parameters &p, int fid) {
++	return p.faceted && fid >= 0 && fid < p.struct_earth_facets;
++}
++
++// Port of StructureGen._site_biome_ok: B_PLAINS always, B_SAVANNA only under climate_biomes.
++bool VoxelGeneratorCosmos::struct_site_biome_ok(const Parameters &p, int biome) {
++	if (biome == B_PLAINS) {
++		return true;
++	}
++	if (p.climate_biomes && biome == B_SAVANNA) {
++		return true;
++	}
++	return false;
++}
++
++// Port of StructureGen.has_village: body gate FIRST, then salt-201, then the site test (biome / flat
++// stencil / above-sea). Pure.
++bool VoxelGeneratorCosmos::struct_has_village(const Parameters &p, int fid, int vx, int vz) {
++	if (!struct_is_earth(p, fid)) {
++		return false; // body gate FIRST (the Moon biome-id alias trap)
++	}
++	if (tree_hash01(vx, vz, SALT_VILLAGE) >= VILLAGE_CHANCE) {
++		return false;
++	}
++	const int ax = vx * STRUCT_V + STRUCT_V / 2;
++	const int az = vz * STRUCT_V + STRUCT_V / 2;
++	if (!struct_site_biome_ok(p, int(column_profile_core(p, fid, ax, az).y))) {
++		return false;
++	}
++	// 4x4 flat stencil at pitch 8, max-min column_top <= 4.
++	int mn = 0x7fffffff;
++	int mx = -0x7fffffff;
++	for (int iz = 0; iz < 4; ++iz) {
++		for (int ix = 0; ix < 4; ++ix) {
++			const int h = col_h(p, fid, ax + ix * 8, az + iz * 8);
++			mn = mini(mn, h);
++			mx = maxi(mx, h);
++		}
++	}
++	if (mx - mn > 4) {
++		return false;
++	}
++	if (col_h(p, fid, ax, az) <= SEA_LEVEL + 2) {
++		return false; // above the water line -- no half-drowned village
++	}
++	return true;
++}
++
++// Port of StructureGen._jitter: an offset in [2, HCELL-dim-2] so base+dim-1 <= HCELL-3 < the next cell.
++int VoxelGeneratorCosmos::struct_jitter(int hx, int hz, int salt, int dim) {
++	const int span = STRUCT_HCELL - dim - 3;
++	return 2 + int(tree_hash01(hx, hz, salt) * double(span));
++}
++
++// Port of StructureGen.house_info: owning village live -> salt-202 -> footprint-corner flatness AND no
++// corner on a firing slope -> params from salts 203-209. Empty (valid=false) mirrors the {} return.
++VoxelGeneratorCosmos::StructHouse VoxelGeneratorCosmos::struct_house_info(
++		const Parameters &p, int fid, int hx, int hz) {
++	StructHouse hi;
++	const int vx = int(floori(double(hx) / double(STRUCT_HPV)));
++	const int vz = int(floori(double(hz) / double(STRUCT_HPV)));
++	if (!struct_has_village(p, fid, vx, vz)) {
++		return hi;
++	}
++	if (tree_hash01(hx, hz, SALT_HOUSE) >= HOUSE_CHANCE) {
++		return hi;
++	}
++	const int w = STRUCT_FOOT_MIN + int(tree_hash01(hx, hz, SALT_W) * double(STRUCT_FOOT_MAX - STRUCT_FOOT_MIN + 1));
++	const int d = STRUCT_FOOT_MIN + int(tree_hash01(hx, hz, SALT_D) * double(STRUCT_FOOT_MAX - STRUCT_FOOT_MIN + 1));
++	const int base_x = hx * STRUCT_HCELL + struct_jitter(hx, hz, SALT_JITX, w);
++	const int base_z = hz * STRUCT_HCELL + struct_jitter(hx, hz, SALT_JITZ, d);
++	// Footprint-corner flatness + slope reject (in corner order (x,z),(x+w-1,z),(x+w-1,z+d-1),(x,z+d-1)).
++	const int cx[4] = { base_x, base_x + w - 1, base_x + w - 1, base_x };
++	const int cz[4] = { base_z, base_z, base_z + d - 1, base_z + d - 1 };
++	int mn = 0x7fffffff;
++	int mx = -0x7fffffff;
++	for (int i = 0; i < 4; ++i) {
++		const int h = col_h(p, fid, cx[i], cz[i]);
++		mn = mini(mn, h);
++		mx = maxi(mx, h);
++		// slope_run_fires(slope_run_of(cx,cz)) worker-path == slope_fires_only with g = col_h (this column).
++		if (slope_fires_only(p, fid, cx[i], cz[i], h)) {
++			return hi; // a corner on a firing slope -- skip this house
++		}
++	}
++	if (mx - mn > STRUCT_FLAT_TOL) {
++		return hi;
++	}
++	const int wall_h = WALL_MIN + int(tree_hash01(hx, hz, SALT_WALLH) * double(WALL_MAX - WALL_MIN + 1));
++	const int door = int(tree_hash01(hx, hz, SALT_DOOR) * 4.0); // 0=-x 1=+x 2=-z 3=+z
++	int roof = tree_hash01(hx, hz, SALT_ROOF) < 0.5 ? 1 : 0;    // 1 = gabled, 0 = flat
++	const int base_y = mx;                                       // floor flush at the high corner
++	int gable_h = 0;
++	if (roof == 1) {
++		gable_h = mini(d / 2, STRUCT_H_MAX - wall_h); // capped so wall_h + gable_h <= STRUCT_H_MAX
++		if (gable_h < 1) {
++			roof = 0; // < 1 -> fall back to flat
++		}
++	}
++	hi.valid = true;
++	hi.base_x = base_x;
++	hi.base_y = base_y;
++	hi.base_z = base_z;
++	hi.w = w;
++	hi.d = d;
++	hi.wall_h = wall_h;
++	hi.door = door;
++	hi.roof = roof;
++	hi.gable_h = gable_h;
++	return hi;
++}
++
++// Port of StructureGen._roof_top_ly: the topmost local y (relative to base.y) the roof reaches.
++int VoxelGeneratorCosmos::struct_roof_top_ly(const StructHouse &hi) {
++	return hi.wall_h + (hi.roof == 1 ? hi.gable_h : 1);
++}
++
++// Port of StructureGen._is_door: a 1-wide, 2-tall opening at the centre of the hash-chosen wall.
++bool VoxelGeneratorCosmos::struct_is_door(const StructHouse &hi, int lx, int lz, int ly) {
++	if (ly > 2) {
++		return false;
++	}
++	const int w = hi.w;
++	const int d = hi.d;
++	const int midw = w / 2;
++	const int midd = d / 2;
++	switch (hi.door) {
++		case 0:
++			return lx == 0 && lz == midd;
++		case 1:
++			return lx == w - 1 && lz == midd;
++		case 2:
++			return lz == 0 && lx == midw;
++		case 3:
++			return lz == d - 1 && lx == midw;
++	}
++	return false;
++}
++
++// Port of StructureGen._is_window: one window per wall at mid height (ly == 2), except at the door.
++bool VoxelGeneratorCosmos::struct_is_window(const StructHouse &hi, int lx, int lz, int ly, int w, int d) {
++	if (ly != 2) {
++		return false;
++	}
++	if (struct_is_door(hi, lx, lz, ly)) {
++		return false;
++	}
++	const int midw = w / 2;
++	const int midd = d / 2;
++	if (lz == 0 && lx == midw) {
++		return true;
++	}
++	if (lz == d - 1 && lx == midw) {
++		return true;
++	}
++	if (lx == 0 && lz == midd) {
++		return true;
++	}
++	if (lx == w - 1 && lz == midd) {
++		return true;
++	}
++	return false;
++}
++
++// Port of StructureGen._roof_block: a flat plank slab one course above the walls, OR a gable across z.
++int VoxelGeneratorCosmos::struct_roof_block(
++		const Parameters &p, const StructHouse &hi, int lx, int lz, int ly, int w, int d, int wall_h) {
++	(void)w;
++	if (hi.roof == 0) {
++		return (ly == wall_h + 1) ? p.struct_roof : ID_AIR; // flat slab
++	}
++	const int k = ly - wall_h; // >= 1
++	if (k - 1 > d - k) {
++		return ID_AIR; // above the ridge
++	}
++	if (lz == k - 1 || lz == d - k) {
++		return p.struct_roof;
++	}
++	return ID_AIR;
++}
++
++// Port of StructureGen._template_block: -1 (outside / above roof / at-or-below ground), 0 (interior/door
++// AIR -- authoritative), or a house block id (>0). Materials are the frozen ids resolved from BlockCatalog.
++int VoxelGeneratorCosmos::struct_template_block(
++		const Parameters &p, const StructHouse &hi, int x, int y, int z, int cg) {
++	const int w = hi.w;
++	const int d = hi.d;
++	const int lx = x - hi.base_x;
++	const int lz = z - hi.base_z;
++	if (lx < 0 || lx >= w || lz < 0 || lz >= d) {
++		return -1; // outside the footprint
++	}
++	if (y <= cg) {
++		return -1; // terrain owns at/below ground (foundation only skirts ABOVE cg)
++	}
++	const int ly = y - hi.base_y;
++	if (ly > struct_roof_top_ly(hi)) {
++		return -1; // above the house -> open sky
++	}
++	if (ly < 0) {
++		return p.struct_foundation; // cobble skirt below the floor
++	}
++	if (ly == 0) {
++		return p.struct_floor; // solid floor course
++	}
++	const int wall_h = hi.wall_h;
++	if (ly <= wall_h) {
++		const bool edge = (lx == 0 || lx == w - 1 || lz == 0 || lz == d - 1);
++		if (!edge) {
++			return 0; // interior air -- AUTHORITATIVE (suppresses snow stack + lip)
++		}
++		if ((lx == 0 || lx == w - 1) && (lz == 0 || lz == d - 1)) {
++			return p.struct_post; // corner posts
++		}
++		if (struct_is_door(hi, lx, lz, ly)) {
++			return 0; // door gap -- authoritative air (passable)
++		}
++		if (struct_is_window(hi, lx, lz, ly, w, d)) {
++			return p.struct_window;
++		}
++		return p.struct_wall;
++	}
++	return struct_roof_block(p, hi, lx, lz, ly, w, d, wall_h); // roof region (ly > wall_h)
++}
++
++// Port of StructureGen.claim_at: the hot-path tri-state. `cg` is the column ground resolve_cell already
++// computed (== int(prof.x) == col_h), so there is ZERO recompute. -1 fall-through / 0 interior air / >0
++// house block id. The y-window early-out (ZERO structure hashes) IS the §12.2 height-budget clamp.
++int VoxelGeneratorCosmos::struct_claim_at(const Parameters &p, int fid, int x, int y, int z, int cg) {
++	if (y <= cg) {
++		return -1; // NEVER claim at/below ground (the stackup stays byte-untouched)
++	}
++	if (y - cg > STRUCT_H_MAX + STRUCT_FLAT_TOL) {
++		return -1; // above every possible roof -- the height-budget clamp (14 = TreeGen.MAX_ABOVE_SURFACE)
++	}
++	const int vx = int(floori(double(x) / double(STRUCT_V)));
++	const int vz = int(floori(double(z) / double(STRUCT_V)));
++	if (!struct_has_village(p, fid, vx, vz)) {
++		return -1;
++	}
++	const int hx = int(floori(double(x) / double(STRUCT_HCELL)));
++	const int hz = int(floori(double(z) / double(STRUCT_HCELL)));
++	const StructHouse hi = struct_house_info(p, fid, hx, hz);
++	if (!hi.valid) {
++		return -1;
++	}
++	return struct_template_block(p, hi, x, y, z, cg);
++}
++
+ // --- THE cell resolver -------------------------------------------------------------------------
+ // Port of TerrainConfig.resolve_cell (the worker path: slope_run passed in, pcache non-null).
+ int64_t VoxelGeneratorCosmos::resolve_cell_core(
+@@ -1541,6 +1811,15 @@ int64_t VoxelGeneratorCosmos::resolve_cell_core(
+ 			return with_snow_state(p, fid, with_shore_liquid(p, cc_pack(smat, smod, 0, 0), y, t), g, t);
+ 		}
+ 		if (y >= hi) {
++			// COSMOS STRUCTURES P1b (§12.3): the village-house claim, mirroring TerrainConfig.resolve_cell's
++			// y>=hi site -- consulted BEFORE the sea/tree chain. Tri-state: -1 fall through, 0 authoritative
++			// AIR, >0 house block id. Off (struct_gen false) => never entered => byte-identical.
++			if (p.struct_gen) {
++				const int cl = struct_claim_at(p, fid, x, y, z, g);
++				if (cl >= 0) {
++					return int64_t(cl);
++				}
++			}
+ 			if (y <= SEA_LEVEL) {
+ 				return sea_block(p, t, y);
+ 			}
+@@ -1555,6 +1834,16 @@ int64_t VoxelGeneratorCosmos::resolve_cell_core(
+ 	}
+ 
+ 	if (y > g) {
++		// COSMOS STRUCTURES P1b (§12.3): claim BEFORE the g+1 cap / snow stack / sea / tree -- precedence
++		// edits > structure claim > cap/snow/sea/tree. 0 = authoritative interior/door AIR (suppresses the
++		// snow stack + smoothing lip inside the house). `g` (this column's ground) feeds the y-window early-
++		// out (zero recompute). Off => never consulted (byte-identical), so this is the only hot-path cost.
++		if (p.struct_gen) {
++			const int cl = struct_claim_at(p, fid, x, y, z, g);
++			if (cl >= 0) {
++				return int64_t(cl);
++			}
++		}
+ 		if (y == g + 1) {
+ 			const int64_t cap = surface_cap(p, fid, x, z, g, biome, t);
+ 			if (cap != ID_AIR) {
+@@ -1852,7 +2141,12 @@ VoxelGenerator::Result VoxelGeneratorCosmos::generate_block(VoxelQueryData input
+ 	const int oz = input.origin_in_voxels.z;
+ 	const unsigned int ch = VoxelBuffer::CHANNEL_TYPE;
+ 	const int sea = SEA_LEVEL;
+-	const int max_above = MAX(10, SNOW_FILL_MAX_CELLS); // TreeGen.MAX_ABOVE_SURFACE=10
++	// COSMOS STRUCTURES P1b (§12.2): TreeGen.MAX_ABOVE_SURFACE was raised 10->14 (the B1 jungle tree,
++	// tree_gen.gd:33) but this near-gen whole-block early-out kept the stale literal 10 -- a latent
++	// byte-divergence where a jungle canopy in the band (max_h+10, max_h+12] crosses a mesh-block boundary
++	// (GDScript places leaves; C++ clipped them). Fixed to the shared 14, which is ALSO the structure height
++	// budget (STRUCT_H_MAX + STRUCT_FLAT_TOL), so every house cell stays inside the profiled envelope too.
++	const int max_above = MAX(14, SNOW_FILL_MAX_CELLS); // TreeGen.MAX_ABOVE_SURFACE=14
+ 	const int fid = p.gen_facet;
+ 
+ 	// Cheap constant all-air early-outs (no noise).
+diff --git a/generators/cosmos/voxel_generator_cosmos.h b/generators/cosmos/voxel_generator_cosmos.h
+index 438cefd..3752c29 100644
+--- a/generators/cosmos/voxel_generator_cosmos.h
++++ b/generators/cosmos/voxel_generator_cosmos.h
+@@ -233,6 +233,15 @@ private:
+ 
+ 	struct Parameters;
+ 
++	// COSMOS STRUCTURES P1b (§12.4): the resolved parametric house at an H-cell -- the C++ analogue of
++	// StructureGen.house_info's Dictionary. `valid` false is house_info's empty-dict return.
++	struct StructHouse {
++		bool valid = false;
++		int base_x = 0, base_y = 0, base_z = 0;
++		int w = 0, d = 0;
++		int wall_h = 0, door = 0, roof = 0, gable_h = 0;
++	};
++
+ 	// --- THE ONE CORE (see the one-sampler law above) -------------------------------------------
+ 	// The single implementation of every terrain quantity, shared by all entry points. Pure: reads
+ 	// only `p` (the frozen epoch) and its arguments. No script callbacks, no singletons, thread-safe
+@@ -287,6 +296,21 @@ private:
+ 	// the primitives above -- see bake_far_tile.
+ 	static int tree_top_decoration(const Parameters &p, int fid, int x, int z);
+ 
++	// --- StructureGen (structure_gen.gd) -- the P1b village-generator mirror (§12.3/§12.4/§12.6). Every
++	// one is a line-for-line port of a StructureGen static, sharing cosmos::tree_hash01 with new salts.
++	// Consulted from resolve_cell_core at the two claim-first sites (mirroring the two resolve_cell consults).
++	static bool struct_is_earth(const Parameters &p, int fid);
++	static bool struct_site_biome_ok(const Parameters &p, int biome);
++	static bool struct_has_village(const Parameters &p, int fid, int vx, int vz);
++	static int struct_jitter(int hx, int hz, int salt, int dim);
++	static StructHouse struct_house_info(const Parameters &p, int fid, int hx, int hz);
++	static int struct_roof_top_ly(const StructHouse &hi);
++	static bool struct_is_door(const StructHouse &hi, int lx, int lz, int ly);
++	static bool struct_is_window(const StructHouse &hi, int lx, int lz, int ly, int w, int d);
++	static int struct_roof_block(const Parameters &p, const StructHouse &hi, int lx, int lz, int ly, int w, int d, int wall_h);
++	static int struct_template_block(const Parameters &p, const StructHouse &hi, int x, int y, int z, int cg);
++	static int struct_claim_at(const Parameters &p, int fid, int x, int y, int z, int cg);
++
+ 	static Vector4 corner_targets(const Parameters &p, int fid, int x, int z);
+ 	static bool slope_fires_only(const Parameters &p, int fid, int x, int z, int g);
+ 	static int slope_run_pack(const Vector4i &tw, int g);
+@@ -431,6 +455,21 @@ private:
+ 		bool climate_biomes = false;
+ 		bool skin_block_exact = false;
+ 
++		// COSMOS STRUCTURES P1b (docs/COSMOS-STRUCTURES-DESIGN.md §12.6): the village generator mirror.
++		// struct_gen mirrors CubeSphere.FP_STRUCT_GEN; struct_earth_facets == 6*K*K is the body gate
++		// (villages exist ONLY on Earth facets, fid < this -- the Moon aliases biome ids); the six ids are
++		// the frozen house materials (stone/wood/dark_oak_log/glass), resolved main-thread exactly as
++		// StructureGen.warm_up does. All default false / 0 so a config that omits them (the 0011 "not
++		// supplied => legacy" sentinel discipline) never claims a structure cell => byte-identical legacy.
++		bool struct_gen = false;
++		int struct_earth_facets = 0;
++		int struct_foundation = 0; // stone
++		int struct_floor = 0;      // stone
++		int struct_wall = 0;       // wood
++		int struct_post = 0;       // dark_oak_log
++		int struct_roof = 0;       // dark_oak_log
++		int struct_window = 0;     // glass
++
+ 		// COSMOS FACETED: the facet atlas as FROZEN NUMBERS, never as topology logic. `facet_frame` is
+ 		// FacetAtlas._frame (12 doubles per facet: origin, du, dv, dw) and `facet_off` is
+ 		// FacetAtlas._off (2 ints per facet); together they make cell_dir() pure arithmetic. This

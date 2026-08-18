@@ -871,7 +871,7 @@ func _process(delta: float) -> void:
 			# feed the tier this frame's planet occluder (render centre + voxel radius, same world frame as the camera) so
 			# a beacon behind the planet is dropped (must-fix #4). OFF ⇒ neither runs (no dev object, no occluder) ⇒ byte-off.
 			if CubeSphere.FP_OBJ_LOD_SPACE:
-				_maybe_spawn_dev_space_object()
+				_maybe_spawn_dev_space_object(_cam)
 				_far_objects.set_occluders([{"center": planet_render_centre(), "radius": FacetAtlas.R_BLOCKS}])
 			_far_objects.step(_cam, get_viewport().get_visible_rect().size.y)
 	# COSMOS-PERF UNATTENDED R3: also skip the main-thread snow step while the ORBITAL near field is frozen (composes
@@ -1783,25 +1783,30 @@ func is_edited_column(x: int, z: int) -> bool:
 # under FP_OBJ_LOD_SPACE (gated at the call site) ⇒ never spawned / registered with the flag off (byte-identical).
 const DEV_SPACE_ALT := 2500.0   # radial altitude above the player spawn (blocks)
 
-func _maybe_spawn_dev_space_object() -> void:
-	if _dev_space_spawned or not _have_player_pos or _far_objects == null or _obj_registry == null:
+func _maybe_spawn_dev_space_object(cam: Camera3D) -> void:
+	if _dev_space_spawned or cam == null or _far_objects == null or _obj_registry == null:
 		return
 	_dev_space_spawned = true
-	var centre := planet_render_centre()                       # planet centre in the current render frame
-	var ppos := _last_player_pos
-	var up := ppos - centre                                    # radial up = direction from the planet centre to the player
+	# FRAME FIX (2026-08-18): the anchor + centre + spawn MUST all be in the SAME scene-global frame the tier + the
+	# DevSpaceObject's own mesh render in. `_last_player_pos` is the player's LATTICE pose (player.gd feeds
+	# update_streaming(position) — lattice), while planet_render_centre() is the render/scene frame — subtracting them
+	# gave a garbage `up` and placed the object thousands of blocks off the rendered scene (invisible everywhere). The
+	# CAMERA's global_transform.origin is the rendered player/eye in scene-global, the SAME frame as render_centre and
+	# VoxelBody.global_transform — so radial up = (cam_pos − render_centre) is correct and the object sits straight up.
+	var anchor := cam.global_transform.origin                  # scene-global: the rendered player/eye
+	var centre := planet_render_centre()                       # scene-global: the rendered planet centre
+	var up := anchor - centre
 	if up.length() < 0.001:
-		up = -gravity_vector()                                 # degenerate fallback (centre unknown): use −gravity
+		up = cam.global_transform.basis.y                      # degenerate fallback: the camera's own up (≈ radial on-surface)
 	up = up.normalized()
-	var spawn_pos := ppos + up * DEV_SPACE_ALT
+	var spawn_pos := anchor + up * DEV_SPACE_ALT
 	_dev_space_obj = DevSpaceObject.new()
 	_dev_space_obj.name = "DevSpaceObject"
 	add_child(_dev_space_obj)
 	_dev_space_obj.global_position = spawn_pos
 	_obj_registry.register(_dev_space_obj, ObjectLod.CLASS_SPACE)
-	var alt := spawn_pos.distance_to(centre) - FacetAtlas.R_BLOCKS
-	print("  [FP_OBJ_LOD_SPACE] DevSpaceObject spawned at world ", spawn_pos,
-		"  (player spawn ", ppos, " + radial_up*", DEV_SPACE_ALT, ")  radial altitude ", alt, " blocks")
+	print("  [FP_OBJ_LOD_SPACE] DevSpaceObject spawned at scene ", spawn_pos,
+		"  (cam ", anchor, " + radial_up*", DEV_SPACE_ALT, ")  |centre-dist| ", spawn_pos.distance_to(centre))
 
 func register_far_object(node: Object) -> void:
 	if _obj_registry != null:

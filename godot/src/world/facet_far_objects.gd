@@ -57,6 +57,10 @@ var _material: ShaderMaterial = null
 # (WorldManager, planet render centre + voxel radius). Read only inside the FP_OBJ_LOD_SPACE branch ⇒ byte-off.
 var _occluders: Array = []
 
+# P3 live-debug (FP_OBJ_LOD_SPACE): a one-line diagnostic of the CLASS_SPACE object's frame state, surfaced by
+# PerfHUD so it's readable in a screenshot (print() is browser-console-only). Written each _compute; empty off.
+static var dbg := ""
+
 var _dot_mmi: MultiMeshInstance3D = null
 var _dot_mm: MultiMesh = null
 var _card_mmi: MultiMeshInstance3D = null
@@ -214,6 +218,8 @@ func debug_route(cam_world: Vector3, kpx: float, parent: Transform3D) -> Diction
 func _compute(cam_world: Vector3, kpx: float, parent: Transform3D) -> Dictionary:
 	var parent_inv := parent.affine_inverse()
 	var ids := _registry.ids()
+	if CubeSphere.FP_OBJ_LOD_SPACE:
+		dbg = "objs=%d cam=(%.0f,%.0f,%.0f) noSPACE" % [ids.size(), cam_world.x, cam_world.y, cam_world.z]
 	var cards: Array = []      # {id, proj, origin, hs, alpha, bright}
 	var dots: Array = []
 	var hide: Dictionary = {}  # id -> bool want_hidden
@@ -241,6 +247,9 @@ func _compute(cam_world: Vector3, kpx: float, parent: Transform3D) -> Dictionary
 		var rep: int = rung["rep"]
 		var proj: float = rung["proj"]
 		reps[id] = rep
+		if CubeSphere.FP_OBJ_LOD_SPACE and cls == ObjectLod.CLASS_SPACE:
+			dbg = "SPC c=(%.0f,%.0f,%.0f) cam=(%.0f,%.0f,%.0f) d=%.0f proj=%.1f rep=%s" % [
+				center.x, center.y, center.z, cam_world.x, cam_world.y, cam_world.z, dist, proj, ObjectLod.REP_NAMES[rep]]
 		if rep == ObjectLod.REP_FULL:
 			hide[id] = false                                   # near — L0 renders its own mesh
 			continue

@@ -131,6 +131,8 @@ func _process(delta: float) -> void:
 		fps, min_fps, worst_ms, _hitches, stream_per_s,
 		proc_ms, phys_ms, draws, _fmt(prims), vmem,
 		gen_pending, mesh_pending, main_pending, gpu_pending]
+	if CubeSphere.FP_OBJ_LOD_SPACE and FacetFarObjects.dbg != "":
+		s += "\nOBJLOD " + FacetFarObjects.dbg
 	_label.text = s
 
 	print("[PERF] fps=%.0f min=%.0f worst=%.0fms hitches=%d drained=%d/s proc=%.1f phys=%.1f draws=%d prims=%d vox_gen=%d vox_mesh=%d" % [

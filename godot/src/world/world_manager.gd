@@ -282,6 +282,14 @@ var _edits_by_fid: Dictionary = {}    # int fid -> Dictionary(edit_key:int -> tr
 # cells, driven from the two write choke points (_write_cell / sim_revert_cell). Constructed in setup() under the
 # flag; null off (the choke-point hooks are one null test) ⇒ byte-identical. See structure_tracker.gd.
 var _structure_tracker = null
+# docs/COSMOS-STRUCTURES-DESIGN.md (P1, FP_STRUCT_GEN §12.5): the GEN half of the ONE registry — a pure per-fid cache
+# of StructureGen's village hash. Constructed in setup() under the flag; null off ⇒ the structure_registry concat +
+# the structure_cell_at GEN branch + the rev-bump hooks are all one null test (byte-identical). See struct_gen_index.gd.
+var _gen_index = null
+# COSMOS STRUCTURES P1 (§12.5): a 1-entry per-fid GenCtx cache the structure_cell_at GEN sampler reuses across the
+# decimator's contiguous per-structure scan (shares the column memo). Rebuilt when the sampled fid changes.
+var _struct_gen_ctx = null
+var _struct_gen_ctx_fid := -1
 # The number of edit keys the LAST `_rebuild_window_indices` iterated (the O() the crossing paid): == the active
 # facet's edit count with FP_EDIT_FID_INDEX on, == the total edit count with it off. Read by verify_edit_fid_index.gd.
 var _rebuild_scanned: int = 0
@@ -439,6 +447,10 @@ func _ready() -> void:
 	# Only under FACETED with no chart (the edit keys are the (fid, cell) ints the tracker keys on). Off ⇒ null (byte-off).
 	if CubeSphere.FP_STRUCT_DETECT and CubeSphere.FACETED and _chart == null:
 		_structure_tracker = StructureTracker.new()
+	# docs/COSMOS-STRUCTURES-DESIGN.md (P1, FP_STRUCT_GEN §12.5): the GEN registry producer. Same FACETED/no-chart
+	# guard as the tracker (records are keyed on (fid, cell) lattice coords). Null off ⇒ byte-identical.
+	if CubeSphere.FP_STRUCT_GEN and CubeSphere.FACETED and _chart == null:
+		_gen_index = StructGenIndex.new()
 	if CubeSphere.FACETED and FacetFarRing.ENABLED:
 		_facet_ring = FacetFarRing.new()
 		_facet_ring.name = "FacetFarRing"
@@ -860,6 +872,11 @@ func _process(delta: float) -> void:
 	# dirtied cluster re-floods once the removal burst settles). Cheap no-op when nothing is dirty; null off (byte-off).
 	if _structure_tracker != null:
 		_structure_tracker.tick(Time.get_ticks_msec())
+	# docs/COSMOS-STRUCTURES-DESIGN.md (P1, §12.5): refresh the GEN registry's wanted-facet band (active facet +
+	# facets within STRUCT_FAR_MAX). The 3,456-facet scan only fires on a facet crossing; a still player costs one int
+	# compare. Null off ⇒ never runs (byte-identical).
+	if _gen_index != null:
+		_gen_index.refresh(TerrainConfig.active_facet())
 	# COSMOS-OBJECT-LOD P1 (docs/COSMOS-OBJECT-LOD-DESIGN.md, FP_OBJ_LOD_DEBRIS): tick the far-object tier each frame off
 	# the LIVE Camera3D (its fov + the device viewport height give K_px, zoom-aware). Mirrors how the far-tree tier is
 	# fed the live camera each frame (main.gd:332). Dirty-gated inside step() (dormant snapshot / awake-only rewrite), so
@@ -2164,6 +2181,11 @@ func _write_cell(cell: Vector3i, packed: int, meta: Variant = null, paint: bool 
 	# null tracker (flag off) ⇒ one branch skip (byte-identical).
 	if _structure_tracker != null and CubeSphere.FACETED and _chart == null:
 		_structure_tracker.note_cell(ek, packed)
+	# docs/COSMOS-STRUCTURES-DESIGN.md (P1, §12.5): an edit inside a GEN village bbox damages it — bump that record's
+	# rev so the far tier re-bakes and shows the hole (the player-build path). Null off ⇒ one branch skip (byte-off).
+	if _gen_index != null and CubeSphere.FACETED and _chart == null:
+		var _gu: Array = FacetAtlas.edit_key_unpack(int(ek))
+		_gen_index.note_edit(int(_gu[0]), _gu[1])
 	# docs/COSMOS-FARTREE-CHOP-DESIGN.md §4.3 (FP_FT_SKIN_CHOP): if this edit is the trunk-base cell of its column's
 	# procedural tree, the tree's chopped state just toggled — the facet's baked band/fine far-skin tiles are stale.
 	# O(1) detect (one tree_info); the rung-3 analogue of FacetFarTrees' edits-rev rebuild re-arm. Off / no baker ⇒ no-op.
@@ -2211,6 +2233,11 @@ func sim_revert_cell(cell: Vector3i) -> void:
 		# removed so the tracker debounces a bounded recluster (a removal can split a component). FACETED ⇒ ek is int.
 		if _structure_tracker != null and CubeSphere.FACETED and _chart == null:
 			_structure_tracker.note_removed(int(ek))
+		# docs/COSMOS-STRUCTURES-DESIGN.md (P1, §12.5): a reverted cell over a GEN house un-damages/re-damages it —
+		# bump the record rev so the far model re-bakes (symmetric with the _write_cell hook). Null off ⇒ byte-off.
+		if _gen_index != null and CubeSphere.FACETED and _chart == null:
+			var _gu: Array = FacetAtlas.edit_key_unpack(int(ek))
+			_gen_index.note_edit(int(_gu[0]), _gu[1])
 		# docs/COSMOS-FARTREE-CHOP-DESIGN.md §4.3 (FP_FT_SKIN_CHOP): the ONLY `_edits` erase — an erased trunk-base
 		# edit UN-chops the tree; re-bake the facet's far skin so the tree returns (symmetric with _write_cell above).
 		if CubeSphere.FP_FT_SKIN_CHOP and _facet_tex != null and CubeSphere.FACETED and _chart == null:
@@ -3847,7 +3874,12 @@ func far_tree_near_presence(fid: int, box: AABB) -> int:
 ## far-structure tier walks THIS, never the world. Empty with no tracker (FP_STRUCT_DETECT off) ⇒ the tier renders
 ## nothing (byte-identical). Each call returns fresh record dicts the tier snapshots.
 func structure_registry() -> Array:
-	return _structure_tracker.registry() if _structure_tracker != null else []
+	var out: Array = _structure_tracker.registry() if _structure_tracker != null else []
+	# docs/COSMOS-STRUCTURES-DESIGN.md (P1, §12.5): ONE registry, TWO producers — concat the GEN villages (a pure
+	# cache of StructureGen's hash) under FP_STRUCT_GEN. Null off ⇒ exactly the tracker registry (byte-identical).
+	if _gen_index != null:
+		out.append_array(_gen_index.records())
+	return out
 
 ## docs/COSMOS-STRUCTURES-DESIGN.md (P0, §6.1): the decimator's cell sampler — the PLACED overlay material at
 ## (fid, cell), or 0 for air / non-placed. Reads the overlay DIRECTLY by (fid, cell) edit key (fid-agnostic, unlike
@@ -3855,9 +3887,25 @@ func structure_registry() -> Array:
 ## structure alone, no adjacent terrain slab). A dug placed cell reads air ⇒ damage shows in the far model for free.
 func structure_cell_at(fid: int, cell: Vector3i) -> int:
 	var v: int = _edits.get(FacetAtlas.edit_key(fid, cell), -1)
-	if v <= 0:
-		return 0
-	return CellCodec.mat(v)
+	# COSMOS STRUCTURES P1 (§12.5) — the load-bearing −1-vs-0 SPLIT (G-SG-DAMAGE): the shipped P0 merged "no overlay
+	# entry" (−1) and "dug air" (0) via `if v <= 0: return 0`. P1 MUST split them: an overlay-PLACED cell → its mat; an
+	# overlay-DUG cell → 0 (a dug GEN wall reads air ⇒ the damage hole shows far); NO overlay entry → the GEN claim
+	# (flag-gated) else air. Null _gen_index (flag off) ⇒ every v ≤ 0 returns 0 exactly as before (byte-identical).
+	if v > 0:
+		return CellCodec.mat(v)                        # overlay placed → its material
+	if v == 0:
+		return 0                                        # overlay DUG → air (damage shows in the far model)
+	if _gen_index != null:                              # v == -1 (no overlay): the generated village house, if any
+		return maxi(0, StructureGen.claim_at(cell.x, cell.y, cell.z, _struct_gen_ctx_for(fid)))
+	return 0
+
+## COSMOS STRUCTURES P1 (§12.5): the 1-entry per-fid GenCtx the GEN sampler threads so column_top/biome resolve on
+## the sampled facet AND share the column memo across the decimator's contiguous per-structure scan.
+func _struct_gen_ctx_for(fid: int):
+	if _struct_gen_ctx == null or _struct_gen_ctx_fid != fid:
+		_struct_gen_ctx = TerrainConfig.GenCtx.new(0, fid)
+		_struct_gen_ctx_fid = fid
+	return _struct_gen_ctx
 
 ## COSMOS ATMO2 B3 (FP_NEAR_DAYLIGHT): forward the current Sun direction into the near-field daylight material
 ## twin (the module path's shared atlas material). No-op with no module world or the flag off (the module setter

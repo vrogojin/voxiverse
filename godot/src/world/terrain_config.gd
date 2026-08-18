@@ -348,6 +348,9 @@ static func is_moon_biome(b: int) -> bool:
 # (Mountains mask), and the 7xx hashing salts below. SnowfallSystem owns 105 (the
 # SEED+105 weather-gate noise, SNOW-ACCUMULATION §4.3) — recorded here so the one-place
 # registry stays collision-free even though the noise object lives in the sim class.
+# COSMOS STRUCTURES P1 (docs/COSMOS-STRUCTURES-DESIGN.md §12.4): StructureGen owns 201-209 (201 village gate,
+# 202 house gate, 203/204 footprint jitter, 205/206 footprint w/d, 207 wall_h, 208 door side, 209 roof/material) —
+# disjoint from TreeGen's 11-125 and TerrainConfig's 101-105 / 7xx. Its _hash01 is a verbatim copy of TreeGen's mix.
 const _SALT_BEDROCK := 701
 const _SALT_DEEP := 702
 const _SALT_STRATA_EXIST := 711
@@ -606,6 +609,10 @@ static func warm_up() -> void:
 	_ensure_noise()
 	_ensure_ids()
 	TreeGen.warm_up()
+	# COSMOS STRUCTURES P1 (FP_STRUCT_GEN): resolve the house material ids on the MAIN thread (like TreeGen) so the
+	# voxel worker never races BlockCatalog.id_of into existence. Behaviour-neutral when the flag is off (claim_at is
+	# never consulted), so this stays byte-identical.
+	StructureGen.warm_up()
 	# COSMOS crash-fix (WGC §7.4): in curved mode the worldgen fold (LatticeNav → CubeSphere.fold_cell)
 	# reads a lazily-built static edge-remap table. If the voxel WORKER first-touches that build while a
 	# main-thread fold (FarTerrain / collider / HUD / player query) runs concurrently, the shared static
@@ -1382,6 +1389,14 @@ static func resolve_cell(x: int, y: int, z: int, g: int, biome: int, c: float, t
 				smat = _surface_rule(x, y, z, g, biome, c, t)   # carve: generated banding, NO ore/deepslate
 			return _with_snow_state(_with_shore_liquid(CellCodec.pack(smat, smod), y, t), g, t)
 		if y >= hi:
+			# COSMOS STRUCTURES P1 (§12.3, FP_STRUCT_GEN): the village-house claim is consulted BEFORE the sea/tree
+			# chain (precedence edits > structure claim > sea/tree; edits already won upstream in cell_value_at). The
+			# tri-state maps −1 → fall through, 0 → AIR (authoritative), >0 → house block id. `g` is passed so claim_at
+			# does the y-window early-out with ZERO recompute. Flag off ⇒ this branch is never entered (byte-identical).
+			if CubeSphere.FP_STRUCT_GEN:
+				var _cl := StructureGen.claim_at(x, y, z, pcache, g)
+				if _cl >= 0:
+					return _cl
 			if y <= SEA_LEVEL:
 				return _sea_block(t, y)
 			return TreeGen.block_at(x, y, z, pcache)
@@ -1392,6 +1407,14 @@ static func resolve_cell(x: int, y: int, z: int, g: int, biome: int, c: float, t
 			idlo = _ore_at(x, y, z, idlo, biome, c)
 		return idlo
 	if y > g:
+		# COSMOS STRUCTURES P1 (§12.3, FP_STRUCT_GEN): claim BEFORE the g+1 cap / snow stack / sea fill / tree overlay
+		# — precedence edits > structure claim > cap/snow/sea/tree. −1 fall through, 0 authoritative interior/door AIR
+		# (suppresses the snow stack + smoothing lip inside the house), >0 a house block id. `g` (this column's ground)
+		# feeds the y-window early-out. Flag off ⇒ never consulted (byte-identical), so this is the ONLY hot-path cost.
+		if CubeSphere.FP_STRUCT_GEN:
+			var _cl := StructureGen.claim_at(x, y, z, pcache, g)
+			if _cl >= 0:
+				return _cl
 		# Smoothing CAP cell (SUB-VOXEL-SMOOTHING §8.1): a column whose neighbours rise grows a
 		# partial lip one cell above its surface, bridging a 1-block step up into a continuous slope.
 		# WATER-SHORE §3.6: underwater caps are now ON — a submerged step descends smoothly over

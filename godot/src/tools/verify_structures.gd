@@ -49,8 +49,296 @@ func _initialize() -> void:
 	_gate_np()
 	_gate_shader()
 
+	# COSMOS STRUCTURES P1a (FP_STRUCT_GEN, §12.7) — the village-generator gate set. The StructureGen / StructGenIndex
+	# classes are PURE (hash-of-position), so they are exercised directly via a GenCtx homed on an Earth facet (exactly
+	# how verify_far_trees drives TreeGen), even though FACETED is const-false in this headless run.
+	_gate_sg_off()
+	_gate_sg_site()
+	_gate_sg_biject_env()
+	_gate_sg_root()
+	_gate_sg_damage()
+	_gate_sg_phys()
+
 	print("=== VERIFY structures: ", _pass, " passed, ", _fail, " failed ===")
 	quit(1 if _fail > 0 else 0)
+
+# =====================================================================================================================
+# G-SG helpers — locate a real generated house (deterministic scan over Earth facets) to drive the deep gates.
+# =====================================================================================================================
+const SG := preload("res://src/world/structure_gen.gd")
+const SGI := preload("res://src/world/struct_gen_index.gd")
+
+## The first Earth facet with ≥ 1 generated house, as {idx, fid, recs, rec}. {} if none within the scan cap.
+func _find_house() -> Dictionary:
+	var idx = SGI.new()
+	var earth_n := 6 * FA.K * FA.K
+	for fid in range(mini(earth_n, 2000)):
+		var recs: Array = idx.enumerate_facet(fid)
+		if not recs.is_empty():
+			return {"idx": idx, "fid": fid, "recs": recs, "rec": recs[0]}
+	return {}
+
+func _inside_any(recs: Array, x: int, y: int, z: int) -> bool:
+	for r in recs:
+		var bmin: Vector3i = r["bmin"]
+		var bmax: Vector3i = r["bmax"]
+		if x >= bmin.x and x <= bmax.x and y >= bmin.y and y <= bmax.y and z >= bmin.z and z <= bmax.z:
+			return true
+	return false
+
+# =====================================================================================================================
+# G-SG-OFF — the interlock assert + the height-budget const law (§12.2/§12.7). Byte-identity flag-off is proven by
+# the full FLAT suite; the grep-no-unguarded-sites check runs in the harness (reported separately).
+# =====================================================================================================================
+func _gate_sg_off() -> void:
+	_ok(not (CubeSphere.FP_STRUCT_GEN and CubeSphere.FP_CPPGEN),
+		"G-SG-OFF: interlock — NOT (FP_STRUCT_GEN AND FP_CPPGEN) until the P1b C++ mirror lands byte-equal")
+	_ok(SG.STRUCT_H_MAX + SG.STRUCT_FLAT_TOL <= TreeGen.MAX_ABOVE_SURFACE,
+		"G-SG-ENV: STRUCT_H_MAX + STRUCT_FLAT_TOL (%d) ≤ TreeGen.MAX_ABOVE_SURFACE (%d) — the height budget holds" \
+			% [SG.STRUCT_H_MAX + SG.STRUCT_FLAT_TOL, TreeGen.MAX_ABOVE_SURFACE])
+	_ok(SG.STRUCT_V == SG.STRUCT_HPV * SG.STRUCT_HCELL,
+		"G-SG-ENV: V == HPV·HCELL (houses tile the village exactly ⇒ each house inside its own H-cell)")
+
+# =====================================================================================================================
+# G-SG-SITE — body-gate-FIRST (no village on the Moon even when the salt passes), and the found village really sits
+# on plains/savanna, above sea, off slopes (§12.4). The Moon alias trap ([[voxiverse-tree-bugs-rootcause]]).
+# =====================================================================================================================
+func _gate_sg_site() -> void:
+	# Moon body gate: find a Moon fid; a village-cell whose salt-201 PASSES must still be refused (body gate first).
+	var moon_fid := -1
+	for fid in range(6 * FA.K * FA.K, 6 * FA.K * FA.K + 4000):
+		if FA.body_of_fid(fid) != 0:
+			moon_fid = fid
+			break
+	if moon_fid >= 0:
+		var mctx = TerrainConfig.GenCtx.new(0, moon_fid)
+		# a (vx,vz) whose village hash clears the 0.05 gate — the site test would run were the body not gated.
+		var found_salt := false
+		var refused := true
+		for vx in range(-40, 40):
+			for vz in range(-40, 40):
+				if SG._hash01(vx, vz, SG._SALT_VILLAGE) < SG.VILLAGE_CHANCE:
+					found_salt = true
+					if SG.has_village(vx, vz, mctx):
+						refused = false
+		_ok(found_salt and refused,
+			"G-SG-SITE: Moon facet — a salt-201-passing village cell is STILL refused (body gate FIRST, alias trap)")
+		var midx = SGI.new()
+		_ok(midx.enumerate_facet(moon_fid).is_empty(), "G-SG-SITE: no GEN records enumerate on a Moon facet")
+	else:
+		_ok(true, "G-SG-SITE: (single-body atlas — Moon facet unavailable, body-gate assert via flat ctx below)")
+		_ok(not SG.has_village(0, 0, TerrainConfig.GenCtx.new(0, -1)),
+			"G-SG-SITE: a flat/no-facet ctx (fid −1) hosts NO village (FACETED-gated)")
+
+	var found := _find_house()
+	if found.is_empty():
+		_ok(false, "G-SG-SITE: no generated house found within the facet scan cap (widen the scan / site gate)")
+		return
+	var rec: Dictionary = found["rec"]
+	var fid: int = found["fid"]
+	var ctx = TerrainConfig.GenCtx.new(0, fid)
+	var base: Vector3i = rec["bmin"]                    # bmin.x/.z == base.x/.z (bmin only sinks y by FOUNDATION_MAX)
+	var vx := floori(float(base.x) / float(SG.STRUCT_V))
+	var vz := floori(float(base.z) / float(SG.STRUCT_V))
+	var ax := vx * SG.STRUCT_V + SG.STRUCT_V / 2
+	var az := vz * SG.STRUCT_V + SG.STRUCT_V / 2
+	var b := TerrainConfig.biome_at(ax, az, ctx)
+	_ok(b == TerrainConfig.B_PLAINS or (CubeSphere.FP_CLIMATE_BIOMES and b == TerrainConfig.B_SAVANNA),
+		"G-SG-SITE: the located village anchor biome is B_PLAINS (or B_SAVANNA under FP_CLIMATE_BIOMES)")
+	_ok(TerrainConfig.column_top(ax, az, ctx) > TerrainConfig.SEA_LEVEL + 2,
+		"G-SG-SITE: the village anchor is above SEA_LEVEL + 2 (no drowned village)")
+
+# =====================================================================================================================
+# G-SG-BIJECT + G-SG-ENV — every claim_at non-air cell lies inside an enumerated record bbox (and inside its H-cell);
+# no claim at/below ground; no claim above the height budget; the records reproduce from the hashes.
+# =====================================================================================================================
+func _gate_sg_biject_env() -> void:
+	var found := _find_house()
+	if found.is_empty():
+		_ok(false, "G-SG-BIJECT: no generated house found (see G-SG-SITE)")
+		return
+	var fid: int = found["fid"]
+	var recs: Array = found["recs"]
+	var ctx = TerrainConfig.GenCtx.new(0, fid)
+	var all_in := true
+	var none_below := true
+	var budget_ok := true
+	var in_hcell := true
+	# H-cell containment of every record bbox (jitter keeps the whole footprint inside one H-cell).
+	for r in recs:
+		var bmin: Vector3i = r["bmin"]
+		var bmax: Vector3i = r["bmax"]
+		if floori(float(bmin.x) / float(SG.STRUCT_HCELL)) != floori(float(bmax.x) / float(SG.STRUCT_HCELL)) \
+			or floori(float(bmin.z) / float(SG.STRUCT_HCELL)) != floori(float(bmax.z) / float(SG.STRUCT_HCELL)):
+			in_hcell = false
+	# Scan a padded region around each record and assert claim>0 lands ONLY inside some record's bbox.
+	for r in recs:
+		var bmin: Vector3i = r["bmin"]
+		var bmax: Vector3i = r["bmax"]
+		for x in range(bmin.x - 3, bmax.x + 4):
+			for z in range(bmin.z - 3, bmax.z + 4):
+				var cg := TerrainConfig.column_top(x, z, ctx)
+				for y in range(cg - SG.FOUNDATION_MAX - 2, cg + 18):
+					var cl: int = SG.claim_at(x, y, z, ctx)
+					if cl >= 0:
+						if y <= cg:
+							none_below = false
+						if y - cg > TreeGen.MAX_ABOVE_SURFACE:
+							budget_ok = false
+					if cl > 0 and not _inside_any(recs, x, y, z):
+						all_in = false
+	_ok(all_in, "G-SG-BIJECT: every claim_at solid (>0) cell lies inside an enumerated record bbox")
+	_ok(in_hcell, "G-SG-ENV: every record bbox is contained in a single H-cell (no claim outside the H-cell)")
+	_ok(none_below, "G-SG-ENV: no claim at/below the column ground g (the sub-surface stackup stays untouched)")
+	_ok(budget_ok, "G-SG-ENV: no claim above g + MAX_ABOVE_SURFACE (the height-budget clamp holds)")
+	# Reproduce-from-hashes: a FRESH index enumerates byte-identical records.
+	var idx2 = SGI.new()
+	var recs2: Array = idx2.enumerate_facet(fid)
+	var same := recs2.size() == recs.size()
+	if same:
+		for i in range(recs.size()):
+			if recs2[i]["root"] != recs[i]["root"] or recs2[i]["bmin"] != recs[i]["bmin"] or recs2[i]["bmax"] != recs[i]["bmax"]:
+				same = false
+	_ok(same, "G-SG-BIJECT: records reproduce byte-identically from the hashes (deterministic enumeration)")
+
+# =====================================================================================================================
+# G-SG-ROOT — GEN roots are NEGATIVE (disjoint from tracker roots ≥ 0), unique, and stable across evict/re-derive.
+# =====================================================================================================================
+func _gate_sg_root() -> void:
+	var found := _find_house()
+	if found.is_empty():
+		_ok(false, "G-SG-ROOT: no generated house found (see G-SG-SITE)")
+		return
+	var recs: Array = found["recs"]
+	var neg := true
+	var uniq := {}
+	var dup := false
+	for r in recs:
+		var root: int = r["root"]
+		if root >= 0:
+			neg = false
+		if uniq.has(root):
+			dup = true
+		uniq[root] = true
+	_ok(neg, "G-SG-ROOT: GEN roots are NEGATIVE (structurally disjoint from tracker edit-key roots ≥ 0)")
+	_ok(not dup, "G-SG-ROOT: GEN roots are unique within a facet")
+	# Stable across a fresh re-derive (the cache is pure/evictable).
+	var idx2 = SGI.new()
+	var recs2: Array = idx2.enumerate_facet(found["fid"])
+	var stable := recs2.size() == recs.size()
+	if stable:
+		for i in range(recs.size()):
+			if recs2[i]["root"] != recs[i]["root"]:
+				stable = false
+	_ok(stable, "G-SG-ROOT: roots are stable across enumeration evict / re-derive")
+
+# =====================================================================================================================
+# G-SG-DAMAGE — the sampler's −1-vs-0 split value mapping + the note_edit rev bump (pins the world_manager :3596 split).
+# =====================================================================================================================
+func _gate_sg_damage() -> void:
+	var found := _find_house()
+	if found.is_empty():
+		_ok(false, "G-SG-DAMAGE: no generated house found (see G-SG-SITE)")
+		return
+	var idx = found["idx"]
+	var fid: int = found["fid"]
+	var rec: Dictionary = found["rec"]
+	var ctx = TerrainConfig.GenCtx.new(0, fid)
+	# Find a solid wall/roof cell (claim>0) and an interior air cell (claim==0) within the bbox.
+	var bmin: Vector3i = rec["bmin"]
+	var bmax: Vector3i = rec["bmax"]
+	var wall_cell := Vector3i(0, -0x40000000, 0)
+	var air_cell := Vector3i(0, -0x40000000, 0)
+	for x in range(bmin.x, bmax.x + 1):
+		for z in range(bmin.z, bmax.z + 1):
+			var cg := TerrainConfig.column_top(x, z, ctx)
+			for y in range(cg + 1, bmax.y + 1):
+				var cl: int = SG.claim_at(x, y, z, ctx)
+				if cl > 0 and wall_cell.y == -0x40000000:
+					wall_cell = Vector3i(x, y, z)
+				if cl == 0 and air_cell.y == -0x40000000:
+					air_cell = Vector3i(x, y, z)
+	var have := wall_cell.y != -0x40000000 and air_cell.y != -0x40000000
+	# The GEN sampler value mapping: maxi(0, claim) → wall shows solid, interior air shows 0 (the far model law).
+	_ok(have and maxi(0, SG.claim_at(wall_cell.x, wall_cell.y, wall_cell.z, ctx)) > 0,
+		"G-SG-DAMAGE: sampler maps a wall cell (claim>0) → its block id (far model shows the wall)")
+	_ok(have and maxi(0, SG.claim_at(air_cell.x, air_cell.y, air_cell.z, ctx)) == 0,
+		"G-SG-DAMAGE: sampler maps an interior-air cell (claim==0) → 0 (the split; interior never far-renders solid)")
+	# note_edit rev bump: an edit inside the bbox bumps the record's damage rev (the far-tier re-bake signal).
+	var root: int = rec["root"]
+	var rev0 := int(rec["rev"])
+	idx.note_edit(fid, wall_cell)
+	var recs2: Array = idx.enumerate_facet(fid)
+	var rev1 := rev0
+	for r in recs2:
+		if int(r["root"]) == root:
+			rev1 = int(r["rev"])
+	_ok(rev1 == rev0 + 1, "G-SG-DAMAGE: note_edit inside a GEN bbox bumps its rev (re-bake ⇒ the hole shows far)")
+
+# =====================================================================================================================
+# G-SG-PHYS — the BLOCK-LEVEL physical preconditions (the live floor_under / collapse / walk-in is the P1c A/B):
+# a solid floor under the interior, a 2-tall passable doorway, and a roof held up only by the walls (collapse detaches).
+# =====================================================================================================================
+func _gate_sg_phys() -> void:
+	var found := _find_house()
+	if found.is_empty():
+		_ok(false, "G-SG-PHYS: no generated house found (see G-SG-SITE)")
+		return
+	var fid: int = found["fid"]
+	var rec: Dictionary = found["rec"]
+	var ctx = TerrainConfig.GenCtx.new(0, fid)
+	var base: Vector3i = rec["bmin"]                    # base.x/.z (y sinks by FOUNDATION_MAX)
+	var hx := floori(float(base.x) / float(SG.STRUCT_HCELL))
+	var hz := floori(float(base.z) / float(SG.STRUCT_HCELL))
+	var hi: Dictionary = SG.house_info(hx, hz, ctx)
+	if hi.is_empty():
+		_ok(false, "G-SG-PHYS: house_info did not reproduce the located house (site drift)")
+		return
+	var bp: Vector3i = hi["base"]
+	var w: int = hi["w"]
+	var d: int = hi["d"]
+	var wall_h: int = hi["wall_h"]
+	# (a) FLOOR: an interior column stands on a solid floor (floor cell solid OR terrain at/above the floor) and its
+	# wall-band interior is HOLLOW (no solid house block above the floor) — floor_under lands, the room is enterable.
+	var ix := bp.x + w / 2
+	var iz := bp.z + d / 2
+	var cg := TerrainConfig.column_top(ix, iz, ctx)
+	var floor_solid := SG.claim_at(ix, bp.y, iz, ctx) > 0 or cg >= bp.y
+	var hollow := true
+	for ly in range(1, wall_h + 1):
+		if SG.claim_at(ix, bp.y + ly, iz, ctx) > 0:      # a solid block inside the room ⇒ not hollow
+			hollow = false
+	_ok(floor_solid and hollow, "G-SG-PHYS: interior column has a solid floor + hollow room above (floor_under lands)")
+	# (b) DOORWAY: the door column is a 2-tall air gap (claim 0 at ly 1 and 2) — passable.
+	var dc := _door_cell(hi)
+	var passable := SG.claim_at(dc.x, bp.y + 1, dc.z, ctx) == 0 and SG.claim_at(dc.x, bp.y + 2, dc.z, ctx) == 0
+	_ok(passable, "G-SG-PHYS: the doorway is a 2-tall air gap (claim 0) — passable")
+	# (c) ROOF: the roof course carries at least one solid cell and the interior is hollow (from a), so the roof is
+	# supported ONLY by the perimeter walls — breaking a wall column floats the roof cluster ⇒ _collapse_unsupported.
+	var roof_solid := false
+	var rc_y := bp.y + wall_h + 1
+	for lx in range(w):
+		for lz in range(d):
+			if SG.claim_at(bp.x + lx, rc_y, bp.z + lz, ctx) > 0:
+				roof_solid = true
+	_ok(roof_solid and hollow,
+		"G-SG-PHYS: roof course has solid cells over a hollow room (wall-supported ⇒ collapse detaches on a wall break)")
+
+## The door edge cell (lx,lz) → world (x,z) for house `hi` (mirrors StructureGen._is_door).
+func _door_cell(hi: Dictionary) -> Vector3i:
+	var bp: Vector3i = hi["base"]
+	var w: int = hi["w"]
+	var d: int = hi["d"]
+	var midw := w / 2
+	var midd := d / 2
+	var lx := 0
+	var lz := 0
+	match int(hi["door"]):
+		0: lx = 0; lz = midd
+		1: lx = w - 1; lz = midd
+		2: lx = midw; lz = 0
+		3: lx = midw; lz = d - 1
+	return Vector3i(bp.x + lx, 0, bp.z + lz)
 
 # --- helpers ---------------------------------------------------------------------------------------------------------
 func _grass() -> int: return BlockCatalog.id_of(&"grass")

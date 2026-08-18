@@ -89,14 +89,17 @@ var _dbg_rebuilds := 0
 # =====================================================================================================================
 const _SHADER := "shader_type spatial;
 render_mode unshaded, cull_disabled;
-uniform vec3 debris_tint = vec3(0.42, 0.34, 0.24);
+uniform vec3 debris_tint = vec3(0.52, 0.47, 0.42);   // CARD: a lighter neutral rock/hull grey (was muddy brown 0.42,0.34,0.24)
+uniform vec3 beacon_tint = vec3(1.00, 0.96, 0.86);   // DOT: a bright warm-white star/beacon so a distant space object POPS
 varying flat float v_alpha;
 varying flat float v_bright;
+varying flat float v_kind;                            // INSTANCE_CUSTOM.w: 0 = DOT (beacon), 1 = CARD
 float _obj_dither(vec2 fc) { return fract(sin(dot(floor(fc), vec2(12.9898, 78.233))) * 43758.5453); }
 void vertex() {
 	float hs = INSTANCE_CUSTOM.x;
 	v_alpha = INSTANCE_CUSTOM.y;
 	v_bright = INSTANCE_CUSTOM.z;
+	v_kind = INSTANCE_CUSTOM.w;
 	vec3 origin = MODEL_MATRIX[3].xyz;
 	vec3 right = INV_VIEW_MATRIX[0].xyz;
 	vec3 up = INV_VIEW_MATRIX[1].xyz;
@@ -105,7 +108,8 @@ void vertex() {
 }
 void fragment() {
 	if (_obj_dither(FRAGCOORD.xy) > v_alpha) discard;
-	ALBEDO = debris_tint * v_bright;
+	vec3 tint = (v_kind < 0.5) ? beacon_tint : debris_tint;   // DOT = bright beacon, CARD = neutral hull
+	ALBEDO = tint * v_bright;
 }
 "
 

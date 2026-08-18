@@ -37,6 +37,11 @@ const KIND_DOT := 0.0
 const KIND_CARD := 1.0
 const MOTION_EPS_PX := 0.5         # awake body rewrites only when its screen centre moved ≥ this (design §P1)
 const CAM_EPS := 0.25              # camera move (blocks) that forces a rewrite regardless of per-object motion
+# P3 (FP_OBJ_LOD_SPACE): clamp a CLASS_SPACE beacon to this eye-distance (blocks) so it never approaches the far
+# plane. D_SKY (cosmos_sky.gd:27) is where the Sun/Moon impostors sit and is well inside the ≥9000 orbital clip —
+# a distant space beacon placed among the sky shell is both depth-safe and thematically correct. Its on-screen
+# angular size is preserved by beacon_placement regardless of the clamp (the gate asserts it).
+const BEACON_CLAMP_DIST := 8000.0
 
 # The shared unit billboard quad (corners at ±1 in XY, z=0) — one triangle pair. Built once; the vertex shader
 # billboards + scales it by the per-instance world half-size, so the full quad spans 2·half_size (a diameter).
@@ -46,6 +51,11 @@ var _ring: Node3D = null
 var _registry: ObjectRegistry = null
 var _budget_bytes := ObjectLod.OBJ_LOD_BYTES_MAX
 var _material: ShaderMaterial = null
+
+# P3 (FP_OBJ_LOD_SPACE): occluding body spheres in the SAME world frame as the camera / object centres. Each entry
+# is {"center": Vector3, "radius": float}. Empty ⇒ no occlusion test (the P1 default). Set per frame by the owner
+# (WorldManager, planet render centre + voxel radius). Read only inside the FP_OBJ_LOD_SPACE branch ⇒ byte-off.
+var _occluders: Array = []
 
 var _dot_mmi: MultiMeshInstance3D = null
 var _dot_mm: MultiMesh = null
@@ -156,6 +166,18 @@ func _make_mmi(mm: MultiMesh, node_name: String) -> MultiMeshInstance3D:
 # Per-frame tick (live) — fetch the live Camera3D (fov + device height ⇒ K_px), dirty-gate, route + apply.
 # =====================================================================================================================
 
+## P3 (FP_OBJ_LOD_SPACE): set the occluding body spheres (world frame). Each entry {"center": Vector3, "radius":
+## float}. Only consulted inside the FP_OBJ_LOD_SPACE / CLASS_SPACE branch — a no-op influence when the flag is off.
+func set_occluders(occ: Array) -> void:
+	_occluders = occ
+
+## True iff the eye→center segment is blocked by ANY registered occluder body (P3 must-fix #4).
+func _beacon_occluded(eye: Vector3, center: Vector3) -> bool:
+	for b in _occluders:
+		if ObjectLod.beacon_occluded(eye, center, b["center"] as Vector3, float(b["radius"])):
+			return true
+	return false
+
 ## `cam` is the live Camera3D. `viewport_h_px` is the device (drawable) viewport height. No-op if not set up.
 func step(cam: Camera3D, viewport_h_px: float) -> void:
 	if _ring == null or _registry == null or cam == null:
@@ -227,19 +249,35 @@ func _compute(cam_world: Vector3, kpx: float, parent: Transform3D) -> Dictionary
 		var cullr := ObjectLod.cull(cls, proj)
 		if not bool(cullr["draw"]):
 			continue                                            # debris faded fully out (< 0.5 px) — nothing drawn
-		var origin: Vector3 = parent_inv * center               # #131 frame-weld: explicit map into the ring's space
 		var alpha: float = float(cullr["fade"])
 		var is_dot := (rep == ObjectLod.REP_DOT)
+		var origin: Vector3                                     # #131 frame-weld: written in the ring's parent-local space
 		var hs: float
-		if is_dot:
-			# size the dot so its screen diameter == dot_px:  2·hs/d·kpx = dot_px  ⇒  hs = dot_px·d/(2·kpx)
-			var dot_px: float = float(cullr["dot_px"])
-			hs = (dot_px * dist / (2.0 * kpx)) if kpx > 0.0 else r
+		var bright := 1.0
+		# P3 (FP_OBJ_LOD_SPACE): CLASS_SPACE never-cull beacon — planet occlusion + clamped-distance placement. Gated on
+		# the const so with the flag off this branch is dead and the else path is byte-identical to P1 (and no CLASS_SPACE
+		# object is ever registered when the flag is off anyway).
+		if CubeSphere.FP_OBJ_LOD_SPACE and cls == ObjectLod.CLASS_SPACE:
+			if _beacon_occluded(cam_world, center):
+				continue                                        # behind the planet — emit no beacon row (stays L0-hidden)
+			# on-screen size to preserve: the beacon dot floor for a dot, else the card's true angular size (proj).
+			var screen_px: float = float(cullr["dot_px"]) if is_dot else proj
+			var place := ObjectLod.beacon_placement(cam_world, center, screen_px, kpx, BEACON_CLAMP_DIST)
+			origin = parent_inv * (place["origin"] as Vector3)  # map the CLAMPED world point into the ring's space
+			hs = float(place["hs"])
+			if is_dot:
+				bright = ObjectLod.beacon_brightness(proj)      # flux-conserving p^2 dimming of a sub-pixel emitter
 		else:
-			hs = r                                              # card at the object's true angular size (2r/d·kpx)
+			origin = parent_inv * center                        # #131 frame-weld: explicit map into the ring's space
+			if is_dot:
+				# size the dot so its screen diameter == dot_px:  2*hs/d*kpx = dot_px  =>  hs = dot_px*d/(2*kpx)
+				var dot_px: float = float(cullr["dot_px"])
+				hs = (dot_px * dist / (2.0 * kpx)) if kpx > 0.0 else r
+			else:
+				hs = r                                          # card at the object's true angular size (2r/d*kpx)
 		far.append({
 			"id": id, "kind": (KIND_DOT if is_dot else KIND_CARD), "proj": proj,
-			"origin": origin, "hs": hs, "alpha": alpha, "bright": 1.0, "awake": bool(d["awake"]),
+			"origin": origin, "hs": hs, "alpha": alpha, "bright": bright, "awake": bool(d["awake"]),
 		})
 	# Budget: priority = proj desc; cap dots/cards by ObjectLod caps AND total bytes.
 	far.sort_custom(func(a, b): return a["proj"] > b["proj"])

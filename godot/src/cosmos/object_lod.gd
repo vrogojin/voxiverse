@@ -181,6 +181,55 @@ static func beacon_brightness(p: float) -> float:
 	return clampf(r * r, 0.0, 1.0)
 
 # ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+# P3 CLASS_SPACE beacon geometry (FP_OBJ_LOD_SPACE) — pure/gate-certified (verify_object_space.gd), consumed by
+# FacetFarObjects only behind the flag. Occlusion mirrors cosmos_sky.gd:418-426 (analytic ray-vs-body-sphere,
+# angular radius asin(R/dist)); the clamped placement realises "no reversed-Z / log-depth on gl_compat" safely.
+# ─────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+## True iff the segment eye→target is blocked by the body sphere (center `bc`, radius `br`) — i.e. `target` sits
+## behind the body's disc AND beyond its near limb along the eye→target ray. The angular test mirrors
+## cosmos_sky.occlusion_factor (asin(R/dist) disc half-angle, :418-426); the extra depth term (chord entry
+## distance t_near) rejects an object that lies in FRONT of the sphere but happens to project onto its disc.
+## A behind-planet beacon would otherwise shine through terrain (must-fix #4). No occlusion if the body is
+## degenerate (br ≤ 0) or the eye is at the target/body centre.
+static func beacon_occluded(eye: Vector3, target: Vector3, bc: Vector3, br: float) -> bool:
+	if br <= 0.0:
+		return false
+	var to_body := bc - eye
+	var db := to_body.length()
+	if db <= 0.0:
+		return false                                             # eye at the body centre — degenerate
+	var to_obj := target - eye
+	var do_obj := to_obj.length()
+	if do_obj <= 0.0:
+		return false
+	var ang_radius := asin(clampf(br / db, 0.0, 1.0))            # the body's angular radius from the eye (cosmos_sky:422)
+	var cos_sep := clampf(to_body.dot(to_obj) / (db * do_obj), -1.0, 1.0)
+	var sep := acos(cos_sep)
+	if sep >= ang_radius:
+		return false                                             # object direction clear of the body's disc ⇒ visible
+	# The ray enters the sphere at t_near = db·cosθ − √(R² − db²·sin²θ). Occluded only if the object is AT/BEYOND it.
+	var t_near := db * cos_sep - sqrt(maxf(0.0, br * br - db * db * (1.0 - cos_sep * cos_sep)))
+	return do_obj > t_near
+
+## Clamped-distance, angular-size-preserving beacon placement. gl_compat WebGL2 has no reversed-Z / log-depth, so a
+## billboard at the object's true (possibly enormous) distance risks far-plane clipping / depth loss. Place it at
+## d_place = min(true_dist, clamp_dist) along the eye→target ray and size its world half-extent so its ON-SCREEN
+## diameter stays exactly `screen_px` (the object's TRUE projected size the caller already computed): from
+## screen_px = 2·hs / d_place · kpx ⇒ hs = screen_px · d_place / (2·kpx). Returns {"origin" (WORLD point), "hs"
+## (world half-size), "d_place"}. Because hs is derived FROM d_place, the projected px is preserved by construction
+## (the gate asserts 2·hs/d_place·kpx == screen_px). Degenerate (dist ≤ 0 or kpx ≤ 0) ⇒ origin = target, hs = 0.
+static func beacon_placement(eye: Vector3, target: Vector3, screen_px: float, kpx: float, clamp_dist: float) -> Dictionary:
+	var to := target - eye
+	var dist := to.length()
+	if dist <= 0.0 or kpx <= 0.0:
+		return {"origin": target, "hs": 0.0, "d_place": dist}
+	var d_place := minf(dist, clamp_dist)
+	var origin := eye + (to / dist) * d_place
+	var hs := screen_px * d_place / (2.0 * kpx)
+	return {"origin": origin, "hs": hs, "d_place": d_place}
+
+# ─────────────────────────────────────────────────────────────────────────────────────────────────────────
 # Never-OOM budget — the boot-time proxy → ledger-tier selection (pure; the renderer applies it in P1+).
 # WebGL2 cannot read VRAM and over-allocation LOSES the GL context, so we DO NOT probe-grow: we pick a tier up
 # front from coarse proxies and may only DEMOTE mid-session. The gate certifies the pick is monotone + capped.

@@ -69,6 +69,8 @@ var _far: FarTerrain                  # far-distance analytic heightmap layer (L
 var _facet_ring: FacetFarRing         # COSMOS FACETED §5.2: the planet rendered around the active facet (faceted mode)
 var _obj_registry: ObjectRegistry = null   # COSMOS-OBJECT-LOD P1 (FP_OBJ_LOD_DEBRIS): live physical-object index; null off
 var _far_objects: FacetFarObjects = null   # COSMOS-OBJECT-LOD P1: the far-object DOT+CARD tier; null off (byte-identical)
+var _dev_space_obj: DevSpaceObject = null  # COSMOS-OBJECT-LOD P3 (FP_OBJ_LOD_SPACE): the dev CLASS_SPACE test object; null off
+var _dev_space_spawned := false            # one-shot latch — the dev object spawns on the first frame the player pos is known
 var _skin: Node3D = null              # COSMOS SEAMLESS-SCALES C3: the heightfield skin tier; null unless FP_SKIN_TIER
 var _facet_tex: FacetTexBaker = null  # COSMOS LOD-TEXTURE Phase 1: per-facet baked far texture; null unless FP_FACET_TEX
 # COSMOS-BACKGROUND-PREBAKE (FP_BG_PREBAKE): last update_streaming call's Time.get_ticks_usec(), for the
@@ -865,6 +867,12 @@ func _process(delta: float) -> void:
 	if _far_objects != null:
 		var _cam := get_viewport().get_camera_3d() if get_viewport() != null else null
 		if _cam != null:
+			# COSMOS-OBJECT-LOD P3 (FP_OBJ_LOD_SPACE): spawn the dev CLASS_SPACE object once the player pos is known, and
+			# feed the tier this frame's planet occluder (render centre + voxel radius, same world frame as the camera) so
+			# a beacon behind the planet is dropped (must-fix #4). OFF ⇒ neither runs (no dev object, no occluder) ⇒ byte-off.
+			if CubeSphere.FP_OBJ_LOD_SPACE:
+				_maybe_spawn_dev_space_object()
+				_far_objects.set_occluders([{"center": planet_render_centre(), "radius": FacetAtlas.R_BLOCKS}])
 			_far_objects.step(_cam, get_viewport().get_visible_rect().size.y)
 	# COSMOS-PERF UNATTENDED R3: also skip the main-thread snow step while the ORBITAL near field is frozen (composes
 	# with FP_SNOW_SKIP_AIRBORNE — either predicate suppresses the step; no snow accumulates visibly from orbit).
@@ -1768,6 +1776,32 @@ func is_edited_column(x: int, z: int) -> bool:
 # --- COSMOS-OBJECT-LOD P1 (FP_OBJ_LOD_DEBRIS) registry hooks -------------------
 # Called by VoxelBody._enter_tree / _exit_tree (both gated on the flag). No-op when the registry doesn't exist
 # (flag off, or non-faceted with no ring), so the VoxelBody hook stays inert ⇒ byte-identical off.
+
+# --- COSMOS-OBJECT-LOD P3 (FP_OBJ_LOD_SPACE) dev test object ------------------
+# Spawn ONE CLASS_SPACE test object (DevSpaceObject) radially +2500 blocks above the player's spawn point so the P3
+# beacon ladder is live-verifiable. One-shot, deferred to the first frame the player position is known. Only reached
+# under FP_OBJ_LOD_SPACE (gated at the call site) ⇒ never spawned / registered with the flag off (byte-identical).
+const DEV_SPACE_ALT := 2500.0   # radial altitude above the player spawn (blocks)
+
+func _maybe_spawn_dev_space_object() -> void:
+	if _dev_space_spawned or not _have_player_pos or _far_objects == null or _obj_registry == null:
+		return
+	_dev_space_spawned = true
+	var centre := planet_render_centre()                       # planet centre in the current render frame
+	var ppos := _last_player_pos
+	var up := ppos - centre                                    # radial up = direction from the planet centre to the player
+	if up.length() < 0.001:
+		up = -gravity_vector()                                 # degenerate fallback (centre unknown): use −gravity
+	up = up.normalized()
+	var spawn_pos := ppos + up * DEV_SPACE_ALT
+	_dev_space_obj = DevSpaceObject.new()
+	_dev_space_obj.name = "DevSpaceObject"
+	add_child(_dev_space_obj)
+	_dev_space_obj.global_position = spawn_pos
+	_obj_registry.register(_dev_space_obj, ObjectLod.CLASS_SPACE)
+	var alt := spawn_pos.distance_to(centre) - FacetAtlas.R_BLOCKS
+	print("  [FP_OBJ_LOD_SPACE] DevSpaceObject spawned at world ", spawn_pos,
+		"  (player spawn ", ppos, " + radial_up*", DEV_SPACE_ALT, ")  radial altitude ", alt, " blocks")
 
 func register_far_object(node: Object) -> void:
 	if _obj_registry != null:

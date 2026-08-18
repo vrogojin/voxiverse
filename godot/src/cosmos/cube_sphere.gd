@@ -731,6 +731,19 @@ const FP_OBJ_LOD := false
 ## are P3 FP_OBJ_LOD_SPACE. OFF ⇒ no registry, no tier, the VoxelBody hook is inert (never registered, rev never
 ## bumped, mesh never hidden) ⇒ BYTE-IDENTICAL (nothing constructs or reads any of it).
 const FP_OBJ_LOD_DEBRIS := false
+
+## FP_OBJ_LOD_SPACE (docs/COSMOS-OBJECT-LOD-DESIGN.md P3): CLASS_SPACE (ships / stations / asteroids) far-render on
+## top of the P1 tier. A CLASS_SPACE object is NEVER hard-culled — below the 2 px dot floor it draws a beacon dot
+## clamped to P_POINT with brightness ∝ p² (ObjectLod.beacon_brightness), and it is placed at a CLAMPED distance
+## along the eye→object ray (gl_compat WebGL2 has no reversed-Z / log-depth, so a beacon at a huge true distance
+## would clip the far plane) scaled to preserve its true on-screen angular size (ObjectLod.beacon_placement). Before
+## a beacon row is emitted the eye→object segment is tested against each occluding body sphere (the planet; Moon is
+## a clean seam) so a beacon behind the planet does not shine through terrain (must-fix #4,
+## ObjectLod.beacon_occluded, mirroring cosmos_sky.gd:418-426). This flag ALSO spawns ONE dev CLASS_SPACE test
+## object (DevSpaceObject, a ~40-block station stand-in) radially +2500 blocks above the player spawn so the tier is
+## live-verifiable. OFF ⇒ the dev object is never spawned and every CLASS_SPACE branch in FacetFarObjects is gated
+## out ⇒ the P1 tier is wire-identical (BYTE-IDENTICAL). Requires FP_OBJ_LOD_DEBRIS (the registry + tier it extends).
+const FP_OBJ_LOD_SPACE := false
 const PLANET_MAP_TEXELS := 64              # texels/facet edge → 64 over ~417 blocks = 6.5 blocks/texel (4× the 16-texel base; sub-px from orbit). 128 made the whole-planet bake 4× dearer than it needs — the band (1 blk/texel) sharpens close approach.
 const PLANET_MAP_QUAD := 12                # facets per sub-page quadrant edge (12·128 = 1536 < 4096); 2×2 quadrants/face → 24 layers
 const BAND_LAYERS_BIG := 240   # WebGL2 GL_MAX_ARRAY_TEXTURE_LAYERS spec-min is 256; 512 FAILED live (band vanished) -> 240 safe. Whole-planet coverage comes from the A3 page tier (24 layers), not a giant band.

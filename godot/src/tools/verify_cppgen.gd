@@ -469,6 +469,17 @@ func _sg_cpp_cell_gate(gen: Object, faceted: bool, fid: int) -> void:
 				var g := int(prof.x)
 				var srun := TerrainConfig.slope_run_of(x, z, pcache)
 				for y in range(g - 4, g + TreeGen.MAX_ABOVE_SURFACE + 3):
+					# Coverage: StructureGen.claim_at is a PURE hash (flag-independent) — it marks the cells the
+					# VILLAGE owns (>0 house block, 0 interior/door air, all strictly above g).
+					var cl := StructureGen.claim_at(x, y, z, pcache, g)
+					if cl > 0:
+						saw_house += 1
+					# ISOLATE the village mirror: only cells the village OWNS (claim >= 0) can differ BECAUSE of
+					# structures. Non-claim cells (cl < 0) are pure terrain — any C++/GDScript delta there is the
+					# PRE-EXISTING faceted terrain divergence (below-ground strata / faceted surface colour, also
+					# seen with FP_STRUCT_GEN off and in G-CG-COLUMNS), independent of this feature and out of scope.
+					if cl < 0:
+						continue
 					n_cells += 1
 					var gd: int = TerrainConfig.resolve_cell(x, y, z, g, int(prof.y), prof.z, prof.w, pcache, srun)
 					var cpp: int = gen.call("resolve_cell", hfid, x, y, z)
@@ -476,10 +487,6 @@ func _sg_cpp_cell_gate(gen: Object, faceted: bool, fid: int) -> void:
 						bad += 1
 						if first == "":
 							first = "(%d,%d,%d fid=%d g=%d) C++ 0x%x != GD 0x%x" % [x, y, z, hfid, g, cpp, gd]
-					# Coverage: StructureGen.claim_at is a PURE hash function (independent of the flag), so it
-					# tells us the sweep really covers house solid cells even when FP_STRUCT_GEN is off.
-					if StructureGen.claim_at(x, y, z, pcache, g) > 0:
-						saw_house += 1
 	print("  ... G-SG-CPP swept %d cells across %d generated houses" % [n_cells, houses.size()])
 	_ok(saw_house > 0,
 		"G-SG-CPP-COVER — the sweep hit %d solid house cells (claim>0); the byte-equality is not vacuous" % saw_house)

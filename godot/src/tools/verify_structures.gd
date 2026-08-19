@@ -55,6 +55,7 @@ func _initialize() -> void:
 	_gate_sg_off()
 	_gate_sg_site()
 	_gate_sg_biject_env()
+	_gate_sg_level()
 	_gate_sg_root()
 	_gate_sg_damage()
 	_gate_sg_phys()
@@ -102,6 +103,15 @@ func _gate_sg_off() -> void:
 	_ok(SG.STRUCT_H_MAX + SG.STRUCT_FLAT_TOL <= TreeGen.MAX_ABOVE_SURFACE,
 		"G-SG-ENV: STRUCT_H_MAX + STRUCT_FLAT_TOL (%d) ≤ TreeGen.MAX_ABOVE_SURFACE (%d) — the height budget holds" \
 			% [SG.STRUCT_H_MAX + SG.STRUCT_FLAT_TOL, TreeGen.MAX_ABOVE_SURFACE])
+	# CARVE-TO-MIN budget: base_y = min footprint corner ⇒ house top = base_y + 1 (floor) + roof_top_ly ≤
+	# base_y + 1 + STRUCT_H_MAX = min_corner + 12 ≤ (any corner-bounded footprint column g) + 14. Carve cells
+	# are AIR at y ≤ g. So the whole-block air-ceiling stencil (max_above = 14) stays valid with no changes.
+	_ok(1 + SG.STRUCT_H_MAX <= TreeGen.MAX_ABOVE_SURFACE,
+		"G-SG-ENV: carve-to-min house top over the pad (1 + STRUCT_H_MAX = %d) ≤ MAX_ABOVE_SURFACE (%d)" \
+			% [1 + SG.STRUCT_H_MAX, TreeGen.MAX_ABOVE_SURFACE])
+	_ok(SG.STRUCT_LEVEL_TOL >= SG.STRUCT_FLAT_TOL,
+		"G-SG-ENV: STRUCT_LEVEL_TOL (%d) admits rolling-plains sites the old ≤ FLAT_TOL (%d) gate rejected" \
+			% [SG.STRUCT_LEVEL_TOL, SG.STRUCT_FLAT_TOL])
 	_ok(SG.STRUCT_V == SG.STRUCT_HPV * SG.STRUCT_HCELL,
 		"G-SG-ENV: V == HPV·HCELL (houses tile the village exactly ⇒ each house inside its own H-cell)")
 
@@ -143,7 +153,7 @@ func _gate_sg_site() -> void:
 	var rec: Dictionary = found["rec"]
 	var fid: int = found["fid"]
 	var ctx = TerrainConfig.GenCtx.new(0, fid)
-	var base: Vector3i = rec["bmin"]                    # bmin.x/.z == base.x/.z (bmin only sinks y by FOUNDATION_MAX)
+	var base: Vector3i = rec["bmin"]                    # bmin.x/.z == footprint base.x/.z (bmin.y = base_y + 1)
 	var vx := floori(float(base.x) / float(SG.STRUCT_V))
 	var vz := floori(float(base.z) / float(SG.STRUCT_V))
 	var ax := vx * SG.STRUCT_V + SG.STRUCT_V / 2
@@ -153,6 +163,18 @@ func _gate_sg_site() -> void:
 		"G-SG-SITE: the located village anchor biome is B_PLAINS (or B_SAVANNA under FP_CLIMATE_BIOMES)")
 	_ok(TerrainConfig.column_top(ax, az, ctx) > TerrainConfig.SEA_LEVEL + 2,
 		"G-SG-SITE: the village anchor is above SEA_LEVEL + 2 (no drowned village)")
+	# CARVE-TO-MIN: villages now sit on ≤ STRUCT_LEVEL_TOL-variation sites (rolling plains), not just pre-flat
+	# ground — but never a sheer cliff. Measure the anchor 4×4 stencil variation and assert it is within cap.
+	var smn := 0x7fffffff
+	var smx := -0x7fffffff
+	for iz in range(4):
+		for ix in range(4):
+			var h := TerrainConfig.column_top(ax + ix * 8, az + iz * 8, ctx)
+			smn = mini(smn, h)
+			smx = maxi(smx, h)
+	_ok(smx - smn <= SG.STRUCT_LEVEL_TOL,
+		"G-SG-SITE: the located village site variation (%d) ≤ STRUCT_LEVEL_TOL (%d) — rolling plains, not a cliff" \
+			% [smx - smn, SG.STRUCT_LEVEL_TOL])
 
 # =====================================================================================================================
 # G-SG-BIJECT + G-SG-ENV — every claim_at non-air cell lies inside an enumerated record bbox (and inside its H-cell);
@@ -167,7 +189,7 @@ func _gate_sg_biject_env() -> void:
 	var recs: Array = found["recs"]
 	var ctx = TerrainConfig.GenCtx.new(0, fid)
 	var all_in := true
-	var none_below := true
+	var pad_untouched := true
 	var budget_ok := true
 	var in_hcell := true
 	# H-cell containment of every record bbox (jitter keeps the whole footprint inside one H-cell).
@@ -177,26 +199,31 @@ func _gate_sg_biject_env() -> void:
 		if floori(float(bmin.x) / float(SG.STRUCT_HCELL)) != floori(float(bmax.x) / float(SG.STRUCT_HCELL)) \
 			or floori(float(bmin.z) / float(SG.STRUCT_HCELL)) != floori(float(bmax.z) / float(SG.STRUCT_HCELL)):
 			in_hcell = false
-	# Scan a padded region around each record and assert claim>0 lands ONLY inside some record's bbox.
+	# Scan a padded region around each record. CARVE-TO-MIN invariants:
+	#  * all_in    — every SOLID claim (>0) lands inside some record bbox.
+	#  * pad_untouched — no claim (≥0) at y ≤ base_y (below the pad): the sub-floor strata stay natural terrain.
+	#  * budget_ok — every SOLID claim (>0) is within the roof budget (y ≤ base_y + 1 + STRUCT_H_MAX) AND within
+	#                MAX_ABOVE_SURFACE of the column ground g. (Carve AIR cells (0) are legitimately at y ≤ g.)
 	for r in recs:
 		var bmin: Vector3i = r["bmin"]
 		var bmax: Vector3i = r["bmax"]
+		var base_y := bmin.y - 1                         # bmin.y = base_y + 1 (floor); base_y = min footprint corner
 		for x in range(bmin.x - 3, bmax.x + 4):
 			for z in range(bmin.z - 3, bmax.z + 4):
 				var cg := TerrainConfig.column_top(x, z, ctx)
-				for y in range(cg - SG.FOUNDATION_MAX - 2, cg + 18):
+				for y in range(base_y - 6, base_y + SG.STRUCT_H_MAX + 8):
 					var cl: int = SG.claim_at(x, y, z, ctx)
-					if cl >= 0:
-						if y <= cg:
-							none_below = false
-						if y - cg > TreeGen.MAX_ABOVE_SURFACE:
+					if cl >= 0 and y <= base_y:
+						pad_untouched = false                # a claim at/below the pad ⇒ sub-floor NOT untouched
+					if cl > 0:
+						if y > base_y + 1 + SG.STRUCT_H_MAX or y - cg > TreeGen.MAX_ABOVE_SURFACE:
 							budget_ok = false
-					if cl > 0 and not _inside_any(recs, x, y, z):
-						all_in = false
+						if not _inside_any(recs, x, y, z):
+							all_in = false
 	_ok(all_in, "G-SG-BIJECT: every claim_at solid (>0) cell lies inside an enumerated record bbox")
 	_ok(in_hcell, "G-SG-ENV: every record bbox is contained in a single H-cell (no claim outside the H-cell)")
-	_ok(none_below, "G-SG-ENV: no claim at/below the column ground g (the sub-surface stackup stays untouched)")
-	_ok(budget_ok, "G-SG-ENV: no claim above g + MAX_ABOVE_SURFACE (the height-budget clamp holds)")
+	_ok(pad_untouched, "G-SG-ENV: no claim at/below base_y (the flattened pad's solid base stays natural terrain)")
+	_ok(budget_ok, "G-SG-ENV: every solid claim within the roof budget AND ≤ g + MAX_ABOVE_SURFACE (carve stays ≤ g)")
 	# Reproduce-from-hashes: a FRESH index enumerates byte-identical records.
 	var idx2 = SGI.new()
 	var recs2: Array = idx2.enumerate_facet(fid)
@@ -206,6 +233,48 @@ func _gate_sg_biject_env() -> void:
 			if recs2[i]["root"] != recs[i]["root"] or recs2[i]["bmin"] != recs[i]["bmin"] or recs2[i]["bmax"] != recs[i]["bmax"]:
 				same = false
 	_ok(same, "G-SG-BIJECT: records reproduce byte-identically from the hashes (deterministic enumeration)")
+
+# =====================================================================================================================
+# G-SG-LEVEL — the CARVE actually fires (the whole point of carve-to-min leveling): a footprint column whose ground
+# g > base_y (the min corner) has terrain in (base_y, g] returned as AIR (0) by claim_at — the pad is flattened by
+# carving DOWN, so the house never sits on filled ground (which would blow the height budget).
+# =====================================================================================================================
+func _gate_sg_level() -> void:
+	var idx = SGI.new()
+	var earth_n := 6 * FA.K * FA.K
+	var demonstrated := false
+	var saw_variation := false
+	var depth := 0
+	for fid in range(mini(earth_n, 2000)):
+		var recs: Array = idx.enumerate_facet(fid)
+		if recs.is_empty():
+			continue
+		var ctx = TerrainConfig.GenCtx.new(0, fid)
+		for r in recs:
+			var bmin: Vector3i = r["bmin"]
+			var bmax: Vector3i = r["bmax"]
+			var base_y := bmin.y - 1                     # bmin.y = base_y + 1; base_y = the MIN footprint corner
+			for x in range(bmin.x, bmax.x + 1):
+				for z in range(bmin.z, bmax.z + 1):
+					var cg := TerrainConfig.column_top(x, z, ctx)
+					if cg <= base_y:
+						continue                         # this column is at/below the pad — nothing to carve
+					saw_variation = true
+					# terrain occupies (base_y, cg]; the carve turns the non-house cells there into AIR (0).
+					for y in range(base_y + 1, cg + 1):
+						if SG.claim_at(x, y, z, ctx) == 0:
+							demonstrated = true
+							depth = maxi(depth, cg - base_y)
+							break
+					if demonstrated: break
+				if demonstrated: break
+			if demonstrated: break
+		if demonstrated: break
+	if not saw_variation:
+		_ok(true, "G-SG-LEVEL: (no scanned village footprint had g > base_y — perfectly flat sites; the carve is a no-op)")
+	else:
+		_ok(demonstrated,
+			"G-SG-LEVEL: carve fires — a footprint column with g > base_y (carve depth %d) has terrain above the pad returned as AIR (0) by claim_at" % depth)
 
 # =====================================================================================================================
 # G-SG-ROOT — GEN roots are NEGATIVE (disjoint from tracker roots ≥ 0), unique, and stable across evict/re-derive.
@@ -255,10 +324,11 @@ func _gate_sg_damage() -> void:
 	var bmax: Vector3i = rec["bmax"]
 	var wall_cell := Vector3i(0, -0x40000000, 0)
 	var air_cell := Vector3i(0, -0x40000000, 0)
+	# CARVE-TO-MIN: the solid house span is [bmin.y (floor = base_y+1) .. bmax.y (roof)]; scan it for a wall
+	# (claim>0) and an interior-air (claim==0) cell (independent of each column's ground g under the carve).
 	for x in range(bmin.x, bmax.x + 1):
 		for z in range(bmin.z, bmax.z + 1):
-			var cg := TerrainConfig.column_top(x, z, ctx)
-			for y in range(cg + 1, bmax.y + 1):
+			for y in range(bmin.y, bmax.y + 1):
 				var cl: int = SG.claim_at(x, y, z, ctx)
 				if cl > 0 and wall_cell.y == -0x40000000:
 					wall_cell = Vector3i(x, y, z)
@@ -293,36 +363,36 @@ func _gate_sg_phys() -> void:
 	var fid: int = found["fid"]
 	var rec: Dictionary = found["rec"]
 	var ctx = TerrainConfig.GenCtx.new(0, fid)
-	var base: Vector3i = rec["bmin"]                    # base.x/.z (y sinks by FOUNDATION_MAX)
+	var base: Vector3i = rec["bmin"]                    # bmin.x/.z == footprint base.x/.z (bmin.y = base_y + 1)
 	var hx := floori(float(base.x) / float(SG.STRUCT_HCELL))
 	var hz := floori(float(base.z) / float(SG.STRUCT_HCELL))
 	var hi: Dictionary = SG.house_info(hx, hz, ctx)
 	if hi.is_empty():
 		_ok(false, "G-SG-PHYS: house_info did not reproduce the located house (site drift)")
 		return
-	var bp: Vector3i = hi["base"]
+	var bp: Vector3i = hi["base"]                        # bp.y = base_y = MIN footprint corner (the pad)
 	var w: int = hi["w"]
 	var d: int = hi["d"]
 	var wall_h: int = hi["wall_h"]
-	# (a) FLOOR: an interior column stands on a solid floor (floor cell solid OR terrain at/above the floor) and its
-	# wall-band interior is HOLLOW (no solid house block above the floor) — floor_under lands, the room is enterable.
+	# CARVE-TO-MIN: the floor course sits at base_y+1 (bp.y+1), walls at bp.y+2..bp.y+1+wall_h, roof above.
+	# (a) FLOOR: a LEVELED interior column stands on a solid floor course and its wall-band interior is HOLLOW
+	# (the carve removed any terrain that would otherwise fill the room) — floor_under lands flat, room enterable.
 	var ix := bp.x + w / 2
 	var iz := bp.z + d / 2
-	var cg := TerrainConfig.column_top(ix, iz, ctx)
-	var floor_solid := SG.claim_at(ix, bp.y, iz, ctx) > 0 or cg >= bp.y
+	var floor_solid := SG.claim_at(ix, bp.y + 1, iz, ctx) > 0
 	var hollow := true
-	for ly in range(1, wall_h + 1):
-		if SG.claim_at(ix, bp.y + ly, iz, ctx) > 0:      # a solid block inside the room ⇒ not hollow
+	for yy in range(bp.y + 2, bp.y + 2 + wall_h):        # the wall_h interior courses above the floor
+		if SG.claim_at(ix, yy, iz, ctx) > 0:             # a solid block inside the room ⇒ not hollow (no carve gap)
 			hollow = false
-	_ok(floor_solid and hollow, "G-SG-PHYS: interior column has a solid floor + hollow room above (floor_under lands)")
-	# (b) DOORWAY: the door column is a 2-tall air gap (claim 0 at ly 1 and 2) — passable.
+	_ok(floor_solid and hollow, "G-SG-PHYS: leveled interior column has a solid floor + hollow room (floor_under lands flat, no fall-through into the carved notch)")
+	# (b) DOORWAY: the door column is a 2-tall air gap (claim 0 at floor+1, floor+2 = bp.y+2, bp.y+3) — passable.
 	var dc := _door_cell(hi)
-	var passable := SG.claim_at(dc.x, bp.y + 1, dc.z, ctx) == 0 and SG.claim_at(dc.x, bp.y + 2, dc.z, ctx) == 0
+	var passable := SG.claim_at(dc.x, bp.y + 2, dc.z, ctx) == 0 and SG.claim_at(dc.x, bp.y + 3, dc.z, ctx) == 0
 	_ok(passable, "G-SG-PHYS: the doorway is a 2-tall air gap (claim 0) — passable")
 	# (c) ROOF: the roof course carries at least one solid cell and the interior is hollow (from a), so the roof is
 	# supported ONLY by the perimeter walls — breaking a wall column floats the roof cluster ⇒ _collapse_unsupported.
 	var roof_solid := false
-	var rc_y := bp.y + wall_h + 1
+	var rc_y := bp.y + wall_h + 2                        # roof course = base_y + 1 (floor) + wall_h + 1
 	for lx in range(w):
 		for lz in range(d):
 			if SG.claim_at(bp.x + lx, rc_y, bp.z + lz, ctx) > 0:

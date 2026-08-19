@@ -12,13 +12,20 @@ extends RefCounted
 ## on an HCELL sub-lattice (V == HPV·HCELL, so a house is fully inside its own H-cell ⇒ block_at consults only (x,z)'s
 ## OWN sub-cell candidate — O(1), the identical bijection trick TreeGen._base_pos uses for a canopy).
 ##
-## THE HEIGHT-BUDGET LAW (§12.2): claim_at NEVER returns a claim for y > g + (STRUCT_H_MAX + STRUCT_FLAT_TOL) = g+14
-## (= TreeGen.MAX_ABOVE_SURFACE). This CLAMP is applied uniformly by every consumer (near render, far bake, physics),
-## so the streaming fast-path 5×5 air-ceiling stencil + the C++ whole-block early-out stay valid with ZERO changes.
+## CARVE-TO-MIN LEVELING: a village LEVELS its build site instead of REQUIRING pre-flat terrain (per-house pad).
+## base_y = the MINIMUM of the 4 footprint-corner column_tops, so the pad sits at/below every footprint column ⇒ a
+## house only ever CARVES terrain DOWN (returns AIR for terrain above the pad), never FILLS above natural ground —
+## which keeps the height budget: house top = base_y + 1 + roof ≤ min_g + 12 ≤ g + 14 for corner-bounded columns.
+## The sub-floor (y ≤ base_y) is NATURAL terrain, byte-untouched (no foundation) — the solid base of the pad.
 ##
-## claim_at TRI-STATE (§12.3): −1 (no claim — fall through to the sea/snow/cap/tree chain), 0 (interior/door AIR —
-## AUTHORITATIVE, suppresses the snow stack + smoothing lip inside the house), >0 (a house block id). The tri-state
-## is the whole ballgame for interiors — a binary AIR-vs-block design re-opens the snow-filled-interior trap.
+## THE HEIGHT-BUDGET LAW (§12.2): the tallest solid claim is the roof at base_y + 1 + roof_top_ly ≤ base_y + 12 ≤
+## g + 14 (= TreeGen.MAX_ABOVE_SURFACE), and carve AIR cells are ≤ g. The whole-BLOCK air-ceiling stencil (max_above
+## = 14, keyed on the block's MAX column height ≥ min corner) therefore stays valid with ZERO changes.
+##
+## claim_at TRI-STATE (§12.3): −1 (no claim — fall through to natural terrain / sea / snow / cap / tree), 0 (AIR —
+## AUTHORITATIVE: interior/door air AND the carved footprint above the pad, suppressing the snow stack + smoothing
+## lip), >0 (a house block id, which OVERRIDES the carve — a buried floor/wall course wins over the terrain it cuts).
+## Consulted at y ≤ g (the solid stackup, to carve) AND y > g (airspace); flag-off ⇒ never consulted ⇒ byte-identical.
 
 # --- placement lattice (columns) ---------------------------------------------------------------------------------
 const STRUCT_V := 192               # village lattice pitch (columns) — ~2-4 candidate cells per facet
@@ -29,8 +36,10 @@ const STRUCT_FOOT_MIN := 5          # smallest footprint dimension
 const VILLAGE_CHANCE := 0.05        # salt 201 gate on the (vx, vz) village cell
 const HOUSE_CHANCE := 0.55          # salt 202 gate per (hx, hz) sub-cell inside a live village
 const STRUCT_H_MAX := 11            # §12.2 tallest cell over base: walls ≤ 4 + roof ≤ 7 (gable capped to fit)
-const STRUCT_FLAT_TOL := 3          # §12.2/§12.4 footprint-corner flatness gate (max−min column_top)
-const FOUNDATION_MAX := 4           # cobble skirt filled below the floor (bridges the ≤ FLAT_TOL site slope)
+const STRUCT_FLAT_TOL := 3          # §12.2 height-budget slack: STRUCT_H_MAX + STRUCT_FLAT_TOL = MAX_ABOVE_SURFACE = 14
+const STRUCT_LEVEL_TOL := 16        # CARVE-TO-MIN: site/footprint terrain-variation cap — villages on rolling plains,
+									 # NOT sheer cliffs; also bounds the per-column carve depth to ≤ 16 below the pad
+const FOUNDATION_MAX := 4           # legacy (no foundation under carve-to-min); kept for record/scan padding
 const WALL_MIN := 3                 # wall course count ∈ [3, 4]
 const WALL_MAX := 4
 
@@ -113,7 +122,9 @@ static func has_village(vx: int, vz: int, pcache = null) -> bool:
 	var az := vz * STRUCT_V + STRUCT_V / 2
 	if not _site_biome_ok(TerrainConfig.biome_at(ax, az, pcache)):
 		return false
-	# 4×4 flat stencil at pitch 8 (a 24-block span), max−min column_top ≤ 4.
+	# CARVE-TO-MIN cliff exclusion: measure the site's terrain variation over a 4×4 stencil (pitch 8, a
+	# 24-block span) and reject only SHEER sites (variation > STRUCT_LEVEL_TOL). Villages now level rolling
+	# plains instead of requiring pre-flat ground; the ≤16 cap bounds how deep a house carves its pad.
 	var mn := 0x7fffffff
 	var mx := -0x7fffffff
 	for iz in range(4):
@@ -121,7 +132,7 @@ static func has_village(vx: int, vz: int, pcache = null) -> bool:
 			var h := TerrainConfig.column_top(ax + ix * 8, az + iz * 8, pcache)
 			mn = mini(mn, h)
 			mx = maxi(mx, h)
-	if mx - mn > 4:
+	if mx - mn > STRUCT_LEVEL_TOL:
 		return false
 	# Above the water line so no half-drowned village.
 	if TerrainConfig.column_top(ax, az, pcache) <= TerrainConfig.SEA_LEVEL + 2:
@@ -167,13 +178,15 @@ static func house_info(hx: int, hz: int, pcache = null) -> Dictionary:
 		mx = maxi(mx, h)
 		if TerrainConfig.slope_run_fires(TerrainConfig.slope_run_of(cx[i], cz[i], pcache)):
 			return {}                                  # a corner on a firing slope — skip this house
-	if mx - mn > STRUCT_FLAT_TOL:
+	# CARVE-TO-MIN: skip only cliff footprints (variation > STRUCT_LEVEL_TOL); leveled sites are carved down.
+	if mx - mn > STRUCT_LEVEL_TOL:
 		return {}
 	var wall_h := WALL_MIN + int(_hash01(hx, hz, _SALT_WALLH) * float(WALL_MAX - WALL_MIN + 1))
 	var door := int(_hash01(hx, hz, _SALT_DOOR) * 4.0)           # 0=-x 1=+x 2=-z 3=+z
 	var roof := 1 if _hash01(hx, hz, _SALT_ROOF) < 0.5 else 0    # 1 = gabled, 0 = flat
-	# base.y = the highest footprint corner (floor sits flush at the high point; the foundation skirts the gaps).
-	var base_y := mx
+	# CARVE-TO-MIN: base.y = the LOWEST footprint corner. The pad sits at/below every footprint column ground,
+	# so the house only ever CARVES terrain down (never fills above natural ground) — the height budget holds.
+	var base_y := mn
 	# Gable height, capped so wall_h + gable_h ≤ STRUCT_H_MAX (the height budget). < 1 ⇒ fall back to flat.
 	var gable_h := 0
 	if roof == 1:
@@ -197,8 +210,8 @@ static func _roof_top_ly(hi: Dictionary) -> int:
 
 
 # =====================================================================================================================
-# claim_at (§12.3) — the hot-path tri-state query, consulted BESIDE TreeGen.block_at at the two resolve_cell airspace
-# sites. −1 fall-through / 0 authoritative interior air / >0 house block id.
+# claim_at (§12.3) — the hot-path tri-state query, consulted BESIDE the terrain stackup at the resolve_cell sites
+# (airspace y>g for the house, AND the solid y≤g path for the CARVE). −1 fall-through / 0 authoritative air / >0 block.
 #   `g` (optional): the column ground the caller already computed (resolve_cell passes it → zero recompute). Omitted
 #   callers (the decimator sampler, the gates) supply _NO_G and claim_at reads column_top itself — the SAME value.
 # =====================================================================================================================
@@ -207,8 +220,12 @@ static func claim_at(x: int, y: int, z: int, pcache = null, g: int = _NO_G) -> i
 	# y-window early-out with ZERO structure hashes (§12.3). The UPPER bound IS the height-budget law (§12.2): no
 	# claim ever exceeds g + (STRUCT_H_MAX + STRUCT_FLAT_TOL) = g+14 = TreeGen.MAX_ABOVE_SURFACE, applied uniformly by
 	# every consumer, so the streaming air-ceiling stencil never clips a house cell it didn't account for.
-	if y <= cg:
-		return -1                                      # NEVER claim at/below ground (the stackup stays byte-untouched)
+	# CARVE-TO-MIN LOWER early-out: a house never touches y ≤ base_y (the natural pad base), and base_y = the
+	# min footprint corner ≥ cg − STRUCT_LEVEL_TOL for a corner-bounded column, so the deepest carve/floor cell
+	# is > cg − STRUCT_LEVEL_TOL. Cells deeper than that can never be a claim (this bounds the carve depth too).
+	# Replaces the old `y ≤ cg → −1` guard: the carve now DELIBERATELY fires at y ≤ g (to level the footprint).
+	if cg - y > STRUCT_LEVEL_TOL:
+		return -1                                      # below any possible flattened pad — natural terrain
 	if y - cg > STRUCT_H_MAX + STRUCT_FLAT_TOL:
 		return -1                                      # above every possible roof — the height-budget clamp
 	# Village gate (1 hash kills ~95% of surviving columns), then the house gate, then the O(1) own-cell template.
@@ -237,16 +254,20 @@ static func _template_block(hi: Dictionary, x: int, y: int, z: int, cg: int) -> 
 	var lz := z - base.z
 	if lx < 0 or lx >= w or lz < 0 or lz >= d:
 		return -1                                      # outside the footprint
-	if y <= cg:
-		return -1                                      # terrain owns at/below ground (foundation only skirts ABOVE cg)
-	var ly := y - base.y
-	if ly > _roof_top_ly(hi):
-		return -1                                      # above the house → open sky
-	# Foundation (below the floor, above this column's ground): the solid cobble skirt.
+	# CARVE-TO-MIN: the floor sits ONE course above the pad (base_y+1). ly < 0 (y ≤ base_y) is the natural
+	# terrain forming the platform's solid base — byte-untouched, NO foundation fill (base_y = min footprint
+	# corner ⇒ every footprint column is solid up to base_y, so there is nothing to fill).
+	var ly := y - base.y - 1
 	if ly < 0:
-		return _FOUNDATION
+		return -1                                      # y ≤ base_y → natural pad base (fall through)
+	if ly > _roof_top_ly(hi):
+		# Above the house roof: terrain poking above the flattened pad (base_y < y ≤ g) is CARVED to air;
+		# open sky above g stays fall-through.
+		if y <= cg:
+			return 0                                   # CARVE — authoritative air (levels the footprint)
+		return -1                                      # open sky above g
 	if ly == 0:
-		return _FLOOR                                  # solid floor course
+		return _FLOOR                                  # solid floor course at base_y+1
 	var wall_h: int = hi["wall_h"]
 	if ly <= wall_h:
 		var edge := (lx == 0 or lx == w - 1 or lz == 0 or lz == d - 1)
@@ -324,8 +345,9 @@ static func make_record(fid: int, hi: Dictionary) -> Dictionary:
 	var w: int = hi["w"]
 	var d: int = hi["d"]
 	var rtop := _roof_top_ly(hi)
-	var bmin := Vector3i(base.x, base.y - FOUNDATION_MAX, base.z)
-	var bmax := Vector3i(base.x + w - 1, base.y + rtop, base.z + d - 1)
+	# CARVE-TO-MIN: the house solid span is [base_y+1 (floor) .. base_y+1+rtop (roof)] — NO foundation below.
+	var bmin := Vector3i(base.x, base.y + 1, base.z)
+	var bmax := Vector3i(base.x + w - 1, base.y + 1 + rtop, base.z + d - 1)
 	var ex := maxi(maxi(bmax.x - bmin.x + 1, bmax.y - bmin.y + 1), bmax.z - bmin.z + 1)
 	return {
 		"source": SOURCE_GEN,
@@ -335,7 +357,7 @@ static func make_record(fid: int, hi: Dictionary) -> Dictionary:
 		"bmax": bmax,
 		"rev": 0,
 		"count": (bmax.x - bmin.x + 1) * (bmax.y - bmin.y + 1) * (bmax.z - bmin.z + 1),
-		"mats": {_WALL: 1, _FOUNDATION: 1, _ROOF: 1},
+		"mats": {_WALL: 1, _FLOOR: 1, _ROOF: 1},
 		"max_extent": ex,
 	}
 

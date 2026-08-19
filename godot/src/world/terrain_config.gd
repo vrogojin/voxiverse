@@ -1463,6 +1463,15 @@ static func resolve_cell(x: int, y: int, z: int, g: int, biome: int, c: float, t
 		if y <= SEA_LEVEL:
 			return _sea_block(t, y)
 		return TreeGen.block_at(x, y, z, pcache)
+	# COSMOS STRUCTURES CARVE-TO-MIN (§12.3, FP_STRUCT_GEN): a village house LEVELS its footprint by carving
+	# terrain above the flattened pad (base_y = the MIN footprint corner). claim_at now fires at y <= g too:
+	# >0 is a buried floor/wall course that OVERRIDES terrain, 0 is authoritative AIR (the carve / hollow
+	# interior). Consulted BEFORE the solid stackup so the pad is flattened DOWN (never filled up ⇒ the height
+	# budget holds). Flag off ⇒ never consulted (byte-identical) — this is the only hot-path cost of the flag.
+	if CubeSphere.FP_STRUCT_GEN:
+		var _cl := StructureGen.claim_at(x, y, z, pcache, g)
+		if _cl >= 0:
+			return _cl                                    # >0 buried house block, 0 = carved AIR (both override terrain)
 	var id := _surface_rule(x, y, z, g, biome, c, t)
 	# The stone -> deepslate/strata/ore rewrite applies to INTERIOR stone only (y < g). A B_MOUNTAINS
 	# column tops with STONE at y == g (its cappable rock peak); guarding on `y < g` keeps that top a

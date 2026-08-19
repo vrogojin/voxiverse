@@ -1,8 +1,8 @@
 diff --git a/generators/cosmos/cosmos_terrain.h b/generators/cosmos/cosmos_terrain.h
-index 35e125a..5c13009 100644
+index 35e125a..5376598 100644
 --- a/generators/cosmos/cosmos_terrain.h
 +++ b/generators/cosmos/cosmos_terrain.h
-@@ -130,6 +130,33 @@ constexpr int CACTUS_MIN = 1;
+@@ -130,6 +130,34 @@ constexpr int CACTUS_MIN = 1;
  constexpr int CACTUS_MAX = 3;
  constexpr double CACTUS_DENSITY = 0.3;
  
@@ -18,8 +18,9 @@ index 35e125a..5c13009 100644
 +constexpr double VILLAGE_CHANCE = 0.05;  // salt 201 gate on the (vx, vz) village cell
 +constexpr double HOUSE_CHANCE = 0.55;    // salt 202 gate per (hx, hz) sub-cell inside a live village
 +constexpr int STRUCT_H_MAX = 11;         // §12.2 tallest cell over base: walls <= 4 + roof <= 7
-+constexpr int STRUCT_FLAT_TOL = 3;       // §12.2/§12.4 footprint-corner flatness gate (max-min column_top)
-+constexpr int FOUNDATION_MAX = 4;        // cobble skirt filled below the floor
++constexpr int STRUCT_FLAT_TOL = 3;       // §12.2 height-budget slack (STRUCT_H_MAX+FLAT_TOL = MAX_ABOVE_SURFACE=14)
++constexpr int STRUCT_LEVEL_TOL = 16;     // CARVE-TO-MIN: site/footprint terrain-variation cap (rolling plains, not cliffs; bounds carve depth)
++constexpr int FOUNDATION_MAX = 4;        // legacy (no foundation under carve-to-min); kept for record padding
 +constexpr int WALL_MIN = 3;              // wall course count in [3, 4]
 +constexpr int WALL_MAX = 4;
 +// StructureGen salt registry (structure_gen.gd:38-46). StructureGen OWNS 201-209.
@@ -37,7 +38,7 @@ index 35e125a..5c13009 100644
  
  // Ore distribution tables (terrain_config.gd:273-281). Constants, so mirrored directly.
 diff --git a/generators/cosmos/voxel_generator_cosmos.cpp b/generators/cosmos/voxel_generator_cosmos.cpp
-index 36600c1..59e6f36 100644
+index 36600c1..d21dde9 100644
 --- a/generators/cosmos/voxel_generator_cosmos.cpp
 +++ b/generators/cosmos/voxel_generator_cosmos.cpp
 @@ -158,6 +158,23 @@ bool VoxelGeneratorCosmos::setup(Dictionary config) {
@@ -64,7 +65,7 @@ index 36600c1..59e6f36 100644
  	p.facet_frame = PackedFloat64Array(config.get("facet_frame", PackedFloat64Array()));
  	p.facet_off = get_i32_param(config, "facet_off");
  	p.facet_r_blocks = double(config.get("facet_r_blocks", 0.0));
-@@ -1491,6 +1508,263 @@ Vector4i VoxelGeneratorCosmos::slope_run_targets(int r, int g) {
+@@ -1491,6 +1508,272 @@ Vector4i VoxelGeneratorCosmos::slope_run_targets(int r, int g) {
  			((r >> 12) & 15) - 4 + g);
  }
  
@@ -115,8 +116,8 @@ index 36600c1..59e6f36 100644
 +			mx = maxi(mx, h);
 +		}
 +	}
-+	if (mx - mn > 4) {
-+		return false;
++	if (mx - mn > STRUCT_LEVEL_TOL) {
++		return false; // CARVE-TO-MIN: reject only sheer-cliff sites (>16 variation); rolling plains are leveled
 +	}
 +	if (col_h(p, fid, ax, az) <= SEA_LEVEL + 2) {
 +		return false; // above the water line -- no half-drowned village
@@ -161,13 +162,13 @@ index 36600c1..59e6f36 100644
 +			return hi; // a corner on a firing slope -- skip this house
 +		}
 +	}
-+	if (mx - mn > STRUCT_FLAT_TOL) {
-+		return hi;
++	if (mx - mn > STRUCT_LEVEL_TOL) {
++		return hi; // CARVE-TO-MIN: skip only cliff footprints (>16); leveled sites are carved down to base_y
 +	}
 +	const int wall_h = WALL_MIN + int(tree_hash01(hx, hz, SALT_WALLH) * double(WALL_MAX - WALL_MIN + 1));
 +	const int door = int(tree_hash01(hx, hz, SALT_DOOR) * 4.0); // 0=-x 1=+x 2=-z 3=+z
 +	int roof = tree_hash01(hx, hz, SALT_ROOF) < 0.5 ? 1 : 0;    // 1 = gabled, 0 = flat
-+	const int base_y = mx;                                       // floor flush at the high corner
++	const int base_y = mn;                                       // CARVE-TO-MIN: pad at the LOWEST footprint corner
 +	int gable_h = 0;
 +	if (roof == 1) {
 +		gable_h = mini(d / 2, STRUCT_H_MAX - wall_h); // capped so wall_h + gable_h <= STRUCT_H_MAX
@@ -268,18 +269,23 @@ index 36600c1..59e6f36 100644
 +	if (lx < 0 || lx >= w || lz < 0 || lz >= d) {
 +		return -1; // outside the footprint
 +	}
-+	if (y <= cg) {
-+		return -1; // terrain owns at/below ground (foundation only skirts ABOVE cg)
-+	}
-+	const int ly = y - hi.base_y;
-+	if (ly > struct_roof_top_ly(hi)) {
-+		return -1; // above the house -> open sky
-+	}
++	// CARVE-TO-MIN: the floor sits ONE course above the pad (base_y+1). ly<0 (y<=base_y) is the natural
++	// terrain forming the platform's solid base -- byte-untouched, NO foundation fill (base_y = min footprint
++	// corner => every footprint column is solid up to base_y, so there is nothing to fill).
++	const int ly = y - hi.base_y - 1;
 +	if (ly < 0) {
-+		return p.struct_foundation; // cobble skirt below the floor
++		return -1; // y <= base_y -> natural pad base (fall through)
++	}
++	if (ly > struct_roof_top_ly(hi)) {
++		// Above the house roof: terrain poking above the flattened pad (base_y < y <= g) is CARVED to air;
++		// open sky above g stays fall-through.
++		if (y <= cg) {
++			return 0; // CARVE -- authoritative air (levels the footprint down to the pad)
++		}
++		return -1; // open sky above g
 +	}
 +	if (ly == 0) {
-+		return p.struct_floor; // solid floor course
++		return p.struct_floor; // solid floor course at base_y+1
 +	}
 +	const int wall_h = hi.wall_h;
 +	if (ly <= wall_h) {
@@ -305,8 +311,12 @@ index 36600c1..59e6f36 100644
 +// computed (== int(prof.x) == col_h), so there is ZERO recompute. -1 fall-through / 0 interior air / >0
 +// house block id. The y-window early-out (ZERO structure hashes) IS the §12.2 height-budget clamp.
 +int VoxelGeneratorCosmos::struct_claim_at(const Parameters &p, int fid, int x, int y, int z, int cg) {
-+	if (y <= cg) {
-+		return -1; // NEVER claim at/below ground (the stackup stays byte-untouched)
++	// CARVE-TO-MIN LOWER early-out: a house never touches y <= base_y (the natural pad base), and base_y =
++	// min footprint corner >= cg - STRUCT_LEVEL_TOL for a corner-bounded column, so the deepest carve/floor
++	// cell is > cg - STRUCT_LEVEL_TOL. Cells more than STRUCT_LEVEL_TOL below cg can never be a claim (this
++	// is also the carve-depth bound). Was `y <= cg -> -1`; carve now fires at y <= g so that guard is gone.
++	if (cg - y > STRUCT_LEVEL_TOL) {
++		return -1; // below any possible flattened pad -- natural terrain (byte-untouched)
 +	}
 +	if (y - cg > STRUCT_H_MAX + STRUCT_FLAT_TOL) {
 +		return -1; // above every possible roof -- the height-budget clamp (14 = TreeGen.MAX_ABOVE_SURFACE)
@@ -328,7 +338,7 @@ index 36600c1..59e6f36 100644
  // --- THE cell resolver -------------------------------------------------------------------------
  // Port of TerrainConfig.resolve_cell (the worker path: slope_run passed in, pcache non-null).
  int64_t VoxelGeneratorCosmos::resolve_cell_core(
-@@ -1509,6 +1783,20 @@ int64_t VoxelGeneratorCosmos::resolve_cell_core(
+@@ -1509,6 +1792,20 @@ int64_t VoxelGeneratorCosmos::resolve_cell_core(
  	if (biome == B_PILLAR) {
  		return y <= g ? p.id_bedrock : ID_AIR;
  	}
@@ -349,7 +359,7 @@ index 36600c1..59e6f36 100644
  
  	// SHARP-SLOPE. slope_run is always >= 0 here (worker path hoists it); < 0 would mean recompute,
  	// which the emit loop never asks for.
-@@ -1541,6 +1829,15 @@ int64_t VoxelGeneratorCosmos::resolve_cell_core(
+@@ -1541,6 +1838,15 @@ int64_t VoxelGeneratorCosmos::resolve_cell_core(
  			return with_snow_state(p, fid, with_shore_liquid(p, cc_pack(smat, smod, 0, 0), y, t), g, t);
  		}
  		if (y >= hi) {
@@ -365,7 +375,7 @@ index 36600c1..59e6f36 100644
  			if (y <= SEA_LEVEL) {
  				return sea_block(p, t, y);
  			}
-@@ -1555,6 +1852,16 @@ int64_t VoxelGeneratorCosmos::resolve_cell_core(
+@@ -1555,6 +1861,16 @@ int64_t VoxelGeneratorCosmos::resolve_cell_core(
  	}
  
  	if (y > g) {
@@ -382,7 +392,24 @@ index 36600c1..59e6f36 100644
  		if (y == g + 1) {
  			const int64_t cap = surface_cap(p, fid, x, z, g, biome, t);
  			if (cap != ID_AIR) {
-@@ -1852,7 +2159,12 @@ VoxelGenerator::Result VoxelGeneratorCosmos::generate_block(VoxelQueryData input
+@@ -1572,6 +1888,16 @@ int64_t VoxelGeneratorCosmos::resolve_cell_core(
+ 		return tree_block_at(p, fid, x, y, z);
+ 	}
+ 
++	// COSMOS STRUCTURES CARVE-TO-MIN (§12.3): a village house LEVELS its footprint by carving terrain above
++	// the flattened pad (base_y = min footprint corner). struct_claim_at now fires at y <= g too: >0 is a
++	// buried floor/wall course overriding terrain, 0 is authoritative AIR (the carve / interior). Consulted
++	// BEFORE the solid stackup so the pad is flattened. Off (struct_gen false) => never entered => byte-identical.
++	if (p.struct_gen) {
++		const int cl = struct_claim_at(p, fid, x, y, z, g);
++		if (cl >= 0) {
++			return int64_t(cl); // >0 buried house block, 0 = carved AIR (both override terrain)
++		}
++	}
+ 	int id = surface_rule(p, x, y, z, g, biome, c, t);
+ 	if (id == p.id_stone && y < g) {
+ 		id = deep_family(p, x, y, z);
+@@ -1852,7 +2178,12 @@ VoxelGenerator::Result VoxelGeneratorCosmos::generate_block(VoxelQueryData input
  	const int oz = input.origin_in_voxels.z;
  	const unsigned int ch = VoxelBuffer::CHANNEL_TYPE;
  	const int sea = SEA_LEVEL;

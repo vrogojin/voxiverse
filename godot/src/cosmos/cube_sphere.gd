@@ -1116,7 +1116,7 @@ const FP_STRUCT_FAR := false                 # P0: StructDecimator + FacetFarStr
 ## no work during fresh-load pile-up). Off ⇒ the shipped credit gate verbatim (byte-identical). Needs FP_STRUCT_FAR.
 const FP_STRUCT_NEAR_GUARD := false          # §4.2: credit-independent bounded structures step (double-render + missing/restore)
 const FP_STRUCT_GEN := false                 # P1: StructureGen worldgen (declared, unused in P0)
-const FP_STRUCT_LOD := false                 # P2: LOD-B band + orbit exception + roof texels (declared, unused in P0)
+const FP_STRUCT_LOD := false                 # P2 (§7.4a): far-skin roof-pixels — houses composite their roof colour into the fine map like tree canopy
 const STRUCT_MIN_BLOCKS := 16               # §4.1 a cluster is a structure at ≥ this many placed blocks
 const STRUCT_MIN_EXTENT := 3                 # §4.1 AND bbox extent ≥ this on at least two axes (filters pillars/floors)
 const STRUCT_TRACK_MAX := 65536             # §4.3 NEVER-OOM: max tracked placed cells (degrade past, never grow)

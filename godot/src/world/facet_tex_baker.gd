@@ -1380,6 +1380,12 @@ func _bm_compute_slice_flat(r0: int, r1: int, nx: int, ny: int, lc: PackedVector
 			var bid := -1
 			if have_edits:
 				bid = int(_edit_snap.get(Vector2i(lxs[i], lzs[i]), -1))   # dig-out air / placed block wins
+			if bid < 0 and CubeSphere.FP_STRUCT_LOD:
+				# COSMOS STRUCTURES P2 (§7.4a): house roof-pixel wins over tree canopy (edit > house > tree > terrain).
+				# Flag off ⇒ short-circuit skips the consult entirely ⇒ byte-identical.
+				var hdeco := StructureGen.top_decoration(lxs[i], lzs[i], ctx)
+				if hdeco != BlockCatalog.AIR:
+					bid = hdeco
 			if bid < 0:
 				var deco := TreeGen.top_decoration(lxs[i], lzs[i], ctx)   # cheap: has_tree gate early-outs to AIR
 				if deco != BlockCatalog.AIR:
@@ -2071,6 +2077,11 @@ func _pbm_compute(i: int) -> void:
 						var eb := int(esnap.get(Vector2i(lxs[idx], lzs[idx]), -1))
 						if eb >= 0:
 							fi = FarPalette.far_color_index_of_block(eb)
+					if fi < 0 and CubeSphere.FP_STRUCT_LOD:
+						# COSMOS STRUCTURES P2 (§7.4a): house roof-pixel wins over tree canopy (edit > house > tree > terrain).
+						var hdeco := StructureGen.top_decoration(lxs[idx], lzs[idx], ctx)
+						if hdeco != BlockCatalog.AIR:
+							fi = FarPalette.far_color_index(BlockCatalog.color_of(hdeco))
 					if fi < 0:
 						var deco := TreeGen.top_decoration(lxs[idx], lzs[idx], ctx)
 						if deco != BlockCatalog.AIR:
@@ -2092,6 +2103,11 @@ func _pbm_compute(i: int) -> void:
 					var eb := int(esnap.get(Vector2i(lx, lz), -1))
 					if eb >= 0:
 						fi = FarPalette.far_color_index_of_block(eb)
+				if fi < 0 and CubeSphere.FP_STRUCT_LOD:
+					# COSMOS STRUCTURES P2 (§7.4a): house roof-pixel wins over tree canopy (edit > house > tree > terrain).
+					var hdeco := StructureGen.top_decoration(lx, lz, ctx)
+					if hdeco != BlockCatalog.AIR:
+						fi = FarPalette.far_color_index_of_block(hdeco) if CubeSphere.FP_SKIN_BLOCK_EXACT else FarPalette.far_color_index(BlockCatalog.color_of(hdeco))
 				if fi < 0:
 					var deco := TreeGen.top_decoration(lx, lz, ctx)   # cheap has_tree early-out on non-tree columns
 					if deco != BlockCatalog.AIR:

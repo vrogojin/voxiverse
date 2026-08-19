@@ -1,5 +1,5 @@
 diff --git a/generators/cosmos/cosmos_terrain.h b/generators/cosmos/cosmos_terrain.h
-index 35e125a..5376598 100644
+index 35e125a..b0b467d 100644
 --- a/generators/cosmos/cosmos_terrain.h
 +++ b/generators/cosmos/cosmos_terrain.h
 @@ -130,6 +130,34 @@ constexpr int CACTUS_MIN = 1;
@@ -38,10 +38,10 @@ index 35e125a..5376598 100644
  
  // Ore distribution tables (terrain_config.gd:273-281). Constants, so mirrored directly.
 diff --git a/generators/cosmos/voxel_generator_cosmos.cpp b/generators/cosmos/voxel_generator_cosmos.cpp
-index 36600c1..d21dde9 100644
+index 36600c1..66b8fae 100644
 --- a/generators/cosmos/voxel_generator_cosmos.cpp
 +++ b/generators/cosmos/voxel_generator_cosmos.cpp
-@@ -158,6 +158,23 @@ bool VoxelGeneratorCosmos::setup(Dictionary config) {
+@@ -158,6 +158,27 @@ bool VoxelGeneratorCosmos::setup(Dictionary config) {
  	p.climate_biomes = bool(config.get("climate_biomes", false));
  	p.skin_block_exact = bool(config.get("skin_block_exact", false));
  
@@ -50,6 +50,10 @@ index 36600c1..d21dde9 100644
 +	// supplied => legacy" sentinel discipline: an old pck without these keys never claims a structure cell, so
 +	// an old-binary/new-pck (or vice-versa) pairing degrades to byte-identical legacy instead of diverging.
 +	p.struct_gen = bool(config.get("struct_gen", false));
++	// COSMOS STRUCTURES P2 (§7.4a far-skin roof-pixels): mirror CubeSphere.FP_STRUCT_LOD -- gates bake_far_tile's
++	// struct_top_decoration roof-pixel consult (BESIDE the tree branch). Default false (key absent) => the far
++	// tile-bake never consults the house claim => byte-identical legacy (the 0011 "not supplied => legacy" discipline).
++	p.struct_lod = bool(config.get("struct_lod", false));
 +	p.struct_earth_facets = int(config.get("struct_earth_facets", 0));
 +	p.struct_foundation = int(config.get("struct_foundation", 0));
 +	p.struct_floor = int(config.get("struct_floor", 0));
@@ -65,7 +69,7 @@ index 36600c1..d21dde9 100644
  	p.facet_frame = PackedFloat64Array(config.get("facet_frame", PackedFloat64Array()));
  	p.facet_off = get_i32_param(config, "facet_off");
  	p.facet_r_blocks = double(config.get("facet_r_blocks", 0.0));
-@@ -1491,6 +1508,272 @@ Vector4i VoxelGeneratorCosmos::slope_run_targets(int r, int g) {
+@@ -1491,6 +1512,304 @@ Vector4i VoxelGeneratorCosmos::slope_run_targets(int r, int g) {
  			((r >> 12) & 15) - 4 + g);
  }
  
@@ -335,10 +339,42 @@ index 36600c1..d21dde9 100644
 +	return struct_template_block(p, hi, x, y, z, cg);
 +}
 +
++// COSMOS STRUCTURES P2 (§7.4a far-skin roof-pixels): a LINE-FOR-LINE port of StructureGen.top_decoration
++// (structure_gen.gd) -- the id of the TOPMOST SOLID house block (roof/wall/post/floor) over column (x, z), or
++// ID_AIR when no house covers it above ground. The StructureGen analogue of tree_top_decoration; built ENTIRELY
++// from the ported struct primitives (struct_has_village / struct_house_info / col_h / struct_claim_at) so it cannot
++// disagree with resolve_cell_core's own placements. Cheap early-out mirroring struct_claim_at's ordering: the
++// 1-hash village gate then the house gate kill every non-house column. On a house column, scans that column's OWN
++// bounded span [g+1 .. g+STRUCT_H_MAX+STRUCT_FLAT_TOL] top-down (= struct_claim_at's y-window upper bound), first
++// SOLID (>0) wins; 0 (carved-air interior / door) is NOT decoration. Consulted ONLY by bake_far_tile (F1, gated by
++// p.struct_lod). Byte-equal to the GDScript oracle -- G-SG-SKIN-CPP proves it.
++int VoxelGeneratorCosmos::struct_top_decoration(const Parameters &p, int fid, int x, int z) {
++	const int vx = int(floori(double(x) / double(STRUCT_V)));
++	const int vz = int(floori(double(z) / double(STRUCT_V)));
++	if (!struct_has_village(p, fid, vx, vz)) {
++		return ID_AIR; // 1-hash village gate -- non-village columns cost ~one hash
++	}
++	const int hx = int(floori(double(x) / double(STRUCT_HCELL)));
++	const int hz = int(floori(double(z) / double(STRUCT_HCELL)));
++	if (!struct_house_info(p, fid, hx, hz).valid) {
++		return ID_AIR; // no house covers (x, z)'s OWN H-cell
++	}
++	const int g = col_h(p, fid, x, z); // this column's ground -- the SAME cg struct_claim_at derives
++	// GDScript's `for y in range(g + STRUCT_H_MAX + STRUCT_FLAT_TOL, g, -1)`: y from the y-window top down to g+1
++	// inclusive, top-down, first SOLID (>0) wins. `g` is passed so struct_claim_at never recomputes it.
++	for (int y = g + STRUCT_H_MAX + STRUCT_FLAT_TOL; y > g; --y) {
++		const int cl = struct_claim_at(p, fid, x, y, z, g);
++		if (cl > 0) {
++			return cl;
++		}
++	}
++	return ID_AIR;
++}
++
  // --- THE cell resolver -------------------------------------------------------------------------
  // Port of TerrainConfig.resolve_cell (the worker path: slope_run passed in, pcache non-null).
  int64_t VoxelGeneratorCosmos::resolve_cell_core(
-@@ -1509,6 +1792,20 @@ int64_t VoxelGeneratorCosmos::resolve_cell_core(
+@@ -1509,6 +1828,20 @@ int64_t VoxelGeneratorCosmos::resolve_cell_core(
  	if (biome == B_PILLAR) {
  		return y <= g ? p.id_bedrock : ID_AIR;
  	}
@@ -359,7 +395,7 @@ index 36600c1..d21dde9 100644
  
  	// SHARP-SLOPE. slope_run is always >= 0 here (worker path hoists it); < 0 would mean recompute,
  	// which the emit loop never asks for.
-@@ -1541,6 +1838,15 @@ int64_t VoxelGeneratorCosmos::resolve_cell_core(
+@@ -1541,6 +1874,15 @@ int64_t VoxelGeneratorCosmos::resolve_cell_core(
  			return with_snow_state(p, fid, with_shore_liquid(p, cc_pack(smat, smod, 0, 0), y, t), g, t);
  		}
  		if (y >= hi) {
@@ -375,7 +411,7 @@ index 36600c1..d21dde9 100644
  			if (y <= SEA_LEVEL) {
  				return sea_block(p, t, y);
  			}
-@@ -1555,6 +1861,16 @@ int64_t VoxelGeneratorCosmos::resolve_cell_core(
+@@ -1555,6 +1897,16 @@ int64_t VoxelGeneratorCosmos::resolve_cell_core(
  	}
  
  	if (y > g) {
@@ -392,7 +428,7 @@ index 36600c1..d21dde9 100644
  		if (y == g + 1) {
  			const int64_t cap = surface_cap(p, fid, x, z, g, biome, t);
  			if (cap != ID_AIR) {
-@@ -1572,6 +1888,16 @@ int64_t VoxelGeneratorCosmos::resolve_cell_core(
+@@ -1572,6 +1924,16 @@ int64_t VoxelGeneratorCosmos::resolve_cell_core(
  		return tree_block_at(p, fid, x, y, z);
  	}
  
@@ -409,7 +445,7 @@ index 36600c1..d21dde9 100644
  	int id = surface_rule(p, x, y, z, g, biome, c, t);
  	if (id == p.id_stone && y < g) {
  		id = deep_family(p, x, y, z);
-@@ -1852,7 +2178,12 @@ VoxelGenerator::Result VoxelGeneratorCosmos::generate_block(VoxelQueryData input
+@@ -1852,7 +2214,12 @@ VoxelGenerator::Result VoxelGeneratorCosmos::generate_block(VoxelQueryData input
  	const int oz = input.origin_in_voxels.z;
  	const unsigned int ch = VoxelBuffer::CHANNEL_TYPE;
  	const int sea = SEA_LEVEL;
@@ -423,11 +459,71 @@ index 36600c1..d21dde9 100644
  	const int fid = p.gen_facet;
  
  	// Cheap constant all-air early-outs (no noise).
+@@ -2252,7 +2619,7 @@ PackedByteArray VoxelGeneratorCosmos::bake_far_tile(int fid, PackedVector2Array
+ 			const int lx = int(cosmos::roundi(bilerp(v00x, v10x, v11x, v01x, s, t)));
+ 			const int lz = int(cosmos::roundi(bilerp(v00z, v10z, v11z, v01z, s, t)));
+ 
+-			// EDIT -> TREE -> TERRAIN, mirroring facet_tex_baker.gd's cpp branch exactly.
++			// EDIT -> STRUCT (P2) -> TREE -> TERRAIN, mirroring facet_tex_baker.gd's cpp branch exactly.
+ 			int fi = -1;
+ 			if (have_edits) {
+ 				int32_t ev = 0;
+@@ -2260,6 +2627,14 @@ PackedByteArray VoxelGeneratorCosmos::bake_far_tile(int fid, PackedVector2Array
+ 					fi = ev;
+ 				}
+ 			}
++			// COSMOS STRUCTURES P2 (§7.4a): the house roof-pixel wins over tree canopy (precedence edit > house >
++			// tree > terrain), gated by p.struct_lod. Off => never consulted => byte-identical (the ONLY hot-path cost).
++			if (fi < 0 && p.struct_lod) {
++				const int hdeco = struct_top_decoration(p, fid, lx, lz);
++				if (hdeco != cosmos::ID_AIR) {
++					fi = (hdeco >= 0 && hdeco < p.deco_far_idx.size()) ? p.deco_far_idx[hdeco] : 0;
++				}
++			}
+ 			if (fi < 0) {
+ 				const int deco = tree_top_decoration(p, fid, lx, lz);
+ 				if (deco != cosmos::ID_AIR) {
+@@ -2496,6 +2871,17 @@ int64_t VoxelGeneratorCosmos::resolve_cell(int fid, int x, int y, int z) const {
+ 	return resolve_cell_core(_params, fid, x, y, z, prof, slope_run);
+ }
+ 
++// COSMOS STRUCTURES P2 (§7.4a): the ClassDB-exposed scalar entry point for struct_top_decoration -- the far-skin
++// roof-pixel query. A one-lock wrapper (mirroring resolve_cell) so verify_cppgen's G-SG-SKIN-CPP can drive the C++
++// port directly and prove it byte-equal to StructureGen.top_decoration. Returns ID_AIR on an out-of-range fid.
++int VoxelGeneratorCosmos::struct_top_decoration_query(int fid, int x, int z) const {
++	RWLockRead rlock(_params_lock);
++	if (!_params.ready || !fid_ok(_params, fid)) {
++		return ID_AIR;
++	}
++	return struct_top_decoration(_params, fid, x, z);
++}
++
+ void VoxelGeneratorCosmos::gd_generate_block(Ref<godot::VoxelBuffer> out_buffer, Vector3i origin, int lod) {
+ 	ERR_FAIL_COND(out_buffer.is_null());
+ 	VoxelQueryData q{ out_buffer->get_buffer(), origin, uint32_t(lod) };
+@@ -2520,6 +2906,8 @@ void VoxelGeneratorCosmos::_bind_methods() {
+ 	ClassDB::bind_method(D_METHOD("column_profile", "fid", "x", "z"), &VoxelGeneratorCosmos::column_profile);
+ 	ClassDB::bind_method(D_METHOD("slope_run_of", "fid", "x", "z"), &VoxelGeneratorCosmos::slope_run_of);
+ 	ClassDB::bind_method(D_METHOD("resolve_cell", "fid", "x", "y", "z"), &VoxelGeneratorCosmos::resolve_cell);
++	// COSMOS STRUCTURES P2 (§7.4a): the far-skin roof-pixel query, exposed for the G-SG-SKIN-CPP byte-equality gate.
++	ClassDB::bind_method(D_METHOD("struct_top_decoration", "fid", "x", "z"), &VoxelGeneratorCosmos::struct_top_decoration_query);
+ }
+ 
+ } // namespace zylann::voxel
 diff --git a/generators/cosmos/voxel_generator_cosmos.h b/generators/cosmos/voxel_generator_cosmos.h
-index 438cefd..29bbda0 100644
+index 438cefd..ae6d946 100644
 --- a/generators/cosmos/voxel_generator_cosmos.h
 +++ b/generators/cosmos/voxel_generator_cosmos.h
-@@ -233,6 +233,15 @@ private:
+@@ -228,11 +228,24 @@ public:
+ 	Vector4 column_profile(int fid, int x, int z) const;
+ 	int64_t resolve_cell(int fid, int x, int y, int z) const;
+ 
++	// COSMOS STRUCTURES P2 (§7.4a): ClassDB-exposed far-skin roof-pixel query (one-lock wrapper over the static
++	// struct_top_decoration), so verify_cppgen's G-SG-SKIN-CPP can prove the C++ port byte-equal to GDScript.
++	int struct_top_decoration_query(int fid, int x, int z) const;
++
+ private:
+ 	static void _bind_methods();
  
  	struct Parameters;
  
@@ -443,7 +539,7 @@ index 438cefd..29bbda0 100644
  	// --- THE ONE CORE (see the one-sampler law above) -------------------------------------------
  	// The single implementation of every terrain quantity, shared by all entry points. Pure: reads
  	// only `p` (the frozen epoch) and its arguments. No script callbacks, no singletons, thread-safe
-@@ -287,6 +296,21 @@ private:
+@@ -287,6 +300,24 @@ private:
  	// the primitives above -- see bake_far_tile.
  	static int tree_top_decoration(const Parameters &p, int fid, int x, int z);
  
@@ -461,11 +557,14 @@ index 438cefd..29bbda0 100644
 +	static int struct_roof_block(const Parameters &p, const StructHouse &hi, int lx, int lz, int ly, int w, int d, int wall_h);
 +	static int struct_template_block(const Parameters &p, const StructHouse &hi, int x, int y, int z, int cg);
 +	static int struct_claim_at(const Parameters &p, int fid, int x, int y, int z, int cg);
++	// COSMOS STRUCTURES P2 (§7.4a): topmost SOLID house block over column (x, z) or ID_AIR -- the far-skin
++	// roof-pixel query (StructureGen.top_decoration port), consulted by bake_far_tile beside tree_top_decoration.
++	static int struct_top_decoration(const Parameters &p, int fid, int x, int z);
 +
  	static Vector4 corner_targets(const Parameters &p, int fid, int x, int z);
  	static bool slope_fires_only(const Parameters &p, int fid, int x, int z, int g);
  	static int slope_run_pack(const Vector4i &tw, int g);
-@@ -431,6 +455,26 @@ private:
+@@ -431,6 +462,30 @@ private:
  		bool climate_biomes = false;
  		bool skin_block_exact = false;
  
@@ -476,6 +575,10 @@ index 438cefd..29bbda0 100644
 +		// StructureGen.warm_up does. All default false / 0 so a config that omits them (the 0011 "not
 +		// supplied => legacy" sentinel discipline) never claims a structure cell => byte-identical legacy.
 +		bool struct_gen = false;
++		// COSMOS STRUCTURES P2 (§7.4a far-skin roof-pixels): mirrors CubeSphere.FP_STRUCT_LOD. Gates
++		// bake_far_tile's struct_top_decoration roof-pixel consult (BESIDE the tree branch). Default false
++		// (key absent) => the far tile-bake never consults the house claim => byte-identical legacy.
++		bool struct_lod = false;
 +		int struct_earth_facets = 0;
 +		int struct_foundation = 0; // stone
 +		int struct_floor = 0;      // stone

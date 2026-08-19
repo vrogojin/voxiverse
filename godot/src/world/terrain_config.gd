@@ -543,6 +543,10 @@ static func material_tables() -> Dictionary:
 		# byte-identical legacy (the 0011 "not supplied ⇒ legacy" sentinel discipline). Single home ⇒ near-gen + far
 		# tile-bake gens agree by construction.
 		"struct_gen": CubeSphere.FP_STRUCT_GEN,
+		# COSMOS STRUCTURES P2 (§7.4a far-skin roof-pixels): mirror CubeSphere.FP_STRUCT_LOD — gates the C++
+		# bake_far_tile's struct_top_decoration roof-pixel consult (BESIDE the tree branch). Default-off sentinel
+		# (key absent ⇒ false in setup) ⇒ the far tile-bake never consults the house claim ⇒ byte-identical legacy.
+		"struct_lod": CubeSphere.FP_STRUCT_LOD,
 		"struct_earth_facets": FacetAtlas.facet_count(),
 		"struct_foundation": BlockCatalog.id_of(&"stone"),
 		"struct_floor": BlockCatalog.id_of(&"stone"),

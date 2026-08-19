@@ -241,6 +241,38 @@ static func claim_at(x: int, y: int, z: int, pcache = null, g: int = _NO_G) -> i
 	return _template_block(hi, x, y, z, cg)
 
 
+## COSMOS STRUCTURES P2 (§7.4a far-skin roof-pixels): the id of the TOPMOST SOLID house block (roof / wall / post /
+## floor) StructureGen places OVER column (x, z), or BlockCatalog.AIR when the column carries no house above ground —
+## the StructureGen analogue of TreeGen.top_decoration (tree_gen.gd:208-224). PURE + deterministic: a queryable
+## refactor over the EXISTING claim_at (adds NO new placement logic), so the far roof-pixel matches the near voxel
+## house by construction. Cheap early-out mirroring claim_at's own ordering: the 1-hash village gate (has_village)
+## then the house gate (house_info) kill every non-house column at ~one hash — a non-house column NEVER scans. On a
+## house column it scans that column's OWN bounded vertical span [g+1 .. g+STRUCT_H_MAX+STRUCT_FLAT_TOL] top-down —
+## the SAME 14-cell height budget the tree scan uses (= claim_at's y-window upper bound) — reusing claim_at VERBATIM
+## (same hashes / template / carve), returning the FIRST SOLID (>0) claim: the exposed roof. 0 (carved-air interior /
+## door) is NOT decoration. Threads `pcache` so terrain + houses resolve on the SAME facet. Consulted by
+## facet_tex_baker (gated CubeSphere.FP_STRUCT_LOD at the CALL site — this class is pure) to composite roofs onto the
+## far skin exactly like tree canopy.
+static func top_decoration(x: int, z: int, pcache = null) -> int:
+	var vx := floori(float(x) / float(STRUCT_V))
+	var vz := floori(float(z) / float(STRUCT_V))
+	if not has_village(vx, vz, pcache):
+		return BlockCatalog.AIR                            # 1-hash village gate — non-village columns cost ~one hash
+	var hx := floori(float(x) / float(STRUCT_HCELL))
+	var hz := floori(float(z) / float(STRUCT_HCELL))
+	if house_info(hx, hz, pcache).is_empty():
+		return BlockCatalog.AIR                            # no house covers (x, z)'s OWN H-cell
+	var g := TerrainConfig.column_top(x, z, pcache)        # this column's ground — the SAME cg claim_at derives
+	# Top-down over the house's bounded span [g+1 .. g+STRUCT_H_MAX+STRUCT_FLAT_TOL] (claim_at's y-window upper bound),
+	# reusing claim_at VERBATIM so the far roof-pixel cannot drift from the near voxel world. First SOLID (>0) wins;
+	# 0 (carved-air interior / door / above the roof) is NOT decoration. `g` is passed so claim_at never recomputes it.
+	for y in range(g + STRUCT_H_MAX + STRUCT_FLAT_TOL, g, -1):
+		var id := claim_at(x, y, z, pcache, g)
+		if id > 0:
+			return id
+	return BlockCatalog.AIR
+
+
 ## The house TEMPLATE (§5.2) at world cell (x, y, z) given the house `hi` and this column's ground `cg`. Returns
 ## −1 (outside the house / above the roof / at-or-below ground), 0 (interior / door air — authoritative), or a
 ## house block id (>0). Materials are BlockCatalog ids only, resolved once in warm_up (a house style is a data change).

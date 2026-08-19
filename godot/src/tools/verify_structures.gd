@@ -59,6 +59,7 @@ func _initialize() -> void:
 	_gate_sg_root()
 	_gate_sg_damage()
 	_gate_sg_phys()
+	_gate_sg_skin()
 
 	print("=== VERIFY structures: ", _pass, " passed, ", _fail, " failed ===")
 	quit(1 if _fail > 0 else 0)
@@ -415,6 +416,66 @@ func _door_cell(hi: Dictionary) -> Vector3i:
 		2: lx = midw; lz = 0
 		3: lx = midw; lz = d - 1
 	return Vector3i(bp.x + lx, 0, bp.z + lz)
+
+# =====================================================================================================================
+# G-SG-SKIN (FP_STRUCT_LOD §7.4a far-skin roof-pixels) — StructureGen.top_decoration, the far-skin roof-pixel query
+# that composites houses into the fine map exactly like TreeGen.top_decoration composites canopies. Over a column
+# KNOWN to host a house it returns the topmost SOLID house block (>0, EQUAL to an independent top-down claim scan);
+# over a clearly non-house column (house_info empty) it returns AIR. PURE (the class is pure — no ring / flag needed).
+# Also asserts FP_STRUCT_LOD defaults false (byte-off: the facet_tex_baker + bake_far_tile roof-pixel consults are all
+# flag-gated, so flag-off is byte-identical).
+# =====================================================================================================================
+func _gate_sg_skin() -> void:
+	var found := _find_house()
+	if found.is_empty():
+		_ok(false, "G-SG-SKIN: no generated house found (see G-SG-SITE)")
+		return
+	var fid: int = found["fid"]
+	var rec: Dictionary = found["rec"]
+	var ctx = TerrainConfig.GenCtx.new(0, fid)
+	var bmin: Vector3i = rec["bmin"]
+	var bmax: Vector3i = rec["bmax"]
+	# (a) HOUSE column: a footprint column whose top_decoration returns a SOLID block (>0), and that value EQUALS an
+	# independent topmost-solid claim scan over the SAME y-window — proving it is really the exposed roof-pixel.
+	var hit := false
+	var consistent := true
+	for x in range(bmin.x, bmax.x + 1):
+		for z in range(bmin.z, bmax.z + 1):
+			var td: int = SG.top_decoration(x, z, ctx)
+			if td <= 0:
+				continue
+			hit = true
+			var g := TerrainConfig.column_top(x, z, ctx)
+			var want := BlockCatalog.AIR
+			for y in range(g + SG.STRUCT_H_MAX + SG.STRUCT_FLAT_TOL, g, -1):
+				var cl: int = SG.claim_at(x, y, z, ctx, g)
+				if cl > 0:
+					want = cl
+					break
+			if td != want:
+				consistent = false
+	_ok(hit, "G-SG-SKIN: top_decoration returns a SOLID block (>0) over ≥1 house footprint column")
+	_ok(consistent, "G-SG-SKIN: top_decoration == the topmost SOLID claim over the column (the exposed roof-pixel)")
+	# (b) NON-house column: scan H-cells away from the house for one whose H-cell hosts NO house (house_info empty),
+	# and assert top_decoration returns AIR there (the early-out ⇒ a non-house column costs ~one hash, no scan).
+	var air_ok := false
+	var found_nonhouse := false
+	for off in range(SG.STRUCT_HCELL, SG.STRUCT_HCELL * 40, SG.STRUCT_HCELL):
+		var nx := bmin.x + off
+		var nz := bmin.z
+		var hx := floori(float(nx) / float(SG.STRUCT_HCELL))
+		var hz := floori(float(nz) / float(SG.STRUCT_HCELL))
+		if SG.house_info(hx, hz, ctx).is_empty():
+			found_nonhouse = true
+			air_ok = SG.top_decoration(nx, nz, ctx) == BlockCatalog.AIR
+			break
+	_ok(found_nonhouse and air_ok, "G-SG-SKIN: top_decoration returns AIR over a clearly non-house column (house_info empty)")
+	# (c) a flat / no-facet ctx (fid −1) is body-gated ⇒ never a village ⇒ always AIR (byte-off safe on flat runs).
+	_ok(SG.top_decoration(bmin.x, bmin.z, TerrainConfig.GenCtx.new(0, -1)) == BlockCatalog.AIR,
+		"G-SG-SKIN: a flat/no-facet ctx (fid −1) yields NO roof-pixel (FACETED-gated)")
+	# (d) byte-off: FP_STRUCT_LOD defaults false (the fine-map roof-pixel consults are all flag-gated).
+	_ok(not CubeSphere.FP_STRUCT_LOD,
+		"G-SG-SKIN: FP_STRUCT_LOD defaults false (facet_tex_baker + bake_far_tile consults gated ⇒ byte-identical off)")
 
 # --- helpers ---------------------------------------------------------------------------------------------------------
 func _grass() -> int: return BlockCatalog.id_of(&"grass")

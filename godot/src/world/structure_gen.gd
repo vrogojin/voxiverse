@@ -33,7 +33,7 @@ const STRUCT_HCELL := 32            # house sub-lattice pitch inside a live vill
 const STRUCT_HPV := 6               # HPV := STRUCT_V / STRUCT_HCELL — house sub-cells per axis in a village
 const STRUCT_FOOT_MAX := 11         # footprint ≤ 11×11; jitter ∈ [2, HCELL−w−2] ⇒ whole footprint inside its H-cell
 const STRUCT_FOOT_MIN := 5          # smallest footprint dimension
-const VILLAGE_CHANCE := 0.05        # salt 201 gate on the (vx, vz) village cell
+const VILLAGE_CHANCE := 0.5         # salt 201 gate on the (vx, vz) village cell
 const HOUSE_CHANCE := 0.55          # salt 202 gate per (hx, hz) sub-cell inside a live village
 const STRUCT_H_MAX := 11            # §12.2 tallest cell over base: walls ≤ 4 + roof ≤ 7 (gable capped to fit)
 const STRUCT_FLAT_TOL := 3          # §12.2 height-budget slack: STRUCT_H_MAX + STRUCT_FLAT_TOL = MAX_ABOVE_SURFACE = 14

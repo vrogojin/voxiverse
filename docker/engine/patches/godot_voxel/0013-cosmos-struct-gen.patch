@@ -15,7 +15,7 @@ index 35e125a..5376598 100644
 +constexpr int STRUCT_HPV = 6;            // STRUCT_V / STRUCT_HCELL -- house sub-cells per axis in a village
 +constexpr int STRUCT_FOOT_MAX = 11;      // footprint <= 11x11; jitter in [2, HCELL-dim-2] keeps it inside its H-cell
 +constexpr int STRUCT_FOOT_MIN = 5;       // smallest footprint dimension
-+constexpr double VILLAGE_CHANCE = 0.05;  // salt 201 gate on the (vx, vz) village cell
++constexpr double VILLAGE_CHANCE = 0.5;  // salt 201 gate on the (vx, vz) village cell
 +constexpr double HOUSE_CHANCE = 0.55;    // salt 202 gate per (hx, hz) sub-cell inside a live village
 +constexpr int STRUCT_H_MAX = 11;         // §12.2 tallest cell over base: walls <= 4 + roof <= 7
 +constexpr int STRUCT_FLAT_TOL = 3;       // §12.2 height-budget slack (STRUCT_H_MAX+FLAT_TOL = MAX_ABOVE_SURFACE=14)

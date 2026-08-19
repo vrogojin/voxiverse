@@ -63,26 +63,6 @@ var _live_structures := 0
 var _live_tris := 0
 var _capped := false
 
-# --- P2 (FP_STRUCT_LOD): the orbit-resident AGGREGATE tier -----------------------------------------------------------
-# §7.4: a lone house is sub-pixel from orbit, but a VILLAGE footprint (~100-192 blocks) subtends several device px even
-# at low orbit. When shell_offsurface() suspends the per-house LOD-A mesh, this LOD-B mesh renders one coarse box per
-# settlement AGGREGATE whose union-bbox max-extent ≥ STRUCT_ORBIT_MIN — GEN houses grouped by their STRUCT_V village
-# cell (derived from the record bbox — make_record is untouched), player builds each their own aggregate. A never-cull
-# ObjectLod beacon floor (STRUCT_LOD_BEACON_PX) scales a blob that would fall below the floor back up to it, so a distant
-# settlement never fully vanishes. Own MeshInstance3D (the §7.4 "2 draws: LOD-A + LOD-B"); created ONLY under
-# FP_STRUCT_LOD ⇒ flag-off is byte-identical (the offsurface `return` is unchanged when _mi_agg is null).
-var _mi_agg: MeshInstance3D = null
-var _mesh_agg: ArrayMesh = null
-var _agg_material: ShaderMaterial = null
-var _agg_have := false
-var _agg_last_cam := Vector3.ZERO
-var _agg_last_reg := -1
-var _agg_last_rev := -1
-var _agg_last_kpx := 0.0
-var _agg_last_ms := 0
-var _agg_last_offsurf := false
-var _live_aggregates := 0
-
 # =====================================================================================================================
 # Shader — HEAD + VoxiLight.shade_glsl() + TAIL. Vertex-colour ALBEDO × voxi_shade(radial_n, sun_dir); planet_centre
 # a uniform (kept in the ONE shader family with the far-trees mesh shader even though a plain mesh could use NORMAL).
@@ -119,17 +99,6 @@ static func make_material() -> ShaderMaterial:
 		sm.set_shader_parameter("moonshine", VoxiLight.MOONSHINE)
 	return sm
 
-## P2 (FP_STRUCT_LOD): the aggregate LOD-B material — UNLIT vertex colour. A settlement marker seen from orbit needs no
-## radial voxi_shade (and the per-house shader's planet_centre normal is unreliable in the orbital-shell frame, which the
-## suspended-on-surface P0 tier never exercised → it shaded the blobs to night-floor black). Unlit is frame-independent
-## and always legible; a day/night shade is a polish follow-up.
-static func _make_agg_material() -> ShaderMaterial:
-	var sm := ShaderMaterial.new()
-	var sh := Shader.new()
-	sh.code = "shader_type spatial;\nrender_mode unshaded, cull_disabled;\nvarying flat vec4 v_col;\nvoid vertex() { v_col = COLOR; }\nvoid fragment() { ALBEDO = v_col.rgb; }\n"
-	sm.shader = sh
-	return sm
-
 # =====================================================================================================================
 # Construction — one MeshInstance3D child of the ring under FP_STRUCT_FAR (FacetFarRing.setup).
 # =====================================================================================================================
@@ -146,18 +115,6 @@ func setup_instance(ring: Node3D, active_fid: int) -> void:
 	# huge custom AABB (the far-trees convention) so the node is never wrongly frustum-culled.
 	_mi.custom_aabb = AABB(Vector3(-12000.0, -12000.0, -12000.0), Vector3(24000.0, 24000.0, 24000.0))
 	ring.add_child(_mi)
-	# P2 (FP_STRUCT_LOD): the orbit-resident aggregate LOD-B mesh — a sibling MeshInstance sharing the ONE shader family
-	# (voxi_shade boxes). Created ONLY under the flag ⇒ off is byte-identical (offsurface still returns with _mi_agg null).
-	if CubeSphere.FP_STRUCT_LOD:
-		_agg_material = _make_agg_material()
-		_mesh_agg = ArrayMesh.new()
-		_mi_agg = MeshInstance3D.new()
-		_mi_agg.name = "FacetFarStructuresAgg"
-		_mi_agg.mesh = _mesh_agg
-		_mi_agg.material_override = _agg_material
-		_mi_agg.custom_aabb = _mi.custom_aabb
-		_mi_agg.visible = false
-		ring.add_child(_mi_agg)
 
 func set_active(new_fid: int) -> void:
 	_active_fid = new_fid   # residency is camera-distance driven (rebuilt each step); crossing only re-seeds the centre
@@ -185,15 +142,7 @@ func step(settled := true, credit_ok := true, cam_render := Vector3.ZERO) -> voi
 	if _mi == null:
 		return
 	var offsurf := (_ring as FacetFarRing).shell_offsurface()
-	_mi.visible = not offsurf   # P0: per-house LOD-A on-surface only
-	# P2 (FP_STRUCT_LOD): the aggregate LOD-B tier takes over the DISTANT band — a settlement emits an aggregate blob when
-	# it is beyond the per-house band (dist > STRUCT_FAR_MAX) OR the per-house tier is suspended off-surface. The two sets
-	# are disjoint (per-house owns [R0, STRUCT_FAR_MAX] on-surface), so no double-render, and it works in BOTH the dev-fly
-	# and orbital-shell regimes. Off-flag (_mi_agg null) the whole block is skipped and the shipped `if offsurf: return`
-	# runs verbatim ⇒ byte-identical.
-	if _mi_agg != null:
-		_mi_agg.visible = true
-		_step_aggregates(settled, credit_ok, cam_render, offsurf)
+	_mi.visible = not offsurf   # P0: on-surface only (the ≥48-block orbit exception is P2/FP_STRUCT_LOD)
 	if offsurf:
 		return
 	# FP_LOAD_DEFER settle gate + stream credit — no structure work during fresh-load pile-up (mirror of the trees).
@@ -444,198 +393,6 @@ func _evict_stale_bakes(reg: Array) -> void:
 		_baked.erase(root)
 		_cull.erase(root)
 
-# --- P2 aggregate tier (FP_STRUCT_LOD): the orbit-resident settlement blobs ------------------------------------------
-
-## Off-surface step: settle/credit/rate/delta-gated rebuild of the aggregate LOD-B mesh. The camera intrinsics (fov +
-## device height ⇒ K_px) come from the live Camera3D under the ring (the FacetFarObjects plumbing), so the beacon floor
-## is a true angular-size floor. No camera ⇒ kpx 0 ⇒ blobs render at true size with no beacon scaling (still visible).
-func _step_aggregates(settled: bool, credit_ok: bool, cam_render: Vector3, offsurf: bool) -> void:
-	if not _credit_gate_open(settled, credit_ok):
-		return
-	var now := Time.get_ticks_msec()
-	if now - _agg_last_ms < CubeSphere.STRUCT_STEP_MS:
-		return
-	_agg_last_ms = now
-	var centre := (_ring as FacetFarRing).render_centre()
-	if _material != null:
-		_material.set_shader_parameter("planet_centre", centre)
-	var cam_abs := _cam_to_absolute(cam_render)
-	var reg: Array = _registry_query.call() if _registry_query.is_valid() else []
-	var kpx := _camera_kpx()
-	var rev_sum := 0
-	for rec in reg:
-		rev_sum += int(rec["rev"])
-	# Delta gate (the forest-fps law, aggregate latch): rebuild only when the camera moved past STRUCT_DELTA_MOVE, the
-	# registry count / rev-sum changed, the projection scale (kpx, i.e. fov/zoom) drifted, or the offsurf regime flipped
-	# (which changes which settlements emit — all of them off-surface, only the > STRUCT_FAR_MAX ones on-surface).
-	if _agg_have \
-			and cam_abs.distance_to(_agg_last_cam) < STRUCT_DELTA_MOVE \
-			and reg.size() == _agg_last_reg \
-			and rev_sum == _agg_last_rev \
-			and absf(kpx - _agg_last_kpx) < 0.5 \
-			and offsurf == _agg_last_offsurf:
-		return
-	_agg_have = true
-	_agg_last_cam = cam_abs
-	_agg_last_reg = reg.size()
-	_agg_last_rev = rev_sum
-	_agg_last_kpx = kpx
-	_agg_last_offsurf = offsurf
-	_rebuild_aggregates(reg, cam_abs, kpx, offsurf)
-
-## px-per-radian from the live Camera3D under the ring (0 if none — blobs then render at true size, no beacon scaling).
-func _camera_kpx() -> float:
-	if _ring == null:
-		return 0.0
-	var vp := (_ring as Node3D).get_viewport()
-	if vp == null:
-		return 0.0
-	var cam := vp.get_camera_3d()
-	if cam == null:
-		return 0.0
-	var vh := float(vp.get_visible_rect().size.y)
-	return ObjectLod.k_px(vh, deg_to_rad(cam.fov))
-
-## Group the registry into settlement aggregates, keep those whose union-bbox max-extent ≥ STRUCT_ORBIT_MIN, and emit one
-## beacon-floored coarse box each into the merged LOD-B mesh (nearest-first under the shared tri cap).
-func _rebuild_aggregates(reg: Array, cam_abs: Vector3, kpx: float, offsurf: bool) -> void:
-	_dbg_rebuild_count += 1
-	var groups := _aggregate_groups(reg)
-	# nearest-first so the tri cap keeps the closest settlements
-	groups.sort_custom(func(a, b): return cam_abs.distance_to(a["centre_w"]) < cam_abs.distance_to(b["centre_w"]))
-	var verts := PackedVector3Array()
-	var colors := PackedColorArray()
-	var tris := 0
-	var count := 0
-	for g in groups:
-		# Disjoint handoff with the per-house LOD-A: on-surface it owns [R0, STRUCT_FAR_MAX], so the aggregate emits only
-		# BEYOND that band; off-surface the per-house tier is suspended, so the aggregate emits every settlement.
-		if not offsurf and cam_abs.distance_to(g["centre_w"]) <= CubeSphere.STRUCT_FAR_MAX:
-			continue
-		if tris + 12 > CubeSphere.STRUCT_FAR_TRIS_MAX:
-			break
-		_append_aggregate_box(verts, colors, g, cam_abs, kpx)
-		tris += 12
-		count += 1
-	_commit_agg_mesh(verts, colors)
-	_live_aggregates = count
-
-## One aggregate per settlement: GEN houses grouped by their STRUCT_V village cell (derived from the record bbox — the
-## record shape is untouched), each player structure its own aggregate. Returns [{fid, bmin, bmax, color, centre_w}] for
-## groups meeting the STRUCT_ORBIT_MIN extent bar (a lone hut is correctly sub-pixel and excluded).
-func _aggregate_groups(reg: Array) -> Array:
-	var acc := {}
-	for rec in reg:
-		var fid: int = int(rec["fid"])
-		var bmin: Vector3i = rec["bmin"]
-		var bmax: Vector3i = rec["bmax"]
-		var key: String
-		if int(rec.get("source", -1)) == StructureGen.SOURCE_GEN:
-			var vx := floori(float(bmin.x) / float(StructureGen.STRUCT_V))
-			var vz := floori(float(bmin.z) / float(StructureGen.STRUCT_V))
-			key = "g%d_%d_%d" % [fid, vx, vz]
-		else:
-			key = "p%d" % int(rec["root"])
-		if acc.has(key):
-			var e: Dictionary = acc[key]
-			e["bmin"] = Vector3i(mini(e["bmin"].x, bmin.x), mini(e["bmin"].y, bmin.y), mini(e["bmin"].z, bmin.z))
-			e["bmax"] = Vector3i(maxi(e["bmax"].x, bmax.x), maxi(e["bmax"].y, bmax.y), maxi(e["bmax"].z, bmax.z))
-		else:
-			acc[key] = {"fid": fid, "bmin": bmin, "bmax": bmax}
-	var out: Array = []
-	for key in acc.keys():
-		var e: Dictionary = acc[key]
-		var bmin: Vector3i = e["bmin"]
-		var bmax: Vector3i = e["bmax"]
-		var dx := bmax.x - bmin.x + 1
-		var dy := bmax.y - bmin.y + 1
-		var dz := bmax.z - bmin.z + 1
-		if maxi(dx, maxi(dy, dz)) < CubeSphere.STRUCT_ORBIT_MIN:
-			continue                                            # sub-pixel from orbit — honestly excluded
-		var fid: int = int(e["fid"])
-		var cx := (float(bmin.x) + float(bmax.x) + 1.0) * 0.5
-		var cy := (float(bmin.y) + float(bmax.y) + 1.0) * 0.5
-		var cz := (float(bmin.z) + float(bmax.z) + 1.0) * 0.5
-		out.append({
-			"fid": fid, "bmin": bmin, "bmax": bmax,
-			"color": Color(0.45, 0.32, 0.20),                   # unlit tan-brown roofs — a settlement reads as buildings from orbit
-			"centre_w": _lattice_world(fid, cx, cy, cz),
-		})
-	return out
-
-## Append the 12-triangle box for aggregate `g`, beacon-floored: if its projected size falls below STRUCT_LOD_BEACON_PX,
-## the box is scaled about its centroid (in lattice space) so it projects at exactly the floor (never-cull). Verts are
-## ring-local (lattice_to_world64, datum-lifted like the per-house bake) so the frozen-frame merged mesh needs no transform.
-func _append_aggregate_box(verts: PackedVector3Array, colors: PackedColorArray, g: Dictionary, cam_abs: Vector3, kpx: float) -> void:
-	var fid: int = int(g["fid"])
-	var bmin: Vector3i = g["bmin"]
-	var bmax: Vector3i = g["bmax"]
-	var cx := (float(bmin.x) + float(bmax.x) + 1.0) * 0.5
-	var cy := (float(bmin.y) + float(bmax.y) + 1.0) * 0.5
-	var cz := (float(bmin.z) + float(bmax.z) + 1.0) * 0.5
-	var hx := (float(bmax.x) - float(bmin.x) + 1.0) * 0.5
-	var hy := (float(bmax.y) - float(bmin.y) + 1.0) * 0.5
-	var hz := (float(bmax.z) - float(bmin.z) + 1.0) * 0.5
-	# Beacon floor: scale the half-extents so the box projects at ≥ STRUCT_LOD_BEACON_PX (ObjectLod law).
-	var scale := 1.0
-	if kpx > 0.0:
-		var r := maxf(hx, maxf(hy, hz))
-		var d := cam_abs.distance_to(g["centre_w"])
-		var proj := ObjectLod.proj_px(r, d, kpx)
-		if proj > 0.0 and proj < CubeSphere.STRUCT_LOD_BEACON_PX:
-			scale = CubeSphere.STRUCT_LOD_BEACON_PX / proj
-	hx *= scale
-	hy *= scale
-	hz *= scale
-	# 8 corners in lattice space → ring-local world (datum-lifted y, exactly the per-house bake convention).
-	var c := PackedVector3Array()
-	c.resize(8)
-	var i := 0
-	for sx in [-1.0, 1.0]:
-		for sy in [-1.0, 1.0]:
-			for sz in [-1.0, 1.0]:
-				c[i] = _lattice_world(fid, cx + sx * hx, cy + sy * hy, cz + sz * hz)
-				i += 1
-	# corner index = (sx,sy,sz) bit pattern: bit2=sx, bit1=sy, bit0=sz. 6 faces, 12 tris, outward winding.
-	var col: Color = g["color"]
-	var faces := [
-		[0, 1, 3, 2],   # -X
-		[4, 6, 7, 5],   # +X
-		[0, 4, 5, 1],   # -Y
-		[2, 3, 7, 6],   # +Y
-		[0, 2, 6, 4],   # -Z
-		[1, 5, 7, 3],   # +Z
-	]
-	for f in faces:
-		_quad(verts, colors, c[f[0]], c[f[1]], c[f[2]], c[f[3]], col)
-
-func _quad(verts: PackedVector3Array, colors: PackedColorArray, a: Vector3, b: Vector3, c: Vector3, d: Vector3, col: Color) -> void:
-	verts.append(a); verts.append(b); verts.append(c)
-	verts.append(a); verts.append(c); verts.append(d)
-	for _k in range(6):
-		colors.append(col)
-
-## Lattice (fid, x, y, z) → ring-local world, datum-lifted on y under FP_FT_FRAME_WELD (byte-identical off, 0 lift).
-func _lattice_world(fid: int, x: float, y: float, z: float) -> Vector3:
-	var vy := y
-	if CubeSphere.FP_FT_FRAME_WELD:
-		vy += FacetAtlas.datum_lift(fid, x, z)
-	var w := FacetAtlas.lattice_to_world64(fid, x, vy, z)
-	return Vector3(float(w[0]), float(w[1]), float(w[2]))
-
-func _commit_agg_mesh(verts: PackedVector3Array, colors: PackedColorArray) -> void:
-	_mesh_agg.clear_surfaces()
-	if verts.is_empty():
-		return
-	var arr := []
-	arr.resize(Mesh.ARRAY_MAX)
-	arr[Mesh.ARRAY_VERTEX] = verts
-	arr[Mesh.ARRAY_COLOR] = colors
-	_mesh_agg.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)
-	_mesh_agg.surface_set_material(0, _agg_material)
-
-func live_aggregates() -> int: return _live_aggregates
-
 # --- telemetry / ledger ---------------------------------------------------------------------------------------------
 func rebuild_count() -> int: return _dbg_rebuild_count
 func live_structures() -> int: return _live_structures
@@ -648,8 +405,4 @@ func total_bytes() -> int:
 	if _mesh != null and _mesh.get_surface_count() > 0:
 		var a := _mesh.surface_get_arrays(0)
 		mesh_b = (a[Mesh.ARRAY_VERTEX] as PackedVector3Array).size() * (3 * 4 + 4 * 4)
-	# P2 (FP_STRUCT_LOD): the aggregate LOD-B vertex buffer (null off ⇒ 0, byte-identical).
-	if _mesh_agg != null and _mesh_agg.get_surface_count() > 0:
-		var ag := _mesh_agg.surface_get_arrays(0)
-		mesh_b += (ag[Mesh.ARRAY_VERTEX] as PackedVector3Array).size() * (3 * 4 + 4 * 4)
 	return _baked_bytes + mesh_b

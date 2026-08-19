@@ -1128,9 +1128,6 @@ const STRUCT_STEP_MS := 250                  # §7.1 min ms between FacetFarStru
 const STRUCT_FAR_TRIS_MAX := 80000          # §8 NEVER-OOM: merged-band triangle cap
 const STRUCT_BYTES_MAX := 8 << 20           # §8 NEVER-OOM: hard 8 MB ceiling (tracker + registry + bakes + meshes)
 const STRUCT_ORBIT_MIN := 48                 # §7.4 P2: min max-extent (blocks) for the orbit-resident exception
-const STRUCT_LOD_BEACON_PX := 3.0            # §7.4 P2 (FP_STRUCT_LOD): min on-screen size (device px) an orbit-resident
-                                             # aggregate holds — below it the blob is scaled up to this floor (ObjectLod
-                                             # beacon law) so a distant settlement never fully vanishes (never-cull).
 const STRUCT_HIDE_STREAK := 2                # §7.3 consecutive COVERED probes before hiding the far model
 const STRUCT_SHOW_STREAK := 2                # §7.3 consecutive NOT_COVERED probes before restoring it
 

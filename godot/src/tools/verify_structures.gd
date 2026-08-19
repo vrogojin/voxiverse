@@ -60,11 +60,6 @@ func _initialize() -> void:
 	_gate_sg_damage()
 	_gate_sg_phys()
 
-	# COSMOS STRUCTURES P2 (FP_STRUCT_LOD, §7.4) — the orbit-resident aggregate tier: settlement grouping + the
-	# ObjectLod beacon floor. FacetFarStructures._aggregate_groups is a pure function of the record array (no ring),
-	# so it is exercised directly on synthetic records.
-	_gate_sg_lod()
-
 	print("=== VERIFY structures: ", _pass, " passed, ", _fail, " failed ===")
 	quit(1 if _fail > 0 else 0)
 
@@ -637,52 +632,3 @@ func _gate_shader() -> void:
 	var code := FS.shader_code()
 	_ok(code.contains("voxi_shade") and code.contains("planet_centre"),
 		"G-ST-SHADER: far-structure shader uses the shared radial voxi_shade + planet_centre uniform")
-
-# =====================================================================================================================
-# G-SG-LOD — P2 orbit-resident aggregate tier (FP_STRUCT_LOD, §7.4): settlement grouping (houses → village by STRUCT_V
-# cell), the STRUCT_ORBIT_MIN extent bar, and the ObjectLod never-cull beacon floor. _aggregate_groups is a pure
-# function of the record array (no ring), so it is exercised directly on synthetic records.
-# =====================================================================================================================
-func _gate_sg_lod() -> void:
-	var fs = FS.new()
-	var V := SG.STRUCT_V
-	var recs: Array = []
-	# Village A — 3 houses spread across STRUCT_V cell (0,0); union extent ≥ 48.
-	recs.append(_lod_rec(SG.SOURCE_GEN, Vector3i(4, 6, 4), Vector3i(14, 12, 14), 101))
-	recs.append(_lod_rec(SG.SOURCE_GEN, Vector3i(60, 6, 30), Vector3i(70, 12, 40), 102))
-	recs.append(_lod_rec(SG.SOURCE_GEN, Vector3i(20, 6, 70), Vector3i(30, 12, 80), 103))
-	# Village B — 2 houses in the ADJACENT cell (1,0); union extent ≥ 48.
-	recs.append(_lod_rec(SG.SOURCE_GEN, Vector3i(V + 5, 6, 5), Vector3i(V + 15, 12, 15), 201))
-	recs.append(_lod_rec(SG.SOURCE_GEN, Vector3i(V + 5, 6, 60), Vector3i(V + 15, 12, 70), 202))
-	# A lone small hut in its own far cell — union extent < 48 ⇒ excluded (honestly sub-pixel from orbit).
-	recs.append(_lod_rec(SG.SOURCE_GEN, Vector3i(5 * V, 6, 5 * V), Vector3i(5 * V + 8, 12, 5 * V + 8), 301))
-	var groups: Array = fs._aggregate_groups(recs)
-	_ok(groups.size() == 2,
-		"G-SG-LOD-GROUP: houses group by STRUCT_V village cell — 2 villages qualify, the sub-48 hut excluded (got %d)" % groups.size())
-	var all_ge := true
-	for g in groups:
-		var b: Vector3i = g["bmin"]
-		var bx: Vector3i = g["bmax"]
-		var ext := maxi(bx.x - b.x + 1, maxi(bx.y - b.y + 1, bx.z - b.z + 1))
-		if ext < CubeSphere.STRUCT_ORBIT_MIN:
-			all_ge = false
-	_ok(all_ge, "G-SG-LOD-EXTENT: every emitted aggregate's union-bbox max-extent ≥ STRUCT_ORBIT_MIN (48)")
-	# A player structure (source != GEN) is its own aggregate (keyed by root, not village cell).
-	var precs: Array = [_lod_rec(999, Vector3i(0, 4, 0), Vector3i(60, 20, 60), -7)]
-	_ok(fs._aggregate_groups(precs).size() == 1,
-		"G-SG-LOD-PLAYER: a ≥48-block player structure is its own orbit-resident aggregate")
-	# Beacon floor (ObjectLod law): a village that projects below STRUCT_LOD_BEACON_PX scales UP so it projects at
-	# exactly the floor — never-cull.
-	var kpx := ObjectLod.k_px(1080.0, deg_to_rad(70.0))
-	var r := 50.0
-	var d := 90000.0
-	var proj := ObjectLod.proj_px(r, d, kpx)
-	var scale := (CubeSphere.STRUCT_LOD_BEACON_PX / proj) if proj > 0.0 else 1.0
-	var proj_scaled := ObjectLod.proj_px(r * scale, d, kpx)
-	_ok(proj < CubeSphere.STRUCT_LOD_BEACON_PX and absf(proj_scaled - CubeSphere.STRUCT_LOD_BEACON_PX) < 0.01,
-		"G-SG-LOD-BEACON: a sub-floor village scales up to project at exactly STRUCT_LOD_BEACON_PX (never-cull)")
-	_ok(not CubeSphere.FP_STRUCT_LOD,
-		"G-SG-LOD-OFF: FP_STRUCT_LOD default false (flag-off ⇒ _mi_agg null, the offsurface return is byte-identical)")
-
-func _lod_rec(source: int, bmin: Vector3i, bmax: Vector3i, root: int) -> Dictionary:
-	return {"source": source, "fid": 0, "bmin": bmin, "bmax": bmax, "root": root, "rev": 0}

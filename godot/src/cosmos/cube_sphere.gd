@@ -330,6 +330,26 @@ const FP_FARRING_ASYNC_REBUILD := false
 ## worker emit verbatim (byte-identical, FLAT 6042/0).
 const FP_FARRING_BULK_EMIT := false
 
+## COSMOS FARRING-SWAP-DIET P2 (FP_FARRING_SECTORS) — sector the cap, swap only dirty sectors. The shipped async path
+## swaps the WHOLE ~176k-vert cap ArrayMesh on the main thread (a measured 20–43 ms add_surface_from_arrays + RID
+## create) even when only a handful of facets changed (axis drift every ~6 s at orbit, floor crossings, warm-phase env
+## upgrades). When true, the cap is partitioned into 24 STATIC face-quadrant sectors (6 faces × 2×2 — a pure function
+## of fid, so membership never churns with the emit axis; ~12 populated per cap ⇒ ~+12 draws, trivial at draws≈36),
+## each its OWN MeshInstance3D child sharing the ONE shell material. Each async dispatch freezes a per-facet emit
+## SIGNATURE (role/cache/slot/limb/v2 state, plus the frozen unsink-column/applied/cull fingerprint for SUNK-emitting
+## facets) on the main thread; a sector is rebuilt+swapped ONLY if its membership or any member's signature differs
+## from what its resident mesh was built from — clean sectors stay resident, bounding the swap to the changed slice
+## (~3–5 ms). A facet emits into exactly ONE sector (partition — no double-emit, no gap; the union of sector meshes is
+## vertex-for-vertex the single cap mesh, G-FR-SECT proves it) and shared facet edges come from the same welded caches,
+## so sector borders weld exactly like facet welds. Worker env-warm still walks the FULL frozen set (converge law
+## unchanged); the sectored emit rides the P3 bulk collectors per sector. Total verts unchanged (NEVER-OOM: the same
+## cap, partitioned). Sync rebuilds (force_rebuild/boot) keep the shipped single mesh and invalidate all sectors.
+## Normals are smoothed per sector (the cross-SECTOR-border vertex-hash merge of the single-mesh generate_normals is
+## the one intentional difference — visually dead: the shell shader shades radially, never from NORMAL, for COLOR.a
+## ≥ 0.5 far-ring vertices). Default OFF → the shipped single-MeshInstance whole-swap path verbatim (byte-identical,
+## FLAT 6042/0).
+const FP_FARRING_SECTORS := false
+
 ## COSMOS far-ring full coverage (docs/COSMOS-FARRING-COVERAGE-DESIGN.md) — the see-through-gap fix. The shipped far
 ## ring EXCLUDES the active facet + the live-pool neighbours (`_excluded`), so beyond the ~128-block near-blocky disk on
 ## those facets there is no far quad at all and the camera sees straight through to the opposite inner side of the globe

@@ -1804,6 +1804,21 @@ const V2_NEARFILL_SINK := 6.0   ## = BACKSTOP_SINK: radial sink (blocks) for the
 ## untouched (V2 is render-only). Off ⇒ shipped V2 material + shipped COLOR.a ⇒ byte-identical (no mesh/material change).
 const FP_V2_NEARFILL_UNSINK := false
 
+## COSMOS-FAR-HEIGHT §3 residual (task #72 slit) — FP_V2_EDGE_APRON. The near-fill (hop ≤ 1) tiles sink UNIFORMLY
+## V2_NEARFILL_SINK (6.0); FP_V2_NEARFILL_UNSINK un-sinks them only to TRUE−1.5 where uncovered. Along a tile-boundary
+## edge SHARED WITH AN UNSUNK (hop ≥ 2) neighbour there is then an OPEN radial STEP (1.5–6 blocks) with NO wall geometry
+## between the sunk tile edge (TRUE−1.5..6) and the neighbour edge (TRUE) → a straight lattice-aligned slit you see the
+## black void/space through (the deployed "deliberate-sink" residual). This does NOT touch the sink (the sink prevents
+## far-over-near protrusion, #113) — it closes the visible gap: `build_tile` emits a thin vertical APRON/skirt quad-strip
+## along each sunk-tile boundary edge that faces an unsunk neighbour, from the sunk edge vertex (reused surface vertex,
+## COLOR.a sink-flag ⇒ un-sinks in lock-step with the surface) UP to the un-sunk TRUE height (`p_true = p + rp·sink`,
+## the SAME reconstruction the un-sink shader/CPU-twin use). The apron TOP carries COLOR.a = 0 (shader NEVER un-sinks it)
+## so it sits at EXACTLY the neighbour-welded TRUE height — never above it (no new #113 protrusion). Only sunk↔unsunk
+## edges get an apron (sunk↔sunk edges already weld continuously; an apron there would poke a visible fin above the
+## surface — the caller passes an EDGE MASK from the hop map). cull_disabled is already on for this mesh so winding is
+## moot. Off ⇒ no apron vertices emitted ⇒ byte-identical geometry (FLAT 6042/0). Render-only (V2 carries no collision).
+const FP_V2_EDGE_APRON := false
+
 ## docs/COSMOS-FAR-TERMINATOR-DESIGN.md (§4, far-border day-lit-at-night fix) — the day/night terminator LAW
 ## itself is correct and unified everywhere (every far material multiplies albedo by voxi_shade(n, sun_dir),
 ## centre-relative normal). The live bug is a RUNTIME sun_dir STALENESS gap: three far materials seed their

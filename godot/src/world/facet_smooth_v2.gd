@@ -64,7 +64,12 @@ enum { EDGE_WEST = 0, EDGE_EAST = 1, EDGE_SOUTH = 2, EDGE_NORTH = 3 }
 ## The sink is a pure function of the welded vertex (radial), so two facets' shared edge vertices sink bit-identically
 ## (weld preserved). Default 0.0 ⇒ the `p` term is untouched and the tile is byte-identical to shipped (every gate /
 ## far-tier caller that passes 3 args is unaffected). Colour/normal read `b_dir` (radial), unaffected by the sink.
-static func build_tile(fid: int, cells: int, gen: Object, sink: float = 0.0) -> Dictionary:
+## `apron_mask` (FP_V2_EDGE_APRON): bitmask over EDGE_WEST/EAST/SOUTH/NORTH of the tile-boundary edges that get a
+## closing vertical apron (only meaningful for a SUNK tile, sink > 0, and only under the flag). A bit is set for an
+## edge whose neighbour is UNSUNK (hop ≥ 2) — the caller computes it via `apron_edge_mask(fid, sunk_want)` from the
+## live hop map. Default 0xF (all 4 edges) so the gates can call the plain 4-arg form and exercise every edge; off
+## the flag it is never consulted ⇒ byte-identical.
+static func build_tile(fid: int, cells: int, gen: Object, sink: float = 0.0, apron_mask: int = 0xF) -> Dictionary:
 	if gen == null:
 		return {}
 	FarPalette.ensure_ready()
@@ -139,6 +144,13 @@ static func build_tile(fid: int, cells: int, gen: Object, sink: float = 0.0) -> 
 				# else: a degenerate cell (zero-area) — leave v11's normal at its shipped radial value.
 
 	var tile := {"pos": pos, "nrm": nrm, "col": col, "idx": idx}
+	# FP_V2_EDGE_APRON: BEFORE the always-on downward skirt, close the see-through slit a SUNK tile opens against an
+	# UNSUNK (hop ≥ 2) neighbour — a thin curtain from the sunk edge UP to the un-sunk TRUE height. Only sunk tiles
+	# (sink > 0) and only the masked boundary edges (those facing an unsunk neighbour); off the flag ⇒ never runs ⇒
+	# byte-identical vertex count. Must precede `_append_skirt` so its `_edge_indices` reference the SURFACE grid
+	# vertices (indices 0..n-1), not the skirt's appended ones.
+	if CubeSphere.FP_V2_EDGE_APRON and sink > 0.0:
+		_append_apron(tile, cells, sink, apron_mask)
 	_append_skirt(tile, cells, SKIRT_DROP_BLOCKS)
 	return tile
 
@@ -172,6 +184,68 @@ static func _append_skirt(tile: Dictionary, cells: int, drop: float) -> void:
 	tile["nrm"] = nrm
 	tile["col"] = col
 	tile["idx"] = idx
+
+## FP_V2_EDGE_APRON (docs/COSMOS-FAR-HEIGHT-DESIGN.md §3 residual / task #72 slit) — close the see-through slit a
+## near-fill-SUNK tile opens along a boundary edge SHARED WITH AN UNSUNK neighbour. For each masked edge (`apron_mask`
+## bit set — the caller flags only edges whose neighbour is unsunk, so a sunk↔sunk edge never gets one and no fin pokes
+## up), emit a vertical quad-strip: the BOTTOM chord REUSES the tile's own surface edge vertices (so it welds to and
+## un-sinks in lock-step with the surface — same COLOR.a sink flag, same shader path), and the TOP chord is a strip of
+## NEW vertices at the un-sunk TRUE height `p_true = p + normalize(p)·sink` — the EXACT reconstruction the un-sink
+## shader/`unsink_pos_cpu` use, i.e. the neighbour-welded height (`b_pos`) the sink was applied to. The top vertices
+## carry COLOR.a = 0 so the un-sink shader NEVER lifts them further: they sit at EXACTLY the neighbour TRUE height,
+## never above it (no new far-over-near protrusion, #113). Colour/normal are copied from the adjacent edge vertex so the
+## curtain reads as terrain, not a seam. Growth is bounded to ONE quad-strip per masked edge: (cells+1) new vertices +
+## 2·cells triangles. Mutates `tile` in place; worker-safe (touches only this tile's arrays). Only ever called with
+## sink > 0 (guarded at the call site), so `p.normalized()` is well-defined and `p_true` is above `p`.
+static func _append_apron(tile: Dictionary, cells: int, sink: float, apron_mask: int) -> void:
+	if apron_mask == 0:
+		return
+	var pos: PackedVector3Array = tile["pos"]
+	var nrm: PackedVector3Array = tile["nrm"]
+	var col: PackedColorArray = tile["col"]
+	var idx: PackedInt32Array = tile["idx"]
+	var stride := cells + 1
+	for edge in range(4):
+		if (apron_mask & (1 << edge)) == 0:
+			continue
+		var e := _edge_indices(edge, cells, stride)
+		var base := pos.size()
+		for vi in e:
+			var p: Vector3 = pos[vi]
+			var p_true := p + p.normalized() * sink   # un-sunk TRUE height (neighbour-welded `b_pos`, shader-identical reconstruction)
+			pos.append(p_true)
+			nrm.append(nrm[vi])
+			var c := col[vi]
+			c.a = 0.0   # top NEVER un-sinks (fast path) ⇒ pinned at TRUE = neighbour height, never protrudes above it
+			col.append(c)
+		for k in range(e.size() - 1):
+			var a0: int = e[k]         # sunk surface edge vertex (COLOR.a sink flag ⇒ tracks the surface under the un-sink shader)
+			var a1: int = e[k + 1]
+			var b0 := base + k         # TRUE-height apron top
+			var b1 := base + k + 1
+			idx.append(a0); idx.append(a1); idx.append(b1)
+			idx.append(a0); idx.append(b1); idx.append(b0)
+	tile["pos"] = pos
+	tile["nrm"] = nrm
+	tile["col"] = col
+	tile["idx"] = idx
+
+## FP_V2_EDGE_APRON: the per-tile apron EDGE MASK for `fid`, given the SUNK set `sunk_want` (a fid->true Dictionary of
+## the near-fill hop ≤ 1 facets). A bit (`1 << EDGE_*`) is set for each of the 4 cardinal edges whose neighbour is NOT
+## in `sunk_want` — i.e. an unsunk (hop ≥ 2 / absent) neighbour, exactly the edge that opens the sink STEP and needs a
+## closing apron. Mirrors `FacetOrbitRelief.edge_sink_mask` and the verified `S_WEST↔EDGE_WEST` correspondence
+## (facet_smooth_tier.gd's `_EDGE_SEAM_SLOT`). PURE — a gate can call it with a synthetic `sunk_want`.
+static func apron_edge_mask(fid: int, sunk_want: Dictionary) -> int:
+	var mask := 0
+	if not sunk_want.has(FacetAtlas.seam_neighbour(fid, FacetAtlas.S_WEST)):
+		mask |= 1 << EDGE_WEST
+	if not sunk_want.has(FacetAtlas.seam_neighbour(fid, FacetAtlas.S_EAST)):
+		mask |= 1 << EDGE_EAST
+	if not sunk_want.has(FacetAtlas.seam_neighbour(fid, FacetAtlas.S_SOUTH)):
+		mask |= 1 << EDGE_SOUTH
+	if not sunk_want.has(FacetAtlas.seam_neighbour(fid, FacetAtlas.S_NORTH)):
+		mask |= 1 << EDGE_NORTH
+	return mask
 
 static func _edge_indices(edge: int, cells: int, stride: int) -> Array:
 	var out := []
@@ -503,6 +577,7 @@ var _active_fid := -1
 var _want: Dictionary = {}            ## fid -> true (the current residency target)
 var _want_order: Array = []           ## the SAME fids, nearest-first BFS order (dispatch priority)
 var _hop_of: Dictionary = {}          ## C3 FP_SMOOTH_V2_NEARFILL: fid -> BFS hop from active (sink selection). Empty off.
+var _sunk_want: Dictionary = {}       ## FP_V2_EDGE_APRON: fid -> true for every SUNK (hop ≤ 1) facet (apron mask source). Empty off.
 var _tiles: Dictionary = {}           ## fid -> tile dict (resident, committed on main)
 var _leaving: Dictionary = {}         ## fid -> dwell steps remaining before eviction (fid no longer in `_want`)
 var _dirty := false                   ## a commit/evict landed since the last mesh rebuild
@@ -512,6 +587,7 @@ var _sn := 0
 var _s_fid: PackedInt32Array = PackedInt32Array()
 var _s_task: PackedInt32Array = PackedInt32Array()
 var _s_sink: PackedFloat32Array = PackedFloat32Array()   ## C3: per-slot radial sink (blocks) for the in-flight tile build
+var _s_apron: PackedInt32Array = PackedInt32Array()      ## FP_V2_EDGE_APRON: per-slot apron edge mask for the in-flight tile build
 var _s_result: Array = []
 var _s_mutex: Mutex = null
 
@@ -558,6 +634,7 @@ func setup_instance(ring: Node3D, active_fid: int) -> void:
 	_s_fid = PackedInt32Array(); _s_fid.resize(_sn); _s_fid.fill(-1)
 	_s_task = PackedInt32Array(); _s_task.resize(_sn); _s_task.fill(-1)
 	_s_sink = PackedFloat32Array(); _s_sink.resize(_sn); _s_sink.fill(0.0)   # C3: default no sink (byte-off)
+	_s_apron = PackedInt32Array(); _s_apron.resize(_sn); _s_apron.fill(0)    # FP_V2_EDGE_APRON: default no apron (byte-off)
 	_s_result.resize(_sn)
 	_s_mutex = Mutex.new()
 	_merge_mutex = Mutex.new()   # FP_SMOOTH_V2_ASYNC_MERGE: guards the single off-thread merge slot (idle off the flag)
@@ -567,6 +644,12 @@ func _recompute_want(active: int) -> void:
 	var order := hop_annulus(active, _hop_b, _hop_h)
 	# C3 FP_SMOOTH_V2_NEARFILL: refresh the hop map so dispatch can pick the per-tile sink. Empty off ⇒ sink 0 ⇒ byte-off.
 	_hop_of = hop_map(active, _hop_h) if CubeSphere.FP_SMOOTH_V2_NEARFILL else {}
+	# FP_V2_EDGE_APRON: the SUNK set (hop ≤ 1) — the apron mask source for each dispatched sunk tile. Empty off ⇒ mask 0 ⇒ byte-off.
+	_sunk_want = {}
+	if CubeSphere.FP_V2_EDGE_APRON:
+		for fid in _hop_of.keys():
+			if int(_hop_of[fid]) <= 1:
+				_sunk_want[int(fid)] = true
 	var new_want := {}
 	for fid in order:
 		new_want[int(fid)] = true
@@ -667,6 +750,10 @@ func step(settled := true, credit_ok := true) -> void:
 		# C3 FP_SMOOTH_V2_NEARFILL: hop ≤ 1 (active + edge neighbours) tiles sink so they sit UNDER the near blocks;
 		# hop ≥ 2 stay un-sunk. Written on MAIN before dispatch (same single-writer discipline as `_s_fid`). Off ⇒ 0.
 		_s_sink[slot] = CubeSphere.V2_NEARFILL_SINK if (CubeSphere.FP_SMOOTH_V2_NEARFILL and int(_hop_of.get(f, 99)) <= 1) else 0.0
+		# FP_V2_EDGE_APRON: a SUNK tile (hop ≤ 1) gets a closing apron on each boundary edge facing an UNSUNK neighbour
+		# (`apron_edge_mask` over the sunk set). Unsunk tiles pass 0 (build_tile skips the apron on sink 0 anyway).
+		# Off ⇒ 0 ⇒ no apron ⇒ byte-identical. Written on MAIN before dispatch (same single-writer discipline as `_s_sink`).
+		_s_apron[slot] = apron_edge_mask(f, _sunk_want) if (CubeSphere.FP_V2_EDGE_APRON and int(_hop_of.get(f, 99)) <= 1) else 0
 		_s_task[slot] = WorkerThreadPool.add_task(Callable(self, "_build_worker").bind(slot), true, "smoothv2tile")
 		_dispatch_count += 1
 	if _dirty:
@@ -715,7 +802,7 @@ func _inflight(fid: int) -> bool:
 ## any other main-thread-owned state. Writes only `_s_result[i]`, mutex-guarded (mirrors `FacetSmoothTier._build_worker`).
 func _build_worker(i: int) -> void:
 	var fid := int(_s_fid[i])
-	var tile := build_tile(fid, _cells, _cpp_gen, _s_sink[i])   # C3: per-slot sink (0.0 off ⇒ byte-identical)
+	var tile := build_tile(fid, _cells, _cpp_gen, _s_sink[i], _s_apron[i])   # C3 sink + FP_V2_EDGE_APRON mask (both 0 off ⇒ byte-identical)
 	_s_mutex.lock()
 	_s_result[i] = tile
 	_s_mutex.unlock()

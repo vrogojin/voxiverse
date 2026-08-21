@@ -261,6 +261,8 @@ func _initialize() -> void:
 	_s2_column_gates(gen, faceted, fid)
 	_s_columns_gates(gen, faceted, fid)
 	_s3_cell_gates(gen, faceted, fid)
+	_sg_cpp_cell_gate(gen, faceted, fid)
+	_sg_cpp_skin_gate(gen, faceted)
 
 	_done(0 if _fail == 0 else 1)
 
@@ -415,6 +417,144 @@ func _s3_cell_gates(gen: Object, faceted: bool, fid: int) -> void:
 
 	_ok(bad == 0, "G-CG-CELL — %d/%d cells mismatched%s"
 		% [bad, n_cells, ("" if bad == 0 else ("; first: " + first))])
+
+## ------------------------------------------------------------------------------------------------
+## G-SG-CPP (COSMOS STRUCTURES P1b, docs/COSMOS-STRUCTURES-DESIGN.md §12.6/§12.7) — the C++ near-gen
+## renders villages CELL-FOR-CELL identical to the GDScript resolve_cell (which consults
+## StructureGen.claim_at at the two claim-first sites). This is the P1b byte-equality oracle that
+## relaxes the P1a interlock: it MUST pass (after the engine rebuild that carries patch 0013) before
+## FP_STRUCT_GEN may ever ride the live C++ near stream.
+##
+## The comparison is byte-equal in BOTH flag states by construction: cfg["struct_gen"] is
+## CubeSphere.FP_STRUCT_GEN (the single-home material_tables key), so the C++ generator and the GDScript
+## oracle claim on the SAME cells. FP_STRUCT_GEN on ⇒ this tests the actual village claim; off ⇒ it
+## proves the claim-off path stays byte-identical (both render terrain/tree at the house columns). The
+## climate-biomes axis rides FP_CLIMATE_BIOMES (also single-home), so a savanna-village run tests the
+## B_SAVANNA gate. Villages are FACETED + Earth-facet only (the body gate), so the gate is meaningful
+## only under the FACETED toggle; a flat run reports a skip.
+##
+##   G-SG-CPP-COVER  the sweep actually covers solid house cells (claim>0) — the equality is not vacuous.
+##   G-SG-CPP        every swept village cell's packed 64-bit value is EXACTLY equal across the boundary.
+## ------------------------------------------------------------------------------------------------
+func _sg_cpp_cell_gate(gen: Object, faceted: bool, fid: int) -> void:
+	if not faceted:
+		_ok(true, "G-SG-CPP — (flat run: villages are Earth-facet-only; the byte-equality gate runs under the FACETED toggle)")
+		return
+	# Locate generated houses via the SAME enumeration the far tier uses (StructGenIndex over Earth facets).
+	var idx = StructGenIndex.new()
+	var earth_n := 6 * FacetAtlas.K * FacetAtlas.K
+	var houses: Array = []          # [ [house_fid, rec], ... ]
+	var sfid := 0
+	while sfid < mini(earth_n, 4000) and houses.size() < 4:
+		for r in idx.enumerate_facet(sfid):
+			houses.append([sfid, r])
+			if houses.size() >= 4:
+				break
+		sfid += 1
+	if houses.is_empty():
+		_ok(true, "G-SG-CPP — (no generated village within the 4000-facet scan cap; nothing to compare — widen the scan if villages exist)")
+		return
+	var n_cells := 0
+	var bad := 0
+	var saw_house := 0
+	var first := ""
+	for hpair in houses:
+		var hfid: int = hpair[0]
+		var rec: Dictionary = hpair[1]
+		var bmin: Vector3i = rec["bmin"]
+		var bmax: Vector3i = rec["bmax"]
+		var pcache = TerrainConfig.GenCtx.new(0, hfid)
+		for x in range(bmin.x - 2, bmax.x + 3):
+			for z in range(bmin.z - 2, bmax.z + 3):
+				var prof: Vector4 = TerrainConfig.column_profile(x, z, pcache)
+				var g := int(prof.x)
+				var srun := TerrainConfig.slope_run_of(x, z, pcache)
+				for y in range(g - 4, g + TreeGen.MAX_ABOVE_SURFACE + 3):
+					# Coverage: StructureGen.claim_at is a PURE hash (flag-independent) — it marks the cells the
+					# VILLAGE owns (>0 house block, 0 interior/door air, all strictly above g).
+					var cl := StructureGen.claim_at(x, y, z, pcache, g)
+					if cl > 0:
+						saw_house += 1
+					# ISOLATE the village mirror: only cells the village OWNS (claim >= 0) can differ BECAUSE of
+					# structures. Non-claim cells (cl < 0) are pure terrain — any C++/GDScript delta there is the
+					# PRE-EXISTING faceted terrain divergence (below-ground strata / faceted surface colour, also
+					# seen with FP_STRUCT_GEN off and in G-CG-COLUMNS), independent of this feature and out of scope.
+					if cl < 0:
+						continue
+					n_cells += 1
+					var gd: int = TerrainConfig.resolve_cell(x, y, z, g, int(prof.y), prof.z, prof.w, pcache, srun)
+					var cpp: int = gen.call("resolve_cell", hfid, x, y, z)
+					if cpp != gd:
+						bad += 1
+						if first == "":
+							first = "(%d,%d,%d fid=%d g=%d) C++ 0x%x != GD 0x%x" % [x, y, z, hfid, g, cpp, gd]
+	print("  ... G-SG-CPP swept %d cells across %d generated houses" % [n_cells, houses.size()])
+	_ok(saw_house > 0,
+		"G-SG-CPP-COVER — the sweep hit %d solid house cells (claim>0); the byte-equality is not vacuous" % saw_house)
+	_ok(bad == 0,
+		"G-SG-CPP — %d/%d village cells mismatched (C++ vs GDScript resolve_cell; FP_STRUCT_GEN=%s FP_CLIMATE_BIOMES=%s)%s"
+			% [bad, n_cells, str(CubeSphere.FP_STRUCT_GEN), str(CubeSphere.FP_CLIMATE_BIOMES),
+				("" if bad == 0 else ("; first: " + first))])
+
+## ------------------------------------------------------------------------------------------------
+## G-SG-SKIN-CPP (COSMOS STRUCTURES P2, docs/COSMOS-STRUCTURES-DESIGN.md §7.4a) — the C++ far-skin
+## roof-pixel port `struct_top_decoration` renders CELL-FOR-CELL identical to the GDScript oracle
+## StructureGen.top_decoration. This is the P2 byte-equality gate: the live web far-skin bake uses the
+## C++ path (FP_CPP_TILE_BAKE → bake_far_tile → struct_top_decoration), so the far roof-pixels MUST
+## match the GDScript truth the near voxel world derives from. Both sides are PURE hashes of position
+## (flag-independent), so the equality is meaningful in either FP_STRUCT_LOD state — the flag only
+## decides whether bake_far_tile consults the (byte-equal) result. Villages are FACETED + Earth-facet
+## only (the body gate), so the gate is meaningful only under the FACETED toggle; a flat run reports a
+## skip. Enumerates the SAME generated houses G-SG-CPP uses and compares the roof-pixel over every
+## footprint (+2 pad) column.
+##
+##   G-SG-SKIN-CPP-COVER  the sweep actually hits a SOLID roof-pixel (top_decoration>0) — not vacuous.
+##   G-SG-SKIN-CPP        every swept column's roof-pixel id is EXACTLY equal across the boundary.
+## ------------------------------------------------------------------------------------------------
+func _sg_cpp_skin_gate(gen: Object, faceted: bool) -> void:
+	if not faceted:
+		_ok(true, "G-SG-SKIN-CPP — (flat run: villages are Earth-facet-only; the byte-equality gate runs under the FACETED toggle)")
+		return
+	var idx = StructGenIndex.new()
+	var earth_n := 6 * FacetAtlas.K * FacetAtlas.K
+	var houses: Array = []          # [ [house_fid, rec], ... ]
+	var sfid := 0
+	while sfid < mini(earth_n, 4000) and houses.size() < 4:
+		for r in idx.enumerate_facet(sfid):
+			houses.append([sfid, r])
+			if houses.size() >= 4:
+				break
+		sfid += 1
+	if houses.is_empty():
+		_ok(true, "G-SG-SKIN-CPP — (no generated village within the 4000-facet scan cap; nothing to compare)")
+		return
+	var n_cols := 0
+	var bad := 0
+	var saw_roof := 0
+	var first := ""
+	for hpair in houses:
+		var hfid: int = hpair[0]
+		var rec: Dictionary = hpair[1]
+		var bmin: Vector3i = rec["bmin"]
+		var bmax: Vector3i = rec["bmax"]
+		var pcache = TerrainConfig.GenCtx.new(0, hfid)
+		for x in range(bmin.x - 2, bmax.x + 3):
+			for z in range(bmin.z - 2, bmax.z + 3):
+				n_cols += 1
+				var gd: int = StructureGen.top_decoration(x, z, pcache)
+				var cpp: int = gen.call("struct_top_decoration", hfid, x, z)
+				if gd > 0:
+					saw_roof += 1
+				if cpp != gd:
+					bad += 1
+					if first == "":
+						first = "(%d,%d fid=%d) C++ %d != GD %d" % [x, z, hfid, cpp, gd]
+	print("  ... G-SG-SKIN-CPP swept %d columns across %d generated houses" % [n_cols, houses.size()])
+	_ok(saw_roof > 0,
+		"G-SG-SKIN-CPP-COVER — the sweep hit %d solid roof-pixels (top_decoration>0); the byte-equality is not vacuous" % saw_roof)
+	_ok(bad == 0,
+		"G-SG-SKIN-CPP — %d/%d roof-pixel columns mismatched (C++ struct_top_decoration vs GDScript StructureGen.top_decoration)%s"
+			% [bad, n_cols, ("" if bad == 0 else ("; first: " + first))])
 
 ## ------------------------------------------------------------------------------------------------
 ## S2 — the column-math gates. C++ column_profile / slope_run_of vs the GDScript twin over >= 1e5

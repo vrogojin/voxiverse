@@ -411,10 +411,21 @@ void fragment() {
 ## lighting law) + TAIL (WS2: `%d` filled with the far_lut size + the fine-map sub-page edge/clamp, from the SAME
 ## `PLANET_MAP_QUAD·PLANET_MAP_TEXELS` the flat skin's own fine decode derives its `pg`/`pg-1` from). A function
 ## (not a top-level const) so it always reads VoxiLight's CURRENT snippet.
-static func shader_code() -> String:
+## `pack` is a param (defaults to the flag) so verify_skin_shade_pack.gd can build both variants; off ⇒ VERBATIM.
+static func shader_code(pack := CubeSphere.FP_SKIN_SHADE_PACK) -> String:
 	var nlut := FarPalette.frozen_colors().size()
 	var pg := CubeSphere.PLANET_MAP_QUAD * CubeSphere.PLANET_MAP_TEXELS
-	return _OR_SHADER_HEAD + VoxiLight.shade_glsl() + (_OR_SHADER_TAIL % [nlut, pg, pg - 1])
+	var code := _OR_SHADER_HEAD + VoxiLight.shade_glsl() + (_OR_SHADER_TAIL % [nlut, pg, pg - 1])
+	if pack:
+		# FP_SKIN_SHADE_PACK (docs/COSMOS-SKIN-SHADE-PACK): G3 samples the SAME whole-planet fine_map byte the flat
+		# skin's `_FLAT_ALBEDO_META_FINE` decodes, so it MUST decode the packed {1 + idx + 14·shade_q} protocol too
+		# (else a packed byte would index far_lut out of range). Identical decode + `·shade` multiply UNDER v_st —
+		# see FacetFarRing._apply_shade_pack, the single home of the decode law. Off ⇒ string returned VERBATIM.
+		code = code.replace(
+			"vec3 fine_albedo = (_f8 > 0) ? far_lut[_f8 - 1] : v_col_raw;",
+			("int _fp = _f8 - 1;\n\tvec3 fine_albedo = (_f8 > 0) ? far_lut[_fp %% %d] * (0.15 + 0.85 * float(_fp / %d) / %d.0) : v_col_raw;"
+				% [CubeSphere.SHADE_PACK_LANES, CubeSphere.SHADE_PACK_LANES, CubeSphere.SHADE_PACK_STEPS - 1]))
+	return code
 
 ## FP_FAR_TERMINATOR_WELD (mirrors `FacetSmoothV2.make_material`): seed sun_dir from the last live Sun G3 itself
 ## was told (`set_sun_dir`, WS3 wiring), not the hardcoded default — kills a "frozen fake-noon" gap on rebuild.

@@ -1380,6 +1380,12 @@ func _bm_compute_slice_flat(r0: int, r1: int, nx: int, ny: int, lc: PackedVector
 			var bid := -1
 			if have_edits:
 				bid = int(_edit_snap.get(Vector2i(lxs[i], lzs[i]), -1))   # dig-out air / placed block wins
+			if bid < 0 and CubeSphere.FP_STRUCT_LOD:
+				# COSMOS STRUCTURES P2 (§7.4a): house roof-pixel wins over tree canopy (edit > house > tree > terrain).
+				# Flag off ⇒ short-circuit skips the consult entirely ⇒ byte-identical.
+				var hdeco := StructureGen.top_decoration(lxs[i], lzs[i], ctx)
+				if hdeco != BlockCatalog.AIR:
+					bid = hdeco
 			if bid < 0:
 				var deco := TreeGen.top_decoration(lxs[i], lzs[i], ctx)   # cheap: has_tree gate early-outs to AIR
 				if deco != BlockCatalog.AIR:
@@ -2071,13 +2077,20 @@ func _pbm_compute(i: int) -> void:
 						var eb := int(esnap.get(Vector2i(lxs[idx], lzs[idx]), -1))
 						if eb >= 0:
 							fi = FarPalette.far_color_index_of_block(eb)
+					if fi < 0 and CubeSphere.FP_STRUCT_LOD:
+						# COSMOS STRUCTURES P2 (§7.4a): house roof-pixel wins over tree canopy (edit > house > tree > terrain).
+						var hdeco := StructureGen.top_decoration(lxs[idx], lzs[idx], ctx)
+						if hdeco != BlockCatalog.AIR:
+							fi = FarPalette.far_color_index(BlockCatalog.color_of(hdeco))
 					if fi < 0:
 						var deco := TreeGen.top_decoration(lxs[idx], lzs[idx], ctx)
 						if deco != BlockCatalog.AIR:
 							fi = FarPalette.far_color_index(BlockCatalog.color_of(deco))
 					if fi < 0:
 						fi = FarPalette.far_color_index(cols[idx])
-					bytes[row_off + bx] = fi + 1
+					# FP_SKIN_SHADE_PACK: pack the quantised analytic shade beside the idx (byte-equal to the C++
+					# tile path's packed byte). Off ⇒ the shipped `fi + 1` verbatim.
+					bytes[row_off + bx] = _sp_pack(fi, fid, lxs[idx], lzs[idx], ctx) if CubeSphere.FP_SKIN_SHADE_PACK else fi + 1
 			by0 += rows
 	elif not tiled:
 		for by in range(ny):
@@ -2092,6 +2105,11 @@ func _pbm_compute(i: int) -> void:
 					var eb := int(esnap.get(Vector2i(lx, lz), -1))
 					if eb >= 0:
 						fi = FarPalette.far_color_index_of_block(eb)
+				if fi < 0 and CubeSphere.FP_STRUCT_LOD:
+					# COSMOS STRUCTURES P2 (§7.4a): house roof-pixel wins over tree canopy (edit > house > tree > terrain).
+					var hdeco := StructureGen.top_decoration(lx, lz, ctx)
+					if hdeco != BlockCatalog.AIR:
+						fi = FarPalette.far_color_index_of_block(hdeco) if CubeSphere.FP_SKIN_BLOCK_EXACT else FarPalette.far_color_index(BlockCatalog.color_of(hdeco))
 				if fi < 0:
 					var deco := TreeGen.top_decoration(lx, lz, ctx)   # cheap has_tree early-out on non-tree columns
 					if deco != BlockCatalog.AIR:
@@ -2110,10 +2128,27 @@ func _pbm_compute(i: int) -> void:
 							fi = FarPalette.far_color_index_of_block(TerrainConfig.top_block_id(g, int(prof.y), prof.w, lx, lz))
 						else:
 							fi = FarPalette.far_color_index(FarPalette.color_for(g, int(prof.y), prof.w, g < TerrainConfig.SEA_LEVEL))
-				bytes[row_off + bx] = fi + 1
+				# FP_SKIN_SHADE_PACK: pack the quantised analytic shade beside the idx (byte-equal to the C++
+				# tile path's packed byte). Off ⇒ the shipped `fi + 1` verbatim.
+				bytes[row_off + bx] = _sp_pack(fi, fid, lx, lz, ctx) if CubeSphere.FP_SKIN_SHADE_PACK else fi + 1
 	_pbm_mutex.lock()
 	_pbm_bytes[i] = bytes
 	_pbm_mutex.unlock()
+
+## FP_SKIN_SHADE_PACK (docs/COSMOS-SKIN-SHADE-PACK): the GDScript twin of the C++ bake_far_tile pack — byte =
+## `1 + fi + 14·SurfaceShot.shade_q(SurfaceShot._shade(...))`, so the GDScript fallback branches stay byte-equal
+## to the packed C++ tile path (the G-CPB byte-equality law extends to the packed byte). The centre g / is_tree
+## re-derive through the SAME facet_profile / top_decoration the classification used (deterministic — identical
+## values), exactly as the C++ pack re-derives via column_profile_core / tree_top_decoration on the branches that
+## didn't already have them. fi outside [0,13] (rogue LUT value) falls back to the legacy idx byte, mirroring the
+## C++ `fi < SHADE_PACK_LANES` guard. Only called under the flag (both call sites ternary on it).
+func _sp_pack(fi: int, fid: int, lx: int, lz: int, ctx) -> int:
+	if fi < 0 or fi >= CubeSphere.SHADE_PACK_LANES:
+		return fi + 1
+	var g := int(TerrainConfig.facet_profile(fid, lx, lz).x)
+	var is_tree := TreeGen.top_decoration(lx, lz, ctx) != BlockCatalog.AIR
+	var s := SurfaceShot._shade(fid, lx, lz, g, is_tree, g < TerrainConfig.SEA_LEVEL, ctx)
+	return 1 + fi + CubeSphere.SHADE_PACK_LANES * SurfaceShot.shade_q(s)
 
 ## Gate-only hook: force the offload path with a supplied lane, independent of the FP_TEX_BAKE_WORKER const, so
 ## verify_tex_worker can drive BOTH paths in one flag state (the byte-identity comparison). Never called in production.

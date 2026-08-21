@@ -712,6 +712,24 @@ const FP_CPP_TILE_BAKE := false
 ## overrides those columns; and the chop invalidates the facet's baked band/fine tiles so they re-bake. GDScript-only
 ## (no engine change). Off ⇒ empty snapshots + no invalidation ⇒ byte-identical bakes.
 const FP_FT_SKIN_CHOP := false
+## FP_SKIN_SHADE_PACK (docs/COSMOS-SKIN-SHADE-PACK, Defect 3): close the near↔far COLOUR/BRIGHTNESS step under the
+## player — the flat far skin (FP_SKIN_FLATCOLOR band + FP_PLANET_MAP fine) is a relief-less {palette-idx}→colour,
+## so it reads brighter/cleaner than the lit 3D near-field. Fix: bake the SUN-INDEPENDENT analytic shade
+## (SurfaceShot._shade — hillshade/AO + water-depth + canopy ground-shadow, [0.15,1]) INTO the existing L8 byte,
+## packed as `1 + idx + 14·shade_q` (idx ∈ [0,13] — the 14 frozen_colors lanes; shade_q ∈ [0,17] — 18 quantised
+## steps; max 252 ≤ 255, 0 stays the un-baked sentinel), and decode+multiply it in the flat shaders
+## (far_lut[idx]·shade UNDER the v_st sun term — single-owner rule, exactly where _BAND_SHOT_ALBEDO multiplied its
+## shade; FP_BAND_SHOT itself is DEAD: RG8 blew the byte ledger and it lived on the wrong FP_BLOCK_DETAIL lineage).
+## Same L8 byte size (no OOM), same multi-core C++ bake (patch 0014 extends bake_far_tile, near-free — it reuses
+## the per-texel heights the id classification already computes). Both the band (512²) AND fine (64²) tiles pack,
+## so there is no shade seam at the fine↔band handoff; the GDScript _pbm fallback branches pack identically (the
+## C++/GDScript byte-equality law extends to the packed byte). Default false ⇒ bytes stay `idx + 1` and every
+## shader string is byte-identical (FLAT 6042/0). Gate: verify_skin_shade_pack.gd.
+const FP_SKIN_SHADE_PACK := false
+## FP_SKIN_SHADE_PACK protocol constants — the pack stride (the 14 palette lanes) and the shade step count.
+## MUST match patch 0014's SHADE_PACK_LANES/SHADE_PACK_STEPS and the shader decode literals in facet_far_ring.gd.
+const SHADE_PACK_LANES := 14
+const SHADE_PACK_STEPS := 18
 
 ## FP_OBJ_LOD (docs/COSMOS-OBJECT-LOD-DESIGN.md): the physical-object far-render + LOD ladder. Discrete objects
 ## (VoxelBody debris; ships/stations/asteroids later) get a size-derived ladder — full mesh → StructDecimator
@@ -1116,7 +1134,7 @@ const FP_STRUCT_FAR := false                 # P0: StructDecimator + FacetFarStr
 ## no work during fresh-load pile-up). Off ⇒ the shipped credit gate verbatim (byte-identical). Needs FP_STRUCT_FAR.
 const FP_STRUCT_NEAR_GUARD := false          # §4.2: credit-independent bounded structures step (double-render + missing/restore)
 const FP_STRUCT_GEN := false                 # P1: StructureGen worldgen (declared, unused in P0)
-const FP_STRUCT_LOD := false                 # P2: LOD-B band + orbit exception + roof texels (declared, unused in P0)
+const FP_STRUCT_LOD := false                 # P2 (§7.4a): far-skin roof-pixels — houses composite their roof colour into the fine map like tree canopy
 const STRUCT_MIN_BLOCKS := 16               # §4.1 a cluster is a structure at ≥ this many placed blocks
 const STRUCT_MIN_EXTENT := 3                 # §4.1 AND bbox extent ≥ this on at least two axes (filters pillars/floors)
 const STRUCT_TRACK_MAX := 65536             # §4.3 NEVER-OOM: max tracked placed cells (degrade past, never grow)
@@ -1130,6 +1148,18 @@ const STRUCT_BYTES_MAX := 8 << 20           # §8 NEVER-OOM: hard 8 MB ceiling (
 const STRUCT_ORBIT_MIN := 48                 # §7.4 P2: min max-extent (blocks) for the orbit-resident exception
 const STRUCT_HIDE_STREAK := 2                # §7.3 consecutive COVERED probes before hiding the far model
 const STRUCT_SHOW_STREAK := 2                # §7.3 consecutive NOT_COVERED probes before restoring it
+## FP_STRUCT_SHELL_BAND (far-render LOD inconsistency: houses vanish at alt 256 while trees render to ~600) — the
+## far-STRUCTURE analogue of FP_FT_SHELL_BAND. FacetFarStructures binary-suspends the whole tier off-surface
+## (`_mi.visible = not offsurf`, flips at OFFSURFACE_Y=256), so a built house HARD-CUTS at 256 while the co-located
+## far trees fade out over [FT_SHELL_FADE_ALT, FT_SHELL_HIDE_ALT] = 520→600 — the visible dropout. This mirrors the
+## trees' three-zone altitude law onto the merged structure mesh: ZONE S (on-surface) shipped; ZONE B (offsurf,
+## h<FT_SHELL_HIDE_ALT) keeps the per-house merged mesh VISIBLE + LIVE (delta-gated rebuild across crossings) with a
+## tier_fade dither DISSOLVE over [FADE_ALT, HIDE_ALT]; ZONE O (h≥HIDE) hidden (the fine-map roof skin owns it above).
+## CO-TIMED with the trees by REUSING FT_SHELL_HIDE_ALT / FT_SHELL_FADE_ALT. CRITICAL: the on-surface material is the
+## radial `voxi_shade` shader (planet_centre uniform) which renders BLACK in the orbital-shell frame off-surface; zone
+## B therefore swaps _mi to an UNLIT vertex-colour material so the baked per-house BROWN renders (not a black blob).
+## Off ⇒ the shipped binary suspend + off-surface early-return, byte-identical. Needs FP_STRUCT_FAR. Gate: G-ST-SHELL.
+const FP_STRUCT_SHELL_BAND := false          # far structures render in the off-surface shell band [OFFSURFACE_Y, FT_SHELL_HIDE_ALT)
 
 ## FP_DEM_DEFER (docs/COSMOS-STREAM-PARALLEL-DESIGN.md Phase A — the fresh-reload fix) — the whole-planet coarse
 ## DEM (`FP_GLOBAL_RELIEF_DATA` / `GlobalReliefData.step`) is frame-budget GATED but the admitted unit is UNBOUNDED
@@ -1791,6 +1821,21 @@ const V2_NEARFILL_SINK := 6.0   ## = BACKSTOP_SINK: radial sink (blocks) for the
 ## CALM-class churn bomb). Effective only with FP_SMOOTH_V2_NEARFILL + TierPlace.applied_cover_on(). Render-only; physics
 ## untouched (V2 is render-only). Off ⇒ shipped V2 material + shipped COLOR.a ⇒ byte-identical (no mesh/material change).
 const FP_V2_NEARFILL_UNSINK := false
+
+## COSMOS-FAR-HEIGHT §3 residual (task #72 slit) — FP_V2_EDGE_APRON. The near-fill (hop ≤ 1) tiles sink UNIFORMLY
+## V2_NEARFILL_SINK (6.0); FP_V2_NEARFILL_UNSINK un-sinks them only to TRUE−1.5 where uncovered. Along a tile-boundary
+## edge SHARED WITH AN UNSUNK (hop ≥ 2) neighbour there is then an OPEN radial STEP (1.5–6 blocks) with NO wall geometry
+## between the sunk tile edge (TRUE−1.5..6) and the neighbour edge (TRUE) → a straight lattice-aligned slit you see the
+## black void/space through (the deployed "deliberate-sink" residual). This does NOT touch the sink (the sink prevents
+## far-over-near protrusion, #113) — it closes the visible gap: `build_tile` emits a thin vertical APRON/skirt quad-strip
+## along each sunk-tile boundary edge that faces an unsunk neighbour, from the sunk edge vertex (reused surface vertex,
+## COLOR.a sink-flag ⇒ un-sinks in lock-step with the surface) UP to the un-sunk TRUE height (`p_true = p + rp·sink`,
+## the SAME reconstruction the un-sink shader/CPU-twin use). The apron TOP carries COLOR.a = 0 (shader NEVER un-sinks it)
+## so it sits at EXACTLY the neighbour-welded TRUE height — never above it (no new #113 protrusion). Only sunk↔unsunk
+## edges get an apron (sunk↔sunk edges already weld continuously; an apron there would poke a visible fin above the
+## surface — the caller passes an EDGE MASK from the hop map). cull_disabled is already on for this mesh so winding is
+## moot. Off ⇒ no apron vertices emitted ⇒ byte-identical geometry (FLAT 6042/0). Render-only (V2 carries no collision).
+const FP_V2_EDGE_APRON := false
 
 ## docs/COSMOS-FAR-TERMINATOR-DESIGN.md (§4, far-border day-lit-at-night fix) — the day/night terminator LAW
 ## itself is correct and unified everywhere (every far material multiplies albedo by voxi_shade(n, sun_dir),

@@ -348,6 +348,9 @@ static func is_moon_biome(b: int) -> bool:
 # (Mountains mask), and the 7xx hashing salts below. SnowfallSystem owns 105 (the
 # SEED+105 weather-gate noise, SNOW-ACCUMULATION §4.3) — recorded here so the one-place
 # registry stays collision-free even though the noise object lives in the sim class.
+# COSMOS STRUCTURES P1 (docs/COSMOS-STRUCTURES-DESIGN.md §12.4): StructureGen owns 201-209 (201 village gate,
+# 202 house gate, 203/204 footprint jitter, 205/206 footprint w/d, 207 wall_h, 208 door side, 209 roof/material) —
+# disjoint from TreeGen's 11-125 and TerrainConfig's 101-105 / 7xx. Its _hash01 is a verbatim copy of TreeGen's mix.
 const _SALT_BEDROCK := 701
 const _SALT_DEEP := 702
 const _SALT_STRATA_EXIST := 711
@@ -530,9 +533,40 @@ static func material_tables() -> Dictionary:
 		# skin_block_exact routes far_color/far_index through deco_far_idx[top_block_id]. Flags default false ⇒ legacy.
 		"climate_biomes": CubeSphere.FP_CLIMATE_BIOMES,
 		"skin_block_exact": CubeSphere.FP_SKIN_BLOCK_EXACT,
+		# FP_SKIN_SHADE_PACK (docs/COSMOS-SKIN-SHADE-PACK, patch 0014): mirror the flag into the C++ bake_far_tile —
+		# gates the packed {1 + far_idx + 14·shade_q} L8 byte (quantised SurfaceShot._shade analytic AO). Default-off
+		# sentinel (key absent ⇒ false in setup) ⇒ idx-only bytes ⇒ byte-identical legacy. Single home beside
+		# skin_block_exact/struct_lod so the far tile-bake gen can never drift from the GDScript flag.
+		"skin_shade_pack": CubeSphere.FP_SKIN_SHADE_PACK,
 		"id_acacia_log": BlockCatalog.id_of(&"acacia_log"), "id_acacia_leaf": BlockCatalog.id_of(&"acacia_leaves"),
 		"id_jungle_log": BlockCatalog.id_of(&"jungle_log"), "id_jungle_leaf": BlockCatalog.id_of(&"jungle_leaves"),
 		"id_cactus": BlockCatalog.id_of(&"cactus"),
+		# COSMOS STRUCTURES P1b (docs/COSMOS-STRUCTURES-DESIGN.md §12.6): the C++ village-generator mirror keys (patch
+		# 0013). struct_gen mirrors FP_STRUCT_GEN; struct_earth_facets = 6·K² is the body gate (Earth-only villages);
+		# the six ids are the frozen house materials resolved EXACTLY as StructureGen.warm_up does (stone foundation +
+		# floor, wood walls, dark_oak_log corner posts + roof, glass windows). Default-off ⇒ the C++ claim never runs ⇒
+		# byte-identical legacy (the 0011 "not supplied ⇒ legacy" sentinel discipline). Single home ⇒ near-gen + far
+		# tile-bake gens agree by construction.
+		"struct_gen": CubeSphere.FP_STRUCT_GEN,
+		# COSMOS STRUCTURES P2 (§7.4a far-skin roof-pixels): mirror CubeSphere.FP_STRUCT_LOD — gates the C++
+		# bake_far_tile's struct_top_decoration roof-pixel consult (BESIDE the tree branch). Default-off sentinel
+		# (key absent ⇒ false in setup) ⇒ the far tile-bake never consults the house claim ⇒ byte-identical legacy.
+		"struct_lod": CubeSphere.FP_STRUCT_LOD,
+		"struct_earth_facets": FacetAtlas.facet_count(),
+		"struct_foundation": BlockCatalog.id_of(&"stone"),
+		"struct_floor": BlockCatalog.id_of(&"stone"),
+		"struct_wall": BlockCatalog.id_of(&"wood"),
+		"struct_post": BlockCatalog.id_of(&"dark_oak_log"),
+		"struct_roof": BlockCatalog.id_of(&"dark_oak_log"),
+		"struct_window": BlockCatalog.id_of(&"glass"),
+		# COSMOS STRUCTURES P1b FIX (§12.4 alias trap): the low moon biome id (moon_biome_id(0) = 11 when
+		# FP_BIOME_SPACE_FIX is off, 21 when on). The C++ resolve_cell_core mirror airs biomes [lo, lo+2]
+		# above the surface, matching resolve_cell's is_moon_biome/_moon_cell interception — so a climate
+		# savanna/jungle column (B_SAVANNA=11 / B_JUNGLE=12, which alias the moon ids with the fix off)
+		# renders open air, NOT an Earth-terrain house, exactly as the GDScript oracle does. Single home so
+		# the near-gen + far tile-bake gens can never drift from moon_biome_id. Pure passthrough of an
+		# existing const — the GDScript oracle's own resolve/claim behaviour is unchanged.
+		"moon_biome_lo": moon_biome_id(0),
 		"strata_seq": PackedInt32Array(_STRATA_SEQ),
 		"band_seq": PackedInt32Array(_BAND_SEQ),
 		"ore_stone": PackedInt32Array(_ORE_STONE),
@@ -606,6 +640,10 @@ static func warm_up() -> void:
 	_ensure_noise()
 	_ensure_ids()
 	TreeGen.warm_up()
+	# COSMOS STRUCTURES P1 (FP_STRUCT_GEN): resolve the house material ids on the MAIN thread (like TreeGen) so the
+	# voxel worker never races BlockCatalog.id_of into existence. Behaviour-neutral when the flag is off (claim_at is
+	# never consulted), so this stays byte-identical.
+	StructureGen.warm_up()
 	# COSMOS crash-fix (WGC §7.4): in curved mode the worldgen fold (LatticeNav → CubeSphere.fold_cell)
 	# reads a lazily-built static edge-remap table. If the voxel WORKER first-touches that build while a
 	# main-thread fold (FarTerrain / collider / HUD / player query) runs concurrently, the shared static
@@ -1382,6 +1420,14 @@ static func resolve_cell(x: int, y: int, z: int, g: int, biome: int, c: float, t
 				smat = _surface_rule(x, y, z, g, biome, c, t)   # carve: generated banding, NO ore/deepslate
 			return _with_snow_state(_with_shore_liquid(CellCodec.pack(smat, smod), y, t), g, t)
 		if y >= hi:
+			# COSMOS STRUCTURES P1 (§12.3, FP_STRUCT_GEN): the village-house claim is consulted BEFORE the sea/tree
+			# chain (precedence edits > structure claim > sea/tree; edits already won upstream in cell_value_at). The
+			# tri-state maps −1 → fall through, 0 → AIR (authoritative), >0 → house block id. `g` is passed so claim_at
+			# does the y-window early-out with ZERO recompute. Flag off ⇒ this branch is never entered (byte-identical).
+			if CubeSphere.FP_STRUCT_GEN:
+				var _cl := StructureGen.claim_at(x, y, z, pcache, g)
+				if _cl >= 0:
+					return _cl
 			if y <= SEA_LEVEL:
 				return _sea_block(t, y)
 			return TreeGen.block_at(x, y, z, pcache)
@@ -1392,6 +1438,14 @@ static func resolve_cell(x: int, y: int, z: int, g: int, biome: int, c: float, t
 			idlo = _ore_at(x, y, z, idlo, biome, c)
 		return idlo
 	if y > g:
+		# COSMOS STRUCTURES P1 (§12.3, FP_STRUCT_GEN): claim BEFORE the g+1 cap / snow stack / sea fill / tree overlay
+		# — precedence edits > structure claim > cap/snow/sea/tree. −1 fall through, 0 authoritative interior/door AIR
+		# (suppresses the snow stack + smoothing lip inside the house), >0 a house block id. `g` (this column's ground)
+		# feeds the y-window early-out. Flag off ⇒ never consulted (byte-identical), so this is the ONLY hot-path cost.
+		if CubeSphere.FP_STRUCT_GEN:
+			var _cl := StructureGen.claim_at(x, y, z, pcache, g)
+			if _cl >= 0:
+				return _cl
 		# Smoothing CAP cell (SUB-VOXEL-SMOOTHING §8.1): a column whose neighbours rise grows a
 		# partial lip one cell above its surface, bridging a 1-block step up into a continuous slope.
 		# WATER-SHORE §3.6: underwater caps are now ON — a submerged step descends smoothly over
@@ -1418,6 +1472,15 @@ static func resolve_cell(x: int, y: int, z: int, g: int, biome: int, c: float, t
 		if y <= SEA_LEVEL:
 			return _sea_block(t, y)
 		return TreeGen.block_at(x, y, z, pcache)
+	# COSMOS STRUCTURES CARVE-TO-MIN (§12.3, FP_STRUCT_GEN): a village house LEVELS its footprint by carving
+	# terrain above the flattened pad (base_y = the MIN footprint corner). claim_at now fires at y <= g too:
+	# >0 is a buried floor/wall course that OVERRIDES terrain, 0 is authoritative AIR (the carve / hollow
+	# interior). Consulted BEFORE the solid stackup so the pad is flattened DOWN (never filled up ⇒ the height
+	# budget holds). Flag off ⇒ never consulted (byte-identical) — this is the only hot-path cost of the flag.
+	if CubeSphere.FP_STRUCT_GEN:
+		var _cl := StructureGen.claim_at(x, y, z, pcache, g)
+		if _cl >= 0:
+			return _cl                                    # >0 buried house block, 0 = carved AIR (both override terrain)
 	var id := _surface_rule(x, y, z, g, biome, c, t)
 	# The stone -> deepslate/strata/ore rewrite applies to INTERIOR stone only (y < g). A B_MOUNTAINS
 	# column tops with STONE at y == g (its cappable rock peak); guarding on `y < g` keeps that top a

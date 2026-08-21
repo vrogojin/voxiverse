@@ -60,6 +60,7 @@ func _initialize() -> void:
 	_gate_churn()
 	_gate_off(fid)
 	_gate_fh_unsink(fid)
+	_gate_edge_apron(fid)
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
 
@@ -322,6 +323,75 @@ func _gate_off(fid: int) -> void:
 			inert_ok = false
 	_ok(inert_ok, "G-NFH-OFF: _applied_probe_step() with no override never moves _applied_r off 0 or sets _pending")
 	ring.free()
+
+# ---------- G-APRON (FP_V2_EDGE_APRON, docs/COSMOS-FAR-HEIGHT-DESIGN.md §3 residual / task #72 slit) ----------
+## The apron closes the see-through slit a near-fill-SUNK tile opens along a boundary edge shared with an UNSUNK
+## neighbour. `FacetSmoothV2._append_apron` is a pure geometry mutator (no generator/RenderingServer), so this gate
+## drives it directly on a SYNTHETIC sunk tile — TRUE radial positions `b_true`, the shipped sunk vertex
+## `p = b_true − n·sink`, COLOR.a = 1 (sink flag) — and asserts the apron TOP recovers exactly `b_true` (the neighbour-
+## welded height the un-sink shader itself reconstructs), pinned there with COLOR.a = 0 so it never rises above the
+## neighbour (no #113 protrusion), with growth bounded to one (cells+1)-vertex strip per masked edge. The mask law
+## `apron_edge_mask` is checked against the verified S_*↔EDGE_* correspondence: an unsunk neighbour flags its edge, a
+## sunk neighbour never does (no fin on a continuous sunk↔sunk seam). Flag-independent (the mask the caller passes is
+## 0 off the flag ⇒ zero apron ⇒ byte-identical), so it is all-pass at the byte-off default.
+func _gate_edge_apron(fid: int) -> void:
+	print("  --- G-APRON: FP_V2_EDGE_APRON closing-apron geometry + mask law ---")
+	var cells := 3
+	var stride := cells + 1
+	var n := stride * stride
+	var sink: float = CubeSphere.V2_NEARFILL_SINK
+	var b_true := PackedVector3Array(); b_true.resize(n)
+	var pos := PackedVector3Array(); pos.resize(n)
+	var nrm := PackedVector3Array(); nrm.resize(n)
+	var col := PackedColorArray(); col.resize(n)
+	var idx := PackedInt32Array()
+	for gj in range(stride):
+		for gi in range(stride):
+			var k := gj * stride + gi
+			var dir := Vector3(float(gi) - 1.0, 8.0, float(gj) - 1.0).normalized()   # near-vertical radial spread + relief
+			var bt := dir * (FA.R_BLOCKS + 20.0 + float(gi) + float(gj))
+			b_true[k] = bt
+			pos[k] = bt - bt.normalized() * sink   # the shipped SUNK vertex (radial drop)
+			nrm[k] = bt.normalized()
+			col[k] = Color(0.3, 0.5, 0.2, 1.0)     # rgb terrain colour, a = 1.0 sink flag
+	var tile := {"pos": pos.duplicate(), "nrm": nrm.duplicate(), "col": col.duplicate(), "idx": idx.duplicate()}
+	var v0: int = (tile["pos"] as PackedVector3Array).size()
+	FSV2._append_apron(tile, cells, sink, 0xF)
+	var apos: PackedVector3Array = tile["pos"]
+	var acol: PackedColorArray = tile["col"]
+	_ok(apos.size() == v0 + 4 * stride, "G-APRON: exactly one (cells+1)-vertex strip per boundary edge (%d added, want %d)" % [apos.size() - v0, 4 * stride])
+	var eps := 1.0e-3
+	var max_h_err := 0.0
+	var all_top_pinned := true
+	var never_above := true
+	var ai := v0
+	for edge in range(4):
+		var e: Array = FSV2._edge_indices(edge, cells, stride)
+		for vi in e:
+			var top: Vector3 = apos[ai]
+			var want_true: Vector3 = b_true[vi]
+			max_h_err = maxf(max_h_err, (top - want_true).length())
+			if acol[ai].a != 0.0:
+				all_top_pinned = false
+			if top.length() > want_true.length() + eps:
+				never_above = false
+			ai += 1
+	_ok(max_h_err <= eps, "G-APRON: apron TOP == neighbour-weld TRUE height within %f (max err %f)" % [eps, max_h_err])
+	_ok(all_top_pinned, "G-APRON: apron TOP carries COLOR.a=0 (un-sink shader never lifts it)")
+	_ok(never_above, "G-APRON: apron TOP never rises above neighbour TRUE height (no #113 protrusion)")
+	var tile0 := {"pos": pos.duplicate(), "nrm": nrm.duplicate(), "col": col.duplicate(), "idx": idx.duplicate()}
+	FSV2._append_apron(tile0, cells, sink, 0)
+	_ok((tile0["pos"] as PackedVector3Array).size() == v0, "G-APRON: mask 0 (flag-off path) emits ZERO apron vertices (byte-identical count)")
+	var tile1 := {"pos": pos.duplicate(), "nrm": nrm.duplicate(), "col": col.duplicate(), "idx": idx.duplicate()}
+	FSV2._append_apron(tile1, cells, sink, 1 << FSV2.EDGE_EAST)
+	_ok((tile1["pos"] as PackedVector3Array).size() == v0 + stride, "G-APRON: single-edge mask emits exactly one strip")
+	# mask law over the verified S_*↔EDGE_* correspondence
+	var sunk_all := {
+		FA.seam_neighbour(fid, FA.S_WEST): true, FA.seam_neighbour(fid, FA.S_EAST): true,
+		FA.seam_neighbour(fid, FA.S_SOUTH): true, FA.seam_neighbour(fid, FA.S_NORTH): true}
+	_ok(FSV2.apron_edge_mask(fid, sunk_all) == 0, "G-APRON: all-neighbours-sunk ⇒ mask 0 (no apron on interior sunk↔sunk edges)")
+	_ok(FSV2.apron_edge_mask(fid, {}) == 0xF, "G-APRON: no-neighbour-sunk ⇒ mask 0xF (apron every frontier edge)")
+	_ok(true, "G-APRON: FP_V2_EDGE_APRON compiled=%s (off ⇒ build_tile never appends apron ⇒ byte-identical)" % str(CubeSphere.FP_V2_EDGE_APRON))
 
 # ---------- G-FH-UNSINK + G-FH-OFF (FP_V2_NEARFILL_UNSINK, docs/COSMOS-FAR-HEIGHT-DESIGN.md §3) ----------
 ## The V2 near-fill un-sink is a VERTEX-shader zone law (the headless dummy RenderingServer never parses GLSL), so this

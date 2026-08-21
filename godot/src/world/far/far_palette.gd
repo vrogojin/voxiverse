@@ -212,6 +212,17 @@ static func ensure_far_index_ready() -> void:
 				best_d = d
 				best = j
 		_block_idx[id] = best
+	# COSMOS STRUCTURES P2 (FP_STRUCT_LOD, §7.4a): the village roof/post block `dark_oak_log` is a dark BROWN wood, but
+	# its nearest frozen-palette swatch is index 7 = (0.23,0.23,0.24) — a near-black GREY. Since StructureGen.top_decoration
+	# returns the roof for most house columns, a village's far-skin roof-pixels would read as a BLACK smudge from orbit
+	# instead of buildings. Re-home dark_oak_log onto the warm-brown swatch (index 8 = (0.48,0.33,0.19)) so settlements
+	# read as brown rooftops. The LUT is handed frozen to the C++ bake (config "deco_far_idx"), so this one override fixes
+	# BOTH the GDScript baker and the C++ bake_far_tile house branch with no rebuild. Gated on the flag ⇒ off = the LUT is
+	# byte-identical (and dark-oak far-skin colour anywhere else is unchanged when the village feature is off).
+	if CubeSphere.FP_STRUCT_LOD:
+		var _doak := BlockCatalog.id_of(&"dark_oak_log")
+		if _doak >= 0 and _doak < _block_idx.size():
+			_block_idx[_doak] = 8
 	_fc_ready = true
 
 static func far_color_index(c: Color) -> int:

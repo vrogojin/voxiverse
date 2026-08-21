@@ -61,6 +61,10 @@ func _initialize() -> void:
 	_gate_sg_phys()
 	_gate_sg_skin()
 
+	# COSMOS STRUCTURES far-render LOD fix (FP_STRUCT_SHELL_BAND): far houses render in the off-surface shell band
+	# [OFFSURFACE_Y, FT_SHELL_HIDE_ALT), co-timed with the far trees (both keyed on FT_SHELL_*_ALT).
+	_gate_shell()
+
 	print("=== VERIFY structures: ", _pass, " passed, ", _fail, " failed ===")
 	quit(1 if _fail > 0 else 0)
 
@@ -693,3 +697,44 @@ func _gate_shader() -> void:
 	var code := FS.shader_code()
 	_ok(code.contains("voxi_shade") and code.contains("planet_centre"),
 		"G-ST-SHADER: far-structure shader uses the shared radial voxi_shade + planet_centre uniform")
+
+# =====================================================================================================================
+# G-ST-SHELL (FP_STRUCT_SHELL_BAND — the far-render dropout fix: houses vanished at alt 256 while trees rendered to
+# ~600). The far-STRUCTURE three-zone altitude law must MATCH the far-trees policy (both driven by FT_SHELL_*_ALT):
+# ZONE S (on-surface) visible; ZONE B (offsurf, h<HIDE) VISIBLE + LIVE under an UNLIT vertex-colour material (so the
+# baked BROWN renders, not the black the radial voxi_shade gives off-surface) with the tier_fade dissolve; ZONE O
+# (h≥HIDE) hidden. Flag off ⇒ the shipped binary suspend (off-surface hidden at any altitude), byte-identical.
+# =====================================================================================================================
+func _gate_shell() -> void:
+	var on := CubeSphere.FP_STRUCT_SHELL_BAND
+	var tier = FS.new()
+	tier.setup_instance(Node3D.new(), 0)   # gate drives debug_apply_shell_visibility directly — no ring shell hooks
+	# ZONE S (on-surface) is visible in BOTH flag states (shipped).
+	tier.debug_apply_shell_visibility(false, 41.0)
+	_ok(tier.mi_visible(), "G-ST-SHELL: zone S (on-surface) visible (both flag states)")
+	if on:
+		# The trees' policy: VISIBLE at h=300 (zone B), HIDDEN at h=650 (zone O). Structures must match exactly.
+		var z_b := tier.debug_apply_shell_visibility(true, 300.0)
+		_ok(z_b == 1 and tier.mi_visible(),
+			"G-ST-SHELL(on): h=300 offsurf ⇒ VISIBLE (zone B) — matches the far-trees policy")
+		_ok(tier.mi_material_is_shell(),
+			"G-ST-SHELL(on): zone B uses the UNLIT vertex-colour material ⇒ baked BROWN, not black")
+		# tier_fade dissolve: 1.0 at ≤FADE_ALT, strictly decreasing into HIDE_ALT, and the zone-B apply drove the uniform.
+		var tf300 := 1.0 - smoothstep(CubeSphere.FT_SHELL_FADE_ALT, CubeSphere.FT_SHELL_HIDE_ALT, 300.0)
+		var tf560 := 1.0 - smoothstep(CubeSphere.FT_SHELL_FADE_ALT, CubeSphere.FT_SHELL_HIDE_ALT, 560.0)
+		_ok(tf300 == 1.0 and tf560 < tf300 and tf560 > 0.0,
+			"G-ST-SHELL(on): tier_fade dissolves over [FT_SHELL_FADE_ALT, FT_SHELL_HIDE_ALT] (co-timed with trees)")
+		_ok(is_equal_approx(float(tier._shell_material.get_shader_parameter("tier_fade")), tf300),
+			"G-ST-SHELL(on): the zone-B apply drives the tier_fade uniform (no rebuild)")
+		var z_o := tier.debug_apply_shell_visibility(true, 650.0)
+		_ok(z_o == 2 and not tier.mi_visible(),
+			"G-ST-SHELL(on): h=650 offsurf ⇒ HIDDEN (zone O) — matches the far-trees policy (skin owns it above)")
+	else:
+		# Off ⇒ byte-identical binary suspend: off-surface hidden at ANY altitude, and no shell material was built.
+		tier.debug_apply_shell_visibility(true, 300.0)
+		_ok(not tier.mi_visible(),
+			"G-ST-SHELL(off): off-surface hidden at any altitude (binary suspend, byte-identical)")
+		tier.debug_apply_shell_visibility(true, 650.0)
+		_ok(not tier.mi_visible(), "G-ST-SHELL(off): off-surface still hidden at h=650 (byte-identical)")
+		_ok(tier._shell_material == null and tier.shell_band_state().is_empty(),
+			"G-ST-SHELL(off): no shell material + empty telemetry (byte-identical off)")

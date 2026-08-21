@@ -33,7 +33,13 @@ var _ring: Node3D = null
 var _mi: MeshInstance3D = null                # LOD-A merged band mesh (one draw)
 var _mesh: ArrayMesh = null
 var _material: ShaderMaterial = null
+var _shell_material: ShaderMaterial = null    # FP_STRUCT_SHELL_BAND: zone-B UNLIT vertex-colour material (never built off-flag)
 var _active_fid := -1
+
+# FP_STRUCT_SHELL_BAND A/B / gate read-back: last computed zone (0=S,1=B,2=O; -1 flag off) + the altitude the law saw.
+var _dbg_shell_zone := -1
+var _dbg_shell_h := 0.0
+var _dbg_shell_offsurf := false
 
 # wired queries (all Callables; unset ⇒ inert — the tier renders nothing / degrades, never crashes)
 var _registry_query: Callable = Callable()    # () -> Array of structure records (StructureTracker.registry)
@@ -100,12 +106,44 @@ static func make_material() -> ShaderMaterial:
 	return sm
 
 # =====================================================================================================================
+# FP_STRUCT_SHELL_BAND shell material — UNLIT vertex colour + a `tier_fade` screen-space dither DISSOLVE. The on-surface
+# `_material` (voxi_shade, planet_centre uniform) renders BLACK in the orbital-shell frame off-surface (the defect fixed
+# once for the reverted aggregate box, commit 276cebd `_make_agg_material`), so zone B renders the merged mesh with THIS
+# material instead: ALBEDO = the baked per-house COLOR.rgb (BROWN), unshaded ⇒ no radial-normal black-out. tier_fade
+# scales the whole-tier dissolve over [FT_SHELL_FADE_ALT, FT_SHELL_HIDE_ALT] (the far-trees `_ft_dither` discard,
+# adapted from per-instance v_fade to one uniform since this is ONE merged mesh, not a MultiMesh). Only ever
+# constructed under the flag ⇒ off is byte-identical (material_override stays `_material`, this object is never made).
+const _SHELL_SHADER := "shader_type spatial;
+render_mode unshaded, cull_disabled;
+uniform float tier_fade = 1.0;
+varying flat vec4 v_col;
+float _sd_dither(vec2 fc) { return fract(sin(dot(floor(fc), vec2(12.9898, 78.233))) * 43758.5453); }
+void vertex() { v_col = COLOR; }
+void fragment() {
+	if (_sd_dither(FRAGCOORD.xy) > tier_fade) discard;
+	ALBEDO = v_col.rgb;
+}
+"
+
+static func make_shell_material() -> ShaderMaterial:
+	var sm := ShaderMaterial.new()
+	var sh := Shader.new()
+	sh.code = _SHELL_SHADER
+	sm.shader = sh
+	sm.set_shader_parameter("tier_fade", 1.0)
+	return sm
+
+# =====================================================================================================================
 # Construction — one MeshInstance3D child of the ring under FP_STRUCT_FAR (FacetFarRing.setup).
 # =====================================================================================================================
 func setup_instance(ring: Node3D, active_fid: int) -> void:
 	_ring = ring
 	_active_fid = active_fid
 	_material = make_material()
+	# FP_STRUCT_SHELL_BAND: build the zone-B UNLIT material only under the flag ⇒ off-flag this stays null and
+	# material_override never changes (byte-identical). On-surface uses `_material`; zone B swaps to `_shell_material`.
+	if CubeSphere.FP_STRUCT_SHELL_BAND:
+		_shell_material = make_shell_material()
 	_mesh = ArrayMesh.new()
 	_mi = MeshInstance3D.new()
 	_mi.name = "FacetFarStructures"
@@ -118,6 +156,31 @@ func setup_instance(ring: Node3D, active_fid: int) -> void:
 
 func set_active(new_fid: int) -> void:
 	_active_fid = new_fid   # residency is camera-distance driven (rebuilt each step); crossing only re-seeds the centre
+
+## FP_STRUCT_SHELL_BAND §3: the three-zone altitude visibility law (the far-trees `_apply_visibility` analogue). Off
+## (or h<0 — the default keeps existing call sites on the shipped path) ⇒ the binary `_mi.visible = not offsurf`,
+## byte-identical. ZONE S (on-surface): visible, radial voxi_shade `_material`. ZONE B (offsurf, h<HIDE): visible +
+## LIVE under the UNLIT `_shell_material` (voxi_shade renders BLACK off-surface) with the tier_fade dissolve ramped
+## over [FADE_ALT, HIDE_ALT]. ZONE O (h≥HIDE): hidden (the fine-map roof skin owns it). Returns the zone (0/1/2; -1 off).
+func _apply_shell_visibility(offsurf: bool, h := -1.0) -> int:
+	if not (CubeSphere.FP_STRUCT_SHELL_BAND and h >= 0.0):
+		if _mi != null:
+			_mi.visible = not offsurf
+		return -1
+	var zone := 0 if not offsurf else (1 if h < CubeSphere.FT_SHELL_HIDE_ALT else 2)
+	if _mi != null:
+		if zone == 0:
+			_mi.visible = true
+			_mi.material_override = _material                       # ZONE S: the radial voxi_shade material
+		elif zone == 1:
+			_mi.visible = true                                     # ZONE B: merged mesh stays live off-surface
+			_mi.material_override = _shell_material                 # UNLIT vertex-colour ⇒ baked BROWN, not black
+			if _shell_material != null:
+				var tf := 1.0 - smoothstep(CubeSphere.FT_SHELL_FADE_ALT, CubeSphere.FT_SHELL_HIDE_ALT, h)
+				_shell_material.set_shader_parameter("tier_fade", tf)
+		else:
+			_mi.visible = false                                    # ZONE O: hidden, skin owns the view
+	return zone
 
 func set_sun_dir(sun_dir: Vector3) -> void:
 	if _material != null:
@@ -142,8 +205,16 @@ func step(settled := true, credit_ok := true, cam_render := Vector3.ZERO) -> voi
 	if _mi == null:
 		return
 	var offsurf := (_ring as FacetFarRing).shell_offsurface()
-	_mi.visible = not offsurf   # P0: on-surface only (the ≥48-block orbit exception is P2/FP_STRUCT_LOD)
-	if offsurf:
+	# FP_STRUCT_SHELL_BAND: the far-STRUCTURE three-zone altitude law (mirror of FP_FT_SHELL_BAND). h = camera radial
+	# altitude from the SAME ring accessor the trees use (shell_cam_alt). shell_mode ⇒ off-surface but below the hide
+	# line: the merged mesh stays VISIBLE + LIVE (fall through to the delta-gated rebuild so it stays correct across
+	# crossings). Off (h defaults -1) ⇒ `_mi.visible = not offsurf` + off-surface early-return, byte-identical.
+	var h := (_ring as FacetFarRing).shell_cam_alt() if CubeSphere.FP_STRUCT_SHELL_BAND else -1.0
+	var shell_mode := CubeSphere.FP_STRUCT_SHELL_BAND and offsurf and h < CubeSphere.FT_SHELL_HIDE_ALT
+	_dbg_shell_zone = _apply_shell_visibility(offsurf, h)
+	_dbg_shell_h = h
+	_dbg_shell_offsurf = offsurf
+	if offsurf and not shell_mode:
 		return
 	# FP_LOAD_DEFER settle gate + stream credit — no structure work during fresh-load pile-up (mirror of the trees).
 	# FP_STRUCT_NEAR_GUARD §4.2 (#132): at credit 0 the same freeze leaves a far structure over its arrived near build
@@ -406,3 +477,27 @@ func total_bytes() -> int:
 		var a := _mesh.surface_get_arrays(0)
 		mesh_b = (a[Mesh.ARRAY_VERTEX] as PackedVector3Array).size() * (3 * 4 + 4 * 4)
 	return _baked_bytes + mesh_b
+
+# --- FP_STRUCT_SHELL_BAND telemetry / gate hooks ---------------------------------------------------------------------
+## Confound-free A/B probe of the zone law. {} with the flag off (never merged → byte-identical telemetry). st_zone:
+## 0=S(surface), 1=B(shell band, mesh live off-surface), 2=O(orbit, hidden); st_shell = the zone-B UNLIT material is
+## active (⇒ baked BROWN, not black); st_h = the altitude the law saw.
+func shell_band_state() -> Dictionary:
+	if not CubeSphere.FP_STRUCT_SHELL_BAND:
+		return {}
+	return {
+		"st_zone": _dbg_shell_zone,
+		"st_vis": (_mi != null and _mi.visible),
+		"st_shell": (_mi != null and _mi.material_override == _shell_material),
+		"st_off": _dbg_shell_offsurf,
+		"st_h": snappedf(_dbg_shell_h, 0.1),
+	}
+
+## Gate hook (G-ST-SHELL): drive the zone-law visibility without a ring (mirror of the trees' debug_apply_visibility).
+func debug_apply_shell_visibility(offsurf: bool, h := -1.0) -> int:
+	return _apply_shell_visibility(offsurf, h)
+func mi_visible() -> bool:
+	return _mi != null and _mi.visible
+## True iff the zone-B UNLIT vertex-colour material is currently bound (the brown-not-black guarantee).
+func mi_material_is_shell() -> bool:
+	return _mi != null and _mi.material_override == _shell_material

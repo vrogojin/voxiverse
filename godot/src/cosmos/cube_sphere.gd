@@ -1130,6 +1130,18 @@ const STRUCT_BYTES_MAX := 8 << 20           # §8 NEVER-OOM: hard 8 MB ceiling (
 const STRUCT_ORBIT_MIN := 48                 # §7.4 P2: min max-extent (blocks) for the orbit-resident exception
 const STRUCT_HIDE_STREAK := 2                # §7.3 consecutive COVERED probes before hiding the far model
 const STRUCT_SHOW_STREAK := 2                # §7.3 consecutive NOT_COVERED probes before restoring it
+## FP_STRUCT_SHELL_BAND (far-render LOD inconsistency: houses vanish at alt 256 while trees render to ~600) — the
+## far-STRUCTURE analogue of FP_FT_SHELL_BAND. FacetFarStructures binary-suspends the whole tier off-surface
+## (`_mi.visible = not offsurf`, flips at OFFSURFACE_Y=256), so a built house HARD-CUTS at 256 while the co-located
+## far trees fade out over [FT_SHELL_FADE_ALT, FT_SHELL_HIDE_ALT] = 520→600 — the visible dropout. This mirrors the
+## trees' three-zone altitude law onto the merged structure mesh: ZONE S (on-surface) shipped; ZONE B (offsurf,
+## h<FT_SHELL_HIDE_ALT) keeps the per-house merged mesh VISIBLE + LIVE (delta-gated rebuild across crossings) with a
+## tier_fade dither DISSOLVE over [FADE_ALT, HIDE_ALT]; ZONE O (h≥HIDE) hidden (the fine-map roof skin owns it above).
+## CO-TIMED with the trees by REUSING FT_SHELL_HIDE_ALT / FT_SHELL_FADE_ALT. CRITICAL: the on-surface material is the
+## radial `voxi_shade` shader (planet_centre uniform) which renders BLACK in the orbital-shell frame off-surface; zone
+## B therefore swaps _mi to an UNLIT vertex-colour material so the baked per-house BROWN renders (not a black blob).
+## Off ⇒ the shipped binary suspend + off-surface early-return, byte-identical. Needs FP_STRUCT_FAR. Gate: G-ST-SHELL.
+const FP_STRUCT_SHELL_BAND := false          # far structures render in the off-surface shell band [OFFSURFACE_Y, FT_SHELL_HIDE_ALT)
 
 ## FP_DEM_DEFER (docs/COSMOS-STREAM-PARALLEL-DESIGN.md Phase A — the fresh-reload fix) — the whole-planet coarse
 ## DEM (`FP_GLOBAL_RELIEF_DATA` / `GlobalReliefData.step`) is frame-budget GATED but the admitted unit is UNBOUNDED

@@ -4058,6 +4058,20 @@ const MOVE_PROBE_CACHE_CAP := 512  # max cells memoized per epoch (NEVER-OOM: st
 ## is the URL param, never a default: no param ⇒ 0.25 s ⇒ the telemetry stream is wire-identical. Off ⇒ the
 ## parse branch is dead ⇒ byte-identical.
 const FP_TELEM_10HZ := false
+## FP_TELEM_LITE (PERF P5) — observer diet. The remote-bridge telemetry emitter runs on the MAIN thread and its
+## own build+send cost (`telem_ms` self-measurement) is 8–21 ms per emission at the default 4 Hz — up to ~4
+## hitch-scale bumps/second injected exactly while the relay observes (i.e. while the user is driving/testing).
+## ON: (a) the DEFAULT ambient cadence drops 4 Hz → 1 Hz unless an explicit `?telem=Nhz` override is present
+## (`?telem=4hz` restores the legacy rate; `?telem=10hz` still requires FP_TELEM_10HZ; `?telem=1hz` unchanged);
+## (b) the per-emission build is dieted — the `heap_mb` probe (a SYNCHRONOUS JS-bridge round-trip, the largest
+## single per-emit term per `eval_ms`) refreshes every 4th emission and serves the cached value between (heap
+## size is a slow NEVER-OOM trend, not a per-window signal), and the ~15 per-emission `has_method` capability
+## probes in the rich-state merge are memoized once per session; (c) two UNAMBIGUOUS fields are ADDED:
+## `frame_ms` (the real last-frame period in ms — the existing `frame_v` is SN2 nav VELOCITY and was misread
+## as frame time in a prior perf session) and `nav_v_bci` (explicit alias of `frame_v`; `frame_v` itself is
+## untouched — HUD/consumers read it). Every existing field keeps its name and meaning. OFF ⇒ byte-identical
+## stream (and FLAT never runs the bridge at all — telemetry only exists under an observed remote session).
+const FP_TELEM_LITE := false
 ## FP_AGENT_POSE (P1) — additive body-orientation telemetry. view_telemetry() gains the SCENE-frame body
 ## basis (fwd/right/up), camera right/up, velocity VECTOR + on_ground; a new player.orientation_telemetry()
 ## adds the BCI planet-local frame (up/north/east/fwd/pos + heading, keys suffixed _bci). Additive +

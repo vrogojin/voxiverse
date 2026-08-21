@@ -168,6 +168,20 @@ var _win_cap_ms := 0.0
 var _win_unattr := 0
 var _telem_1hz := false
 var _telem_10hz := false                    # COSMOS-AGENT-CONTROL §3.3 (FP_TELEM_10HZ): ?telem=10hz raises the snapshot to 10Hz
+var _telem_4hz := false                     # FP_TELEM_LITE (P5): ?telem=4hz restores the legacy 4Hz cadence under the LITE 1Hz default
+
+# FP_TELEM_LITE (P5 observer diet) — all read/written ONLY under the flag ⇒ byte-off. `_lite_caps` memoizes the
+# per-emission has_method capability probes (player/world are wired once, so the capability set is static per
+# session; every probed method name is unique across the two objects). `_lite_heap_mb` caches the WASM-heap
+# reading between refreshes — the probe is a SYNCHRONOUS JS-bridge round-trip (the largest single per-emit term
+# per eval_ms) and heap size is a slow NEVER-OOM trend, so 1-in-LITE_HEAP_REFRESH emissions is plenty.
+# `_last_frame_ms` is the REAL previous-frame period for the unambiguous `frame_ms` field (`frame_v` is SN2 nav
+# VELOCITY — the name collision that got misread as frame time in a prior perf session).
+const LITE_HEAP_REFRESH := 4
+var _lite_caps: Dictionary = {}
+var _lite_heap_mb := -5.0
+var _lite_emit_n := 0
+var _last_frame_ms := 0.0
 
 # MAIN-THREAD BREAKDOWN (streaming-hitch instrumentation, 2026-07-17) — per-WINDOW MAXIMA of
 # godot_voxel's own VoxelTerrain::_process timing breakdown (usec; see WorldManager.terrain_main_thread_stats).
@@ -259,6 +273,7 @@ static func dial_config() -> Dictionary:
 	var frames := true                       # L2: ambient frame stream on unless explicitly disabled (re-baseline knob)
 	var telem_1hz := false                   # §5.2: ?telem=1hz throttles the 4Hz snapshot to 1Hz (observer A/B discriminator)
 	var telem_10hz := false                  # COSMOS-AGENT-CONTROL §3.3: ?telem=10hz RAISES the snapshot to 10Hz (agent session)
+	var telem_4hz := false                   # FP_TELEM_LITE: ?telem=4hz restores the legacy 4Hz cadence (LITE default is 1Hz)
 	if OS.has_feature("web"):
 		# location.search is inherent to the page; a single boot-time eval decides whether to dial.
 		# No param → empty token → {} → dead. This is the whole activation gate on the public site.
@@ -270,6 +285,7 @@ static func dial_config() -> Dictionary:
 		frames = _parse_frames_flag(qs)
 		telem_1hz = _parse_telem_1hz(qs)
 		telem_10hz = _parse_telem_10hz(qs)
+		telem_4hz = _parse_telem_4hz(qs)
 	else:
 		token = OS.get_environment("VOXIVERSE_REMOTE_TOKEN")
 		var fenv := OS.get_environment("VOXIVERSE_REMOTE_FRAMES").strip_edges()
@@ -277,10 +293,11 @@ static func dial_config() -> Dictionary:
 		var tenv := OS.get_environment("VOXIVERSE_REMOTE_TELEM").strip_edges().to_lower()
 		telem_1hz = tenv == "1hz"
 		telem_10hz = tenv == "10hz"
+		telem_4hz = tenv == "4hz"
 	token = token.strip_edges()
 	if token == "":
 		return {}
-	return {"token": token, "url": resolve_url(), "frames": frames, "telem_1hz": telem_1hz, "telem_10hz": telem_10hz}
+	return {"token": token, "url": resolve_url(), "frames": frames, "telem_1hz": telem_1hz, "telem_10hz": telem_10hz, "telem_4hz": telem_4hz}
 
 ## FP_TELEM_FRAME_DECOMP §5.2: the `?telem=1hz` measurement-hygiene knob — throttle the 4Hz snapshot to 1Hz so its own
 ## clocked cost stops aliasing the frame timing (the A/B discriminator for "is the observer the ~5Hz stall?"). Like
@@ -293,6 +310,13 @@ static func _parse_telem_1hz(query: String) -> bool:
 ## (period 0.25→0.1s) so an agent gets fresher ambient pose. Same OBSERVED-session-only scope as ?telem=1hz.
 static func _parse_telem_10hz(query: String) -> bool:
 	return _parse_query_value(query, "telem").to_lower() == "10hz"
+
+
+## FP_TELEM_LITE (P5): the `?telem=4hz` knob — restore the LEGACY 4Hz ambient cadence when the LITE default (1Hz)
+## is compiled in. Parsed unconditionally (same param family as 1hz/10hz); without FP_TELEM_LITE the value is inert
+## (the default already IS 4Hz), so parsing it changes nothing on a shipped build.
+static func _parse_telem_4hz(query: String) -> bool:
+	return _parse_query_value(query, "telem").to_lower() == "4hz"
 
 
 ## The relay URL is FIXED to our host — resolved from VOXIVERSE_REMOTE_URL (native/dev only) else the
@@ -376,6 +400,14 @@ func configure(cfg: Dictionary) -> void:
 	_telem_10hz = bool(cfg.get("telem_10hz", false))
 	if CubeSphere.FP_TELEM_10HZ and _telem_10hz:
 		_telem_interval = 0.1
+	# FP_TELEM_LITE (P5 observer diet): the DEFAULT ambient cadence drops 4Hz→1Hz — the emitter's own main-thread
+	# cost (telem_ms 8–21 ms/emission) was injecting up to ~4 hitch-scale bumps/second exactly while the relay
+	# observes. ANY explicit ?telem=Nhz keeps its meaning: 1hz/10hz were applied above, ?telem=4hz restores the
+	# legacy rate, and an explicit-but-flag-dead 10hz request is left at the legacy 0.25s rather than silently
+	# quartered. Byte-off ⇒ this block is dead and the default stays 0.25s.
+	_telem_4hz = bool(cfg.get("telem_4hz", false))
+	if CubeSphere.FP_TELEM_LITE and not _telem_1hz and not _telem_10hz and not _telem_4hz:
+		_telem_interval = 1.0
 
 
 ## L2 runtime kill switch for the AMBIENT auto-capture (the commanded screenshot path is never affected). Lets the
@@ -428,6 +460,10 @@ func _process(delta: float) -> void:
 	_last_frame_usec = now_usec
 	_win_acc += real_delta
 	_win_frames += 1
+	# FP_TELEM_LITE (P5): latch the REAL previous-frame period for the unambiguous `frame_ms` field (flag-gated
+	# store so the off path is untouched; the emitted stream is byte-identical either way).
+	if CubeSphere.FP_TELEM_LITE:
+		_last_frame_ms = real_delta * 1000.0
 	if real_delta > _win_worst:
 		_win_worst = real_delta
 	if real_delta * 1000.0 > HITCH_MS:
@@ -675,7 +711,7 @@ func _send_telemetry() -> void:
 	var pool_active := -1
 	var pool_tasks := ""
 	var vox_std_current := -1
-	if _voxel_engine != null and _voxel_engine.has_method("get_stats"):
+	if _voxel_engine != null and _has_m(_voxel_engine, "get_stats"):
 		var st: Dictionary = _voxel_engine.call("get_stats")
 		var tasks: Dictionary = st.get("tasks", {})
 		var gpool: Dictionary = (st.get("thread_pools", {}) as Dictionary).get("general", {})
@@ -694,6 +730,19 @@ func _send_telemetry() -> void:
 		vox_main = int(tasks.get("main_thread", 0))
 		vox_gpu = int(tasks.get("gpu", 0))
 
+	# FP_TELEM_LITE (P5): the heap probe is a SYNCHRONOUS JS-bridge round-trip (§5.1's eval_ms measured it as the
+	# largest single per-emit term) — under LITE it refreshes every LITE_HEAP_REFRESH-th emission and serves the
+	# cached value between (heap size is a slow NEVER-OOM trend, not a per-window signal; the field itself stays).
+	# Flag-off: probed every emission, unchanged.
+	var heap_mb: float
+	if CubeSphere.FP_TELEM_LITE:
+		if _lite_emit_n % LITE_HEAP_REFRESH == 0:
+			_lite_heap_mb = _wasm_heap_mb()
+		_lite_emit_n += 1
+		heap_mb = _lite_heap_mb
+	else:
+		heap_mb = _wasm_heap_mb()
+
 	var msg := {
 		"type": "telemetry",
 		"t": Time.get_unix_time_from_system(),
@@ -710,7 +759,7 @@ func _send_telemetry() -> void:
 		# NEVER-OOM: the WASM linear-memory size (what actually OOMs a tab) + Godot's own tracked static
 		# allocation. vmem_mb above is VIDEO memory and is NOT the NEVER-OOM signal. heap_mb is the number
 		# that can VETO the mimalloc win (per-thread segments raise the baseline) — see _wasm_heap_mb.
-		"heap_mb": snappedf(_wasm_heap_mb(), 0.1),
+		"heap_mb": snappedf(heap_mb, 0.1),
 		"mem_static_mb": snappedf(Performance.get_monitor(Performance.MEMORY_STATIC) / 1048576.0, 0.1),
 		"objects": int(Performance.get_monitor(Performance.OBJECT_NODE_COUNT)),
 		"vox_gen": vox_gen,
@@ -741,7 +790,7 @@ func _send_telemetry() -> void:
 	#    block count is not (compare it against vox_gen/dropped, don't treat it as a census).
 	# `dropped_block_loads` — T1's other half, the R4 go/no-go stale share — already ships as vt_dropped_loads.
 	var gcs: Dictionary = {}
-	if is_instance_valid(world) and world.has_method("gen_class_stats"):
+	if is_instance_valid(world) and _has_m(world, "gen_class_stats"):
 		var g = world.call("gen_class_stats")
 		if g is Dictionary:
 			gcs = g as Dictionary
@@ -756,6 +805,14 @@ func _send_telemetry() -> void:
 			_gen_prev_ct[i] = c
 			_gen_prev_us[i] = u
 	_merge_rich_state(msg)
+	# FP_TELEM_LITE (P5): the UNAMBIGUOUS frame-time field. `frame_v` (merged above from nav_telemetry) is SN2
+	# nav VELOCITY and was misread as frame time in a prior perf session — `frame_ms` is the real last-frame
+	# period, `nav_v_bci` re-stamps frame_v under an explicit name. ADDITIVE: `frame_v` itself is untouched
+	# (HUD/consumers read it); flag-off stamps neither key (byte-identical stream).
+	if CubeSphere.FP_TELEM_LITE:
+		msg["frame_ms"] = snappedf(_last_frame_ms, 0.01)
+		if msg.has("frame_v"):
+			msg["nav_v_bci"] = msg["frame_v"]
 	# FP_TELEM_FRAME_DECOMP §5.1: the observer self-decomposition fields (byte-off ⇒ absent, keys unchanged). `telem_ms`
 	# is the PREVIOUS window's snapshot cost; `fh` the frame-period histogram; `eval_ms`/`cap_ms` the JS-eval + readback
 	# window-maxima; `unattr` the ≥25ms stall-frame count. `telem_hz` echoes the ?telem knob so the analysis knows the rate.
@@ -765,13 +822,15 @@ func _send_telemetry() -> void:
 		msg["eval_ms"] = snappedf(_dc_eval, 0.01)
 		msg["cap_ms"] = snappedf(_dc_cap, 0.01)
 		msg["unattr"] = _dc_unattr
-		msg["telem_hz"] = (1 if _telem_1hz else 4)
+		# FP_TELEM_LITE: the echo must report the REAL rate (the LITE default is 1Hz and ?telem=4hz/10hz exist) —
+		# computed from the live interval. Flag-off keeps the shipped 1-or-4 expression (byte-identical).
+		msg["telem_hz"] = (int(round(1.0 / _telem_interval)) if CubeSphere.FP_TELEM_LITE else (1 if _telem_1hz else 4))
 
 	# T2f (docs/COSMOS-PERF-POSTPORT-DESIGN.md §3): per-consumer attribution + the capture-window marker. snow_ms/ctrl_ms
 	# are this window's WORST single-frame snowfall-step / controller-tick cost (WorldManager accumulates the max, resets on
 	# read); cap=1 marks a window whose frames include the ambient capture readback (~35 ms) so the §6 metrics can exclude
 	# capture-polluted windows honestly. Telemetry-only — no frame behaviour changes.
-	if is_instance_valid(world) and world.has_method("take_perf_attrib"):
+	if is_instance_valid(world) and _has_m(world, "take_perf_attrib"):
 		var pa = world.call("take_perf_attrib")
 		if pa is Dictionary:
 			msg.merge(pa as Dictionary)
@@ -887,6 +946,19 @@ func _update_post_cross(now_usec: int, real_delta: float) -> void:
 	_post_cross = still
 
 
+## FP_TELEM_LITE (P5): memoized has_method — the telemetry emission runs ~15 StringName method probes per
+## snapshot, and the capability set is static per session (player/world/_voxel_engine are wired once, before the
+## bridge streams; every probed name is unique across the objects, so the name alone is a safe key). The callers'
+## is_instance_valid guards still run first, so a null object never reaches this and never poisons the cache.
+## Flag-off delegates straight to has_method — identical result, byte-identical stream.
+func _has_m(obj: Object, m: String) -> bool:
+	if not CubeSphere.FP_TELEM_LITE:
+		return obj.has_method(m)
+	if not _lite_caps.has(m):
+		_lite_caps[m] = obj.has_method(m)
+	return bool(_lite_caps[m])
+
+
 ## Rich engine/world state — every field guarded for absence so a render-path/flag combination that
 ## lacks a method simply omits it (never crashes the bridge).
 func _merge_rich_state(msg: Dictionary) -> void:
@@ -896,7 +968,7 @@ func _merge_rich_state(msg: Dictionary) -> void:
 		# COSMOS REMOTE VIEW-STATE (dev-instrument): the surface camera facing (cam_yaw_deg/cam_pitch_deg + the
 		# world-space look_world forward), so a view can be REMEMBERED and restored exactly (teleport yaw_deg/pitch_deg).
 		# ADDITIVE + empty-dict-guarded — view_telemetry() returns {} without a camera rig, so the stream is byte-identical.
-		if player.has_method("view_telemetry"):
+		if _has_m(player, "view_telemetry"):
 			var vw = player.call("view_telemetry")
 			if vw is Dictionary and not (vw as Dictionary).is_empty():
 				msg.merge(vw as Dictionary)
@@ -906,50 +978,50 @@ func _merge_rich_state(msg: Dictionary) -> void:
 		# COSMOS-AGENT-CONTROL section 4.2 (FP_AGENT_POSE): BCI planet-local orientation (up/north/east/fwd/heading,
 		# keys suffixed _bci). ADDITIVE + empty-dict-guarded — {} when flag-off / non-faceted / no active facet
 		# so the telemetry stream is byte-identical.
-		if player.has_method("orientation_telemetry"):
+		if _has_m(player, "orientation_telemetry"):
 			var ot = player.call("orientation_telemetry")
 			if ot is Dictionary and not (ot as Dictionary).is_empty():
 				msg.merge(ot as Dictionary)
-		if player.has_method("nav_telemetry"):
+		if _has_m(player, "nav_telemetry"):
 			var nt = player.call("nav_telemetry")
 			if nt is Dictionary and not (nt as Dictionary).is_empty():
 				msg.merge(nt as Dictionary)
 			# COSMOS SPACE-FLY (docs/COSMOS-SPACEFLY-DESIGN.md): the self-verification telemetry (alt/v_circ/orbit_r/
 			# body/dev_nav/coasting/flying/on_ground/att) a scripted test flight asserts each mechanic on. ADDITIVE +
 			# empty-dict-guarded — space_telemetry() returns {} when the nav machine is off (byte-identical stream).
-			if player.has_method("space_telemetry"):
+			if _has_m(player, "space_telemetry"):
 				var stel = player.call("space_telemetry")
 				if stel is Dictionary and not (stel as Dictionary).is_empty():
 					msg.merge(stel as Dictionary)
 		# COSMOS-PERF FALL-TIMING (FP_FALL_TIMING): the per-segment CPU µs (window MAX) for the free-fall hotspot hunt.
 		# ADDITIVE + empty-dict-guarded exactly like space_telemetry — fall_timing() returns {} with the flag off (the
 		# accumulator was never written), so a shipped build stamps NO t_*_us keys (byte-identical telemetry).
-		if player.has_method("fall_timing"):
+		if _has_m(player, "fall_timing"):
 			var ft = player.call("fall_timing")
 			if ft is Dictionary and not (ft as Dictionary).is_empty():
 				msg.merge(ft as Dictionary)
 		# COSMOS-ORBITAL-SHELL H-B: the live camera far plane, so "shell emitted but far side clipped" (far-plane) is
 		# directly readable next to sh_d/sh_h (compare far to the limb tangent √(d²−R²)). Guarded; 0 when absent.
-		if player.has_method("camera_far"):
+		if _has_m(player, "camera_far"):
 			msg["cam_far"] = snappedf(float(player.call("camera_far")), 0.1)
 	# Active facet is a global (faceted mode); -1 when non-faceted. Static call is always safe.
 	msg["facet"] = TerrainConfig.active_facet()
 	if is_instance_valid(world):
-		if world.has_method("facet_pool_neighbour_count"):
+		if _has_m(world, "facet_pool_neighbour_count"):
 			msg["facet_neighbours"] = int(world.call("facet_pool_neighbour_count"))
-		if world.has_method("stream_load_credit"):
+		if _has_m(world, "stream_load_credit"):
 			msg["stream_credit"] = snappedf(float(world.call("stream_load_credit")), 0.001)
 		# COSMOS-MOTION-PHYS §6.5 (FP_MOVE_PROBE_CACHE): the generated-value cache hit-rate readback (n_probe_hit /
 		# n_probe_cva is the ≥0.5 accept ratio; gen_cache_sz confirms the never-OOM bound). Empty-dict-guarded — a
 		# shipped (flag-off) build stamps NO gen-cache keys → byte-identical telemetry.
-		if world.has_method("gen_cache_stats"):
+		if _has_m(world, "gen_cache_stats"):
 			var gc = world.call("gen_cache_stats")
 			if gc is Dictionary and not (gc as Dictionary).is_empty():
 				msg.merge(gc as Dictionary)
 		# CROSSING-FASTGEN obs-2 fix (4): the controller setpoint/floor/overload trace, so "adaptive off" vs "on but
 		# genuinely over setpoint" is directly readable alongside the credit. Guarded + empty-dict-guarded so a
 		# flag/render-path combination without a live controller simply omits these (never crashes the bridge).
-		if world.has_method("stream_load_stats"):
+		if _has_m(world, "stream_load_stats"):
 			var cs = world.call("stream_load_stats")
 			if cs is Dictionary and not (cs as Dictionary).is_empty():
 				msg["setpoint_ms"] = snappedf(float((cs as Dictionary).get("setpoint_ms", 0.0)), 0.1)
@@ -958,22 +1030,22 @@ func _merge_rich_state(msg: Dictionary) -> void:
 				msg["backlog_gated"] = bool((cs as Dictionary).get("backlog_gated", false))
 		# COSMOS FP-FIXED-FRAME Phase-0 guard (§3): the max |player render-abs| seen — the f32-precision headroom
 		# signal that tells us whether a re-anchor is ever needed at the current R (0 unless the fixed frame is on).
-		if world.has_method("player_abs_max"):
+		if _has_m(world, "player_abs_max"):
 			msg["player_abs_max"] = snappedf(float(world.call("player_abs_max")), 0.1)
-		if world.has_method("lod_stats"):
+		if _has_m(world, "lod_stats"):
 			var ls = world.call("lod_stats")
 			if ls is Dictionary and not (ls as Dictionary).is_empty():
 				msg["lod"] = ls
 			# COSMOS-ORBITAL-SHELL live-path telemetry — the far-ring driver→warm→emit→draw state, so ONE orbit fly
 			# disambiguates the far-side-blank stage (warm/emit stall vs draw/far-plane vs wrong axis). ADDITIVE +
 			# empty-dict-guarded: with the camera-set law off/never-engaged shell_telemetry() is {} → nothing stamped.
-		if world.has_method("shell_telemetry"):
+		if _has_m(world, "shell_telemetry"):
 			var sh = world.call("shell_telemetry")
 			if sh is Dictionary and not (sh as Dictionary).is_empty():
 				msg.merge(sh as Dictionary)
 			# COSMOS LOD-TEXTURE Phase 2: the far-texture bake ledger (coverage, close-up residency, per-frame bake ms,
 			# bytes). ADDITIVE + empty-dict-guarded: {} with FP_FACET_TEX off ⇒ nothing stamped (byte-identical stream).
-		if world.has_method("tex_telemetry"):
+		if _has_m(world, "tex_telemetry"):
 			var tx = world.call("tex_telemetry")
 			if tx is Dictionary and not (tx as Dictionary).is_empty():
 				msg.merge(tx as Dictionary)
@@ -981,7 +1053,7 @@ func _merge_rich_state(msg: Dictionary) -> void:
 			# (g2_baked/g2_total/g2_bytes), so a live session shows the coarse-DEM sweep converging (and, with
 			# FP_RELIEF_REEMIT on, explains any late mountain-shade pop-in). ADDITIVE + empty-dict-guarded: {} with
 			# FP_GLOBAL_RELIEF_DATA off / _relief_data null ⇒ nothing stamped (byte-identical stream).
-			if world.has_method("relief_data_telemetry"):
+			if _has_m(world, "relief_data_telemetry"):
 				var rt = world.call("relief_data_telemetry")
 				if rt is Dictionary and not (rt as Dictionary).is_empty():
 					msg.merge(rt as Dictionary)

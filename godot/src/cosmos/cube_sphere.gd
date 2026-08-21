@@ -315,6 +315,41 @@ const FP_FARRING_FAST_REBUILD := false
 ## rebuild. Default OFF → the synchronous path, byte-identical (FLAT stays 6035/0).
 const FP_FARRING_ASYNC_REBUILD := false
 
+## COSMOS FARRING-SWAP-DIET P3 (FP_FARRING_BULK_EMIT) — alloc-diet the async worker's mesh emit. The shipped worker
+## builds the whole visible cap (~790 facets / ~176k verts) through ~700k per-vertex SurfaceTool calls
+## (set_uv/set_color/add_vertex — each a GDScript→C++ round trip with per-call marshalling), an allocation-dense storm
+## that feeds the WASM dlmalloc single-lock convoy and starves the MAIN thread for the whole off-thread build. When
+## true, `_emit_cached` on the worker routes through `_emit_blocky_bulk`/`_emit_smooth_bulk`: the per-facet vertex
+## count is computed up front, the packed pos/col/uv arrays are resize()d ONCE and index-assigned (no per-vertex
+## append/alloc/VM call), and the merged cap runs the IDENTICAL C++ global normal smoothing via
+## SurfaceTool.create_from_arrays → generate_normals → commit_to_arrays (create_from_arrays is pure CPU ingest — NO
+## mesh RID, NO RenderingServer — worker-safe exactly like commit_to_arrays). The committed surface arrays are
+## BYTE-IDENTICAL to the SurfaceTool path — same vertices/colors/uvs in the same order and the same globally-smoothed
+## normals (verify_farring_emit / G-FR-BULK proves equality; the create_from_arrays round trip is bit-exact). Pure
+## emit-MECHANISM change: emit set, heights, sink, colours untouched. Default OFF → the shipped per-vertex SurfaceTool
+## worker emit verbatim (byte-identical, FLAT 6042/0).
+const FP_FARRING_BULK_EMIT := false
+
+## COSMOS FARRING-SWAP-DIET P2 (FP_FARRING_SECTORS) — sector the cap, swap only dirty sectors. The shipped async path
+## swaps the WHOLE ~176k-vert cap ArrayMesh on the main thread (a measured 20–43 ms add_surface_from_arrays + RID
+## create) even when only a handful of facets changed (axis drift every ~6 s at orbit, floor crossings, warm-phase env
+## upgrades). When true, the cap is partitioned into 24 STATIC face-quadrant sectors (6 faces × 2×2 — a pure function
+## of fid, so membership never churns with the emit axis; ~12 populated per cap ⇒ ~+12 draws, trivial at draws≈36),
+## each its OWN MeshInstance3D child sharing the ONE shell material. Each async dispatch freezes a per-facet emit
+## SIGNATURE (role/cache/slot/limb/v2 state, plus the frozen unsink-column/applied/cull fingerprint for SUNK-emitting
+## facets) on the main thread; a sector is rebuilt+swapped ONLY if its membership or any member's signature differs
+## from what its resident mesh was built from — clean sectors stay resident, bounding the swap to the changed slice
+## (~3–5 ms). A facet emits into exactly ONE sector (partition — no double-emit, no gap; the union of sector meshes is
+## vertex-for-vertex the single cap mesh, G-FR-SECT proves it) and shared facet edges come from the same welded caches,
+## so sector borders weld exactly like facet welds. Worker env-warm still walks the FULL frozen set (converge law
+## unchanged); the sectored emit rides the P3 bulk collectors per sector. Total verts unchanged (NEVER-OOM: the same
+## cap, partitioned). Sync rebuilds (force_rebuild/boot) keep the shipped single mesh and invalidate all sectors.
+## Normals are smoothed per sector (the cross-SECTOR-border vertex-hash merge of the single-mesh generate_normals is
+## the one intentional difference — visually dead: the shell shader shades radially, never from NORMAL, for COLOR.a
+## ≥ 0.5 far-ring vertices). Default OFF → the shipped single-MeshInstance whole-swap path verbatim (byte-identical,
+## FLAT 6042/0).
+const FP_FARRING_SECTORS := false
+
 ## COSMOS far-ring full coverage (docs/COSMOS-FARRING-COVERAGE-DESIGN.md) — the see-through-gap fix. The shipped far
 ## ring EXCLUDES the active facet + the live-pool neighbours (`_excluded`), so beyond the ~128-block near-blocky disk on
 ## those facets there is no far quad at all and the camera sees straight through to the opposite inner side of the globe

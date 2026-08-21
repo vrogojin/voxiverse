@@ -284,6 +284,24 @@ var _async_warm_only := false
 # REVISION 5 Stage B (FP_WARM_EMIT_SPLIT): a warm-only cycle ran since the last real emit — owe ONE more real emit
 # once the envelope fully converges (remaining hits 0), so the upgraded heights actually reach the GPU.
 var _srf_env_dirty := false
+# COSMOS FARRING-SWAP-DIET P2 (FP_FARRING_SECTORS, flag doc in cube_sphere.gd): the cap partitioned into
+# 6·SECTOR_SPLIT² STATIC face-quadrant sectors, each its own MeshInstance3D child. ALL state below is empty / never
+# touched with the flag off (byte-identical). Per-sector records are what its RESIDENT mesh was built from: the
+# member fid→signature map, the drawn/backstop shards of _emitted/_emitted_backstop, and the build epoch; the global
+# `_sector_unsink_sig` is the frozen unsink-column/applied/cull fingerprint the SUNK emits last built against.
+const SECTOR_SPLIT := 2                    # 2×2 quadrants per cube face → 24 static sectors (~12 populated per cap)
+var _sector_mi: Array = []                 # sector -> MeshInstance3D (created lazily at first sectored swap) or null
+var _sector_sig: Array = []                # sector -> Dictionary fid -> int signature (recorded at its last swap)
+var _sector_drawn: Array = []              # sector -> Dictionary fid -> true (its shard of _emitted)
+var _sector_bstop: Array = []              # sector -> Dictionary fid -> true (its shard of _emitted_backstop)
+var _sector_built_epoch := PackedInt32Array()   # sector -> _sector_epoch at its last swap (0 = never built)
+var _sector_epoch := 1                     # bumped by any whole-mesh (sync) rebuild → invalidates every sector
+var _sector_unsink_sig: Array = []         # [col, have, applied_r, band, cull_rev] the sunk emits last built against
+var _async_sectored := false               # frozen at dispatch: THIS in-flight build swaps per-sector
+var _async_sector_dirty: Dictionary = {}   # frozen at dispatch: sector -> true (must rebuild this cycle)
+var _async_fid_sector: Dictionary = {}     # frozen at dispatch: fid -> sector, for every fid in _async_fids
+var _async_sector_parts: Dictionary = {}   # worker-owned: sector -> P3 bulk parts collector
+var _async_sector_arrays: Dictionary = {}  # worker output: sector -> committed surface arrays (read by the swap)
 # COSMOS-PERF L1 (§3.1): pre-TRIANGULATED per-facet caches for FP_FARRING_FAST_REBUILD. Built lazily from the grid
 # caches above (only when the fast path or the equivalence gate runs → zero cost/memory with the flag off). Each holds
 # the facet's 32 tris EXPANDED to 96 vertices in the EXACT order/winding _emit_cached emits — so the fast rebuild is a
@@ -2091,6 +2109,200 @@ func _worker_cache_ready(fid: int) -> bool:
 func _async_enabled() -> bool:
 	return CubeSphere.FP_FARRING_ASYNC_REBUILD and OS.get_processor_count() > 1
 
+# ---- COSMOS FARRING-SWAP-DIET P2 (FP_FARRING_SECTORS) — static sector partition + dirty accounting. ----
+# All main-thread-only except where noted; nothing here runs with the flag off.
+
+func _sector_count() -> int:
+	return 6 * SECTOR_SPLIT * SECTOR_SPLIT
+
+## STATIC face-quadrant sector of `fid` — a pure function of the facet index (same decode as _tex_decode), so
+## membership NEVER churns with the emit axis / player motion; only cap-rim visibility changes move facets in/out.
+## `visible_fids` emits Earth-cap fids (base 0, K lattice) — the same space this decodes.
+func _sector_of(fid: int) -> int:
+	var k := FacetAtlas.K
+	var face := int(fid / (k * k))
+	var rem := fid - face * k * k
+	var a := int(rem / k)
+	var b := rem - a * k
+	var half := int(k / SECTOR_SPLIT)
+	var qa := mini(int(a / half), SECTOR_SPLIT - 1)
+	var qb := mini(int(b / half), SECTOR_SPLIT - 1)
+	return (face * SECTOR_SPLIT + qa) * SECTOR_SPLIT + qb
+
+## Size the per-sector record arrays once (idempotent).
+func _sectors_ensure_arrays() -> void:
+	var ns := _sector_count()
+	if _sector_sig.size() == ns:
+		return
+	_sector_mi.resize(ns)
+	_sector_sig.resize(ns)
+	_sector_drawn.resize(ns)
+	_sector_bstop.resize(ns)
+	_sector_built_epoch.resize(ns)   # zero-filled → never built
+	for s in range(ns):
+		_sector_sig[s] = {}
+		_sector_drawn[s] = {}
+		_sector_bstop[s] = {}
+
+## Create sector `s`'s MeshInstance3D child on demand — SHARES the one shell material instance (`_mi.material_override`)
+## so every uniform push (sun_dir, slots, textures) reaches all sectors exactly as it reaches the single mesh.
+func _sectors_ensure_mi(s: int) -> void:
+	if _sector_mi[s] != null:
+		return
+	var m := MeshInstance3D.new()
+	m.name = "FacetFarRingSector%d" % s
+	if _mi != null:
+		m.material_override = _mi.material_override
+	add_child(m)
+	_sector_mi[s] = m
+
+## The per-facet EMIT SIGNATURE — every discrete input that decides WHICH variant of geometry the worker emits for
+## `fid` (role, cache presence/upgrade state, frozen limb/v2/mid membership, noblack pick, uv2 slot). Computed on the
+## MAIN thread against the SAME frozen snapshots the worker reads (`_async_backstop`/`_async_mid`/`_async_v2_resident`/
+## the limb set frozen by _refresh_limb_set / the slot snapshots frozen by _refresh_slot_snapshot). The CONTINUOUS
+## sunk-geometry inputs (unsink column, applied radius/band, committed cull mask) are fingerprinted separately in
+## `_sectors_sunk_state` and only dirty facets whose signature says they emit SUNK-dense.
+func _sector_fid_sig(fid: int) -> int:
+	var s := 0
+	if CubeSphere.FP_FARRING_FULL_COVER and _async_backstop.has(fid):
+		s |= 1
+	if _bpos_cache.has(fid):
+		s |= 2
+	if _benv_done.has(fid):
+		s |= 4
+	if _pos_cache.has(fid):
+		s |= 8
+	if _env_done.has(fid):
+		s |= 16
+	if _async_v2_resident.has(fid):
+		s |= 32
+	if _is_limb_dense(fid):
+		s |= 64
+	if fid == _noblack_unsink_fid:
+		s |= 128
+	if _async_mid.has(fid):
+		s |= 256
+	if _tex_on():
+		s |= (int(_uv2_y(fid)) + 2) << 16   # slot ids are integral (-1 chart / 0..63 close-up / 64+ band / fid); +2 keeps it non-negative
+	return s
+
+## Does signature `sig` describe a facet that emits SUNK-dense (geometry depending on the continuous unsink inputs)?
+func _sector_sig_sunkish(sig: int) -> bool:
+	return (sig & 1) != 0 and (sig & 2) != 0
+
+## The frozen continuous inputs of every sunk-dense emit this build: unsink column, applied cover radius/band, and the
+## committed cull mask revision (`_cull_reemit_count` bumps on every FLUSH/APPLY). Compared verbatim between builds.
+func _sectors_sunk_state() -> Array:
+	return [_async_unsink_col, _async_unsink_have_col, _async_applied_r, _async_applied_band, _cull_reemit_count]
+
+## MAIN THREAD, at dispatch (after every freeze step): partition the frozen fid set and mark DIRTY every sector whose
+## membership or any member signature differs from what its resident mesh was built from (plus the sunk-state rule and
+## the whole-mesh invalidation epoch). Clean sectors keep their resident meshes — the worker will not re-emit them.
+func _sectors_compute_dirty() -> void:
+	_sectors_ensure_arrays()
+	_async_fid_sector.clear()
+	_async_sector_dirty.clear()
+	var ns := _sector_count()
+	var cur: Array = []
+	cur.resize(ns)
+	var sunk_changed: bool = _sector_unsink_sig != _sectors_sunk_state()
+	for fid in _async_fids:
+		var s := _sector_of(fid)
+		_async_fid_sector[fid] = s
+		if cur[s] == null:
+			cur[s] = {}
+		(cur[s] as Dictionary)[fid] = _sector_fid_sig(fid)
+	for s in range(ns):
+		var c: Dictionary = cur[s] if cur[s] != null else {}
+		var rec: Dictionary = _sector_sig[s]
+		if _sector_built_epoch[s] != _sector_epoch:
+			# never built, or invalidated by a whole-mesh (sync) rebuild — rebuild if it has (or had) any content
+			if not c.is_empty() or not rec.is_empty():
+				_async_sector_dirty[s] = true
+			continue
+		if rec.size() != c.size():
+			_async_sector_dirty[s] = true
+			continue
+		for fid in c:
+			var sg: int = c[fid]
+			if not rec.has(fid) or int(rec[fid]) != sg:
+				_async_sector_dirty[s] = true
+				break
+			if sunk_changed and _sector_sig_sunkish(sg):
+				_async_sector_dirty[s] = true
+				break
+
+## MAIN THREAD, at swap (worker done — cache state now equals what the worker emitted from): record what each DIRTY
+## sector's fresh mesh was built from. Factored out of `_swap_in_sectors` so the headless gate drives the identical
+## record→compare law without a real swap.
+func _sectors_record_frozen() -> void:
+	for s in _async_sector_dirty:
+		_sector_sig[s] = {}
+		_sector_drawn[s] = {}
+		_sector_bstop[s] = {}
+		_sector_built_epoch[s] = _sector_epoch
+	for fid in _async_fids:
+		var s: int = _async_fid_sector.get(fid, -1)
+		if not _async_sector_dirty.has(s):
+			continue
+		(_sector_sig[s] as Dictionary)[fid] = _sector_fid_sig(fid)
+		# drawn/backstop shard guards — VERBATIM `_swap_in_arrays`' committed-set law, per sector.
+		if _async_env_warm and not CubeSphere.FP_ENV_FALLBACK_EMIT and not _worker_cache_ready(fid):
+			if _async_mid.has(fid) and _pos_cache.has(fid):
+				(_sector_drawn[s] as Dictionary)[fid] = true
+			continue
+		(_sector_drawn[s] as Dictionary)[fid] = true
+		if _async_backstop.has(fid) and _bpos_cache.has(fid):
+			(_sector_bstop[s] as Dictionary)[fid] = true
+	_sector_unsink_sig = _sectors_sunk_state()
+
+## A whole-mesh (sync) rebuild is taking ownership of the cap: clear every sector mesh + record and bump the epoch so
+## the next sectored dispatch rebuilds everything from scratch. No-op with the flag off (all arrays empty).
+func _sectors_reset() -> void:
+	if not CubeSphere.FP_FARRING_SECTORS:
+		return
+	_sector_epoch += 1
+	for s in range(_sector_mi.size()):
+		if _sector_mi[s] != null:
+			(_sector_mi[s] as MeshInstance3D).mesh = ArrayMesh.new()
+		_sector_sig[s] = {}
+		_sector_drawn[s] = {}
+		_sector_bstop[s] = {}
+	_sector_unsink_sig = []
+
+## MAIN THREAD: the P2 counterpart of `_swap_in_arrays` — swap ONLY the dirty sectors' freshly built surfaces onto
+## their own MeshInstance3D children (clean sectors stay resident), then rebuild the cap-wide `_emitted`/
+## `_emitted_backstop` as the union of every sector's drawn shard. The whole-cap `_mi` mesh (a prior sync build) is
+## emptied on the first sectored swap so the cap is never double-drawn. Same gate bookkeeping as `_swap_in_arrays`
+## (`_shell_gen`, snap gen, `_reemit_count`, timing event).
+func _swap_in_sectors() -> void:
+	var t_swap := Time.get_ticks_usec()
+	_sectors_ensure_arrays()
+	if _mi != null and _mi.mesh != null and (_mi.mesh as ArrayMesh).get_surface_count() > 0:
+		_mi.mesh = ArrayMesh.new()
+	var verts := 0
+	for s in _async_sector_dirty:
+		_sectors_ensure_mi(s)
+		var arrays: Array = _async_sector_arrays.get(s, [])
+		var mesh := ArrayMesh.new()
+		if arrays.size() == Mesh.ARRAY_MAX and (arrays[Mesh.ARRAY_VERTEX] as PackedVector3Array).size() > 0:
+			mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arrays)
+			verts += (arrays[Mesh.ARRAY_VERTEX] as PackedVector3Array).size()
+		(_sector_mi[s] as MeshInstance3D).mesh = mesh
+	_sectors_record_frozen()
+	_emitted.clear()
+	_emitted_backstop.clear()
+	for s in range(_sector_count()):
+		for fid in (_sector_drawn[s] as Dictionary):
+			_emitted[fid] = true
+		for fid in (_sector_bstop[s] as Dictionary):
+			_emitted_backstop[fid] = true
+	_shell_gen += 1   # REVISION 2 LAW R-B: a real shell mesh commit landed (partial or not) — advances the handshake
+	if CubeSphere.FP_SHELL_SNAP_GEN:
+		_last_committed_snap_gen = _async_snap_gen
+	_reemit_count += 1
+	_push_event("async-sect", _async_build_us, Time.get_ticks_usec() - t_swap, verts)
+
 ## Complete a warmed pending rebuild: dispatch it to a worker (async path) or build it inline (synchronous fallback).
 func _begin_rebuild() -> void:
 	_begin_rebuild_count += 1        # S1b telemetry: prove the emit actually runs post-engage (0 ⇒ warm-gate stall)
@@ -2160,6 +2372,14 @@ func _dispatch_async_rebuild() -> void:
 		for fid in _async_fids:
 			if _smooth_v2.is_resident(int(fid)):
 				_async_v2_resident[int(fid)] = true
+	# COSMOS FARRING-SWAP-DIET P2 (FP_FARRING_SECTORS): freeze the sector partition + per-facet signatures + the dirty
+	# sector set for THIS build (main thread, after every freeze above — the signatures read the same frozen snapshots
+	# the worker will). Off ⇒ `_async_sectored` false, dicts empty, the shipped whole-mesh path verbatim.
+	_async_sectored = CubeSphere.FP_FARRING_SECTORS
+	_async_sector_parts = {}
+	_async_sector_arrays = {}
+	if _async_sectored:
+		_sectors_compute_dirty()
 	_async_arrays = []
 	_pending = false                 # consumed — a fresh crossing sets it again and is served after this build lands
 	_async_building = true
@@ -2189,6 +2409,7 @@ func _dispatch_warm_only(demand_on: bool, fallback_on: bool, floored_on: bool, e
 		_async_env_warm = true
 		_async_chord_only = false
 		_async_warm_only = true
+		_async_sectored = false   # P2: a warm-only cycle never touches any mesh — no sector routing/swap
 		_async_arrays = []
 		_async_building = true
 		_async_task_id = WorkerThreadPool.add_task(Callable(self, "_async_build_worker"), false, "far-ring env warm-only")
@@ -2279,6 +2500,10 @@ func _async_build_worker() -> void:
 		return
 	var st := SurfaceTool.new()
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	# FP_FARRING_BULK_EMIT (P3): a non-null parts collector switches every `_emit_cached` below to the preallocated
+	# packed-array fill (the SurfaceTool above stays begun-but-empty and unused); `_bulk_assemble` then reproduces the
+	# identical committed arrays. Off ⇒ null ⇒ every call runs the shipped per-vertex SurfaceTool emit verbatim.
+	var bulk = [] if CubeSphere.FP_FARRING_BULK_EMIT else null
 	var warmed := 0
 	# FP_ENV_FALL_HOLD: a CHORD-ONLY dispatch caps the env batch at 0 → every facet takes the cheap chord-fill path
 	# below (coverage stays complete, hole=0), NO expensive env build runs. Off / not-holding ⇒ the full ENV_WARM_BATCH.
@@ -2306,22 +2531,44 @@ func _async_build_worker() -> void:
 				if not batch_left:
 					# Batch spent this cycle — the chord fallback above draws it NOW (never a hole); its upgrade lands later.
 					if not v2_excl:
-						if target and _bpos_cache.has(fid):
-							_emit_cached(st, fid, true, true)
-						elif _pos_cache.has(fid):
-							_emit_cached(st, fid, false)
+						_worker_emit_one(st, fid, target, bulk)
 					continue
 				warmed += 1
 		# Emit by cache PRESENCE (never sunk-read a missing dense cache): a warmed/ready dense target → dense sunk; a
 		# mid-dense target whose dense cache is still pending → its coarse fallback; every other facet → coarse (shipped).
 		if not v2_excl:
-			if target and _bpos_cache.has(fid):
-				_emit_cached(st, fid, true, true)
-			elif _pos_cache.has(fid):
-				_emit_cached(st, fid, false)
-	st.generate_normals()
-	_async_arrays = st.commit_to_arrays()
+			_worker_emit_one(st, fid, target, bulk)
+	if _async_sectored:
+		# P2: assemble ONLY the dirty sectors (each its own surface via the P3 bulk pipeline — byte-equal per G-FR-BULK;
+		# normals smooth per sector). A dirty sector with no emitted member yields the empty-arrays shape → its mesh is
+		# cleared at swap.
+		for s in _async_sector_dirty:
+			_async_sector_arrays[s] = _bulk_assemble(_async_sector_parts.get(s, []))
+	elif bulk != null:
+		_async_arrays = _bulk_assemble(bulk)
+	else:
+		st.generate_normals()
+		_async_arrays = st.commit_to_arrays()
 	_async_build_us = Time.get_ticks_usec() - t0
+
+## WORKER THREAD: the ONE per-facet emit step of the loop above (both the batch-spent fallback and the ready emit run
+## the identical presence law). P2 (FP_FARRING_SECTORS): under a sectored build a CLEAN sector's facet is not re-emitted
+## at all (its resident sector mesh keeps drawing it); a dirty sector's facet emits into that sector's own P3 bulk
+## collector. Un-sectored: `bulk` (the P3 whole-cap collector, or null ⇒ the shipped SurfaceTool emit) — verbatim.
+func _worker_emit_one(st: SurfaceTool, fid: int, target: bool, bulk) -> void:
+	var sink = bulk
+	if _async_sectored:
+		var s: int = _async_fid_sector.get(fid, -1)
+		if not _async_sector_dirty.has(s):
+			return
+		sink = _async_sector_parts.get(s)
+		if sink == null:
+			sink = []
+			_async_sector_parts[s] = sink
+	if target and _bpos_cache.has(fid):
+		_emit_cached(st, fid, true, true, CubeSphere.FP_FARRING_UNCOVERED_TRUE, sink)
+	elif _pos_cache.has(fid):
+		_emit_cached(st, fid, false, false, CubeSphere.FP_FARRING_UNCOVERED_TRUE, sink)
 
 ## MAIN THREAD: swap a finished off-thread build onto the MeshInstance3D. The double-buffer is implicit — the previous
 ## _mi.mesh stayed assigned (and visible) for the whole worker run; here we replace it with the freshly built one. This
@@ -2335,10 +2582,15 @@ func _poll_async_rebuild() -> void:
 	WorkerThreadPool.wait_for_task_completion(_async_task_id)   # already done — reclaims the handle (never blocks here)
 	if _async_warm_only:
 		_async_warm_only = false
+	elif _async_sectored:
+		_swap_in_sectors()   # P2: swap ONLY the dirty sectors; clean sector meshes stay resident
 	else:
 		_swap_in_arrays(_async_arrays, _async_fids)
 	_async_task_id = -1
 	_async_arrays = []
+	_async_sectored = false
+	_async_sector_parts = {}
+	_async_sector_arrays = {}
 	_async_building = false
 
 ## MAIN THREAD: build the ArrayMesh from the worker's surface arrays and assign it, then update the committed-set gate
@@ -3045,6 +3297,7 @@ func _rebuild_full() -> void:
 	var new_mesh: Mesh = _build_fast(fids) if (CubeSphere.FP_FARRING_FAST_REBUILD and not CubeSphere.FP_BLOCKY_FARRING) else _build_surfacetool(fids)
 	var build_us := Time.get_ticks_usec() - t_build
 	var t_swap := Time.get_ticks_usec()
+	_sectors_reset()   # P2 (FP_FARRING_SECTORS): this sync WHOLE-cap commit owns the mesh — clear/invalidate all sectors (no-op off)
 	_mi.mesh = new_mesh
 	_shell_gen += 1   # REVISION 2 LAW R-B: a real shell mesh commit landed — advances the leaving-facet handshake
 	if CubeSphere.FP_SHELL_SNAP_GEN:
@@ -3219,6 +3472,9 @@ func _join_async_rebuild() -> void:
 	WorkerThreadPool.wait_for_task_completion(_async_task_id)
 	_async_task_id = -1
 	_async_arrays = []
+	_async_sectored = false      # P2: the discarded build's sector routing/output dies with it
+	_async_sector_parts = {}
+	_async_sector_arrays = {}
 	_async_building = false
 
 ## COSMOS-PERF STEP 2: never free while a worker is still reading our caches.
@@ -4301,6 +4557,279 @@ func _emit_wall(st: SurfaceTool, da: Vector3, db: Vector3, r0: float, r1: float,
 		st.set_color(c); st.add_vertex(b_lo)
 	return 2
 
+## FP_FARRING_BULK_EMIT (P3): the alloc-diet twin of `_emit_blocky` — the IDENTICAL vertices/colors/uvs in the
+## IDENTICAL order (top, +gi wall/skirt, +gj wall/skirt, -gi skirt, -gj skirt per cell; wall vertex order/colour/uv
+## exactly `_emit_wall`'s), but written by index into packed arrays preallocated from an exact COUNT pass (one resize,
+## no per-vertex append/SurfaceTool call/alloc). Appends `[pos, col, uv, uv2]` (uv/uv2 EMPTY when `tex` is off) to the
+## `parts` collector; `_bulk_assemble` merges the parts and reproduces the identical committed surface. Returns the
+## triangle count (same contract as `_emit_blocky`). Thread-safety identical to `_emit_blocky` (reads only the passed
+## arrays + pure fid decode + the frozen cull state).
+func _emit_blocky_bulk(parts: Array, pos: PackedVector3Array, col: PackedColorArray, cells: int, stride: int,
+		fid: int = -1, tex: bool = false) -> int:
+	var ncell := cells * cells
+	var top_r := PackedFloat32Array(); top_r.resize(ncell)
+	var dirs := PackedVector3Array(); dirs.resize(stride * stride)
+	for i in range(stride * stride):
+		var p: Vector3 = pos[i]
+		var l := p.length()
+		dirs[i] = (p / l) if l > 1.0 else Vector3.UP
+	for gj in range(cells):
+		for gi in range(cells):
+			var i0c := gj * stride + gi
+			top_r[gj * cells + gi] = minf(minf(pos[i0c].length(), pos[i0c + 1].length()),
+				minf(pos[i0c + stride].length(), pos[i0c + stride + 1].length()))
+	var fuv2 := Vector2.ZERO; var t_a := 0; var t_b := 0; var inv_k := 0.0; var inv_c := 0.0
+	if tex:
+		var d := _tex_decode(fid)
+		fuv2 = Vector2(float(d[0]), _uv2_y(fid))
+		t_a = d[1]; t_b = d[2]
+		inv_k = 1.0 / float(d[3]); inv_c = 1.0 / float(cells)
+	var skirt := (PI * 0.5 * FacetAtlas.R_BLOCKS / float(FacetAtlas.K)) / float(cells)
+	var cull_dense := cells == CubeSphere.BACKSTOP_CELLS and fid >= 0 and _cull_on()
+	# COUNT pass — the same top/wall/skirt decisions the fill below (and `_emit_blocky`) makes, so ONE resize is exact.
+	var n := 0
+	for gj in range(cells):
+		for gi in range(cells):
+			if cull_dense and is_cell_culled(fid, gj * cells + gi):
+				continue
+			n += 2
+			var r: float = top_r[gj * cells + gi]
+			if gi + 1 < cells:
+				if absf(r - top_r[gj * cells + gi + 1]) > 0.01:
+					n += 2
+			else:
+				n += 2
+			if gj + 1 < cells:
+				if absf(r - top_r[(gj + 1) * cells + gi]) > 0.01:
+					n += 2
+			else:
+				n += 2
+			if gi == 0:
+				n += 2
+			if gj == 0:
+				n += 2
+	var nv := n * 3
+	var tp := PackedVector3Array(); tp.resize(nv)
+	var tc := PackedColorArray(); tc.resize(nv)
+	var tu := PackedVector2Array()
+	var tu2 := PackedVector2Array()
+	if tex:
+		tu.resize(nv); tu2.resize(nv)
+	var w := 0
+	for gj in range(cells):
+		for gi in range(cells):
+			if cull_dense and is_cell_culled(fid, gj * cells + gi):
+				continue
+			var i0 := gj * stride + gi
+			var i1 := i0 + 1
+			var i2 := i0 + stride
+			var i3 := i2 + 1
+			var r: float = top_r[gj * cells + gi]
+			var c: Color = col[i0]
+			var t0 := dirs[i0] * r; var t1 := dirs[i1] * r; var t2 := dirs[i2] * r; var t3 := dirs[i3] * r
+			var uv0 := Vector2.ZERO; var uv1 := Vector2.ZERO; var uv2 := Vector2.ZERO; var uv3 := Vector2.ZERO
+			if tex:
+				var uu0 := (float(t_a) + float(gi) * inv_c) * inv_k
+				var uu1 := (float(t_a) + float(gi + 1) * inv_c) * inv_k
+				var vv0 := (float(t_b) + float(gj) * inv_c) * inv_k
+				var vv1 := (float(t_b) + float(gj + 1) * inv_c) * inv_k
+				uv0 = Vector2(uu0, vv0); uv1 = Vector2(uu1, vv0)   # i0=(gi,gj)  i1=(gi+1,gj)
+				uv2 = Vector2(uu0, vv1); uv3 = Vector2(uu1, vv1)   # i2=(gi,gj+1) i3=(gi+1,gj+1)
+			# FLAT top (2 tris) — `_emit_blocky`'s order verbatim: t0,t2,t1 / t1,t2,t3, all colour c.
+			tp[w] = t0; tp[w + 1] = t2; tp[w + 2] = t1
+			tp[w + 3] = t1; tp[w + 4] = t2; tp[w + 5] = t3
+			tc[w] = c; tc[w + 1] = c; tc[w + 2] = c; tc[w + 3] = c; tc[w + 4] = c; tc[w + 5] = c
+			if tex:
+				tu[w] = uv0; tu[w + 1] = uv2; tu[w + 2] = uv1
+				tu[w + 3] = uv1; tu[w + 4] = uv2; tu[w + 5] = uv3
+				tu2[w] = fuv2; tu2[w + 1] = fuv2; tu2[w + 2] = fuv2
+				tu2[w + 3] = fuv2; tu2[w + 4] = fuv2; tu2[w + 5] = fuv2
+			w += 6
+			# +gi internal edge (shared corners i1,i3) — wall a_hi,a_lo,b_hi / b_hi,a_lo,b_lo with uva,uva,uvb / uvb,uva,uvb.
+			if gi + 1 < cells:
+				var rn: float = top_r[gj * cells + gi + 1]
+				if absf(r - rn) > 0.01:
+					var wc: Color = c if r >= rn else col[i0 + 1]
+					var hi := maxf(r, rn); var lo := minf(r, rn)
+					var a_hi := dirs[i1] * hi; var b_hi := dirs[i3] * hi
+					var a_lo := dirs[i1] * lo; var b_lo := dirs[i3] * lo
+					tp[w] = a_hi; tp[w + 1] = a_lo; tp[w + 2] = b_hi
+					tp[w + 3] = b_hi; tp[w + 4] = a_lo; tp[w + 5] = b_lo
+					tc[w] = wc; tc[w + 1] = wc; tc[w + 2] = wc; tc[w + 3] = wc; tc[w + 4] = wc; tc[w + 5] = wc
+					if tex:
+						tu[w] = uv1; tu[w + 1] = uv1; tu[w + 2] = uv3
+						tu[w + 3] = uv3; tu[w + 4] = uv1; tu[w + 5] = uv3
+						tu2[w] = fuv2; tu2[w + 1] = fuv2; tu2[w + 2] = fuv2
+						tu2[w + 3] = fuv2; tu2[w + 4] = fuv2; tu2[w + 5] = fuv2
+					w += 6
+			else:
+				var hi_s := maxf(r, r - skirt); var lo_s := minf(r, r - skirt)
+				var a_hi_s := dirs[i1] * hi_s; var b_hi_s := dirs[i3] * hi_s
+				var a_lo_s := dirs[i1] * lo_s; var b_lo_s := dirs[i3] * lo_s
+				tp[w] = a_hi_s; tp[w + 1] = a_lo_s; tp[w + 2] = b_hi_s
+				tp[w + 3] = b_hi_s; tp[w + 4] = a_lo_s; tp[w + 5] = b_lo_s
+				tc[w] = c; tc[w + 1] = c; tc[w + 2] = c; tc[w + 3] = c; tc[w + 4] = c; tc[w + 5] = c
+				if tex:
+					tu[w] = uv1; tu[w + 1] = uv1; tu[w + 2] = uv3
+					tu[w + 3] = uv3; tu[w + 4] = uv1; tu[w + 5] = uv3
+					tu2[w] = fuv2; tu2[w + 1] = fuv2; tu2[w + 2] = fuv2
+					tu2[w + 3] = fuv2; tu2[w + 4] = fuv2; tu2[w + 5] = fuv2
+				w += 6
+			# +gj internal edge (shared corners i2,i3).
+			if gj + 1 < cells:
+				var rd: float = top_r[(gj + 1) * cells + gi]
+				if absf(r - rd) > 0.01:
+					var wc2: Color = c if r >= rd else col[i0 + stride]
+					var hi2 := maxf(r, rd); var lo2 := minf(r, rd)
+					var a_hi2 := dirs[i2] * hi2; var b_hi2 := dirs[i3] * hi2
+					var a_lo2 := dirs[i2] * lo2; var b_lo2 := dirs[i3] * lo2
+					tp[w] = a_hi2; tp[w + 1] = a_lo2; tp[w + 2] = b_hi2
+					tp[w + 3] = b_hi2; tp[w + 4] = a_lo2; tp[w + 5] = b_lo2
+					tc[w] = wc2; tc[w + 1] = wc2; tc[w + 2] = wc2; tc[w + 3] = wc2; tc[w + 4] = wc2; tc[w + 5] = wc2
+					if tex:
+						tu[w] = uv2; tu[w + 1] = uv2; tu[w + 2] = uv3
+						tu[w + 3] = uv3; tu[w + 4] = uv2; tu[w + 5] = uv3
+						tu2[w] = fuv2; tu2[w + 1] = fuv2; tu2[w + 2] = fuv2
+						tu2[w + 3] = fuv2; tu2[w + 4] = fuv2; tu2[w + 5] = fuv2
+					w += 6
+			else:
+				var hi_t := maxf(r, r - skirt); var lo_t := minf(r, r - skirt)
+				var a_hi_t := dirs[i2] * hi_t; var b_hi_t := dirs[i3] * hi_t
+				var a_lo_t := dirs[i2] * lo_t; var b_lo_t := dirs[i3] * lo_t
+				tp[w] = a_hi_t; tp[w + 1] = a_lo_t; tp[w + 2] = b_hi_t
+				tp[w + 3] = b_hi_t; tp[w + 4] = a_lo_t; tp[w + 5] = b_lo_t
+				tc[w] = c; tc[w + 1] = c; tc[w + 2] = c; tc[w + 3] = c; tc[w + 4] = c; tc[w + 5] = c
+				if tex:
+					tu[w] = uv2; tu[w + 1] = uv2; tu[w + 2] = uv3
+					tu[w + 3] = uv3; tu[w + 4] = uv2; tu[w + 5] = uv3
+					tu2[w] = fuv2; tu2[w + 1] = fuv2; tu2[w + 2] = fuv2
+					tu2[w + 3] = fuv2; tu2[w + 4] = fuv2; tu2[w + 5] = fuv2
+				w += 6
+			# -gi / -gj FACET-boundary skirts (first row/col only) — `_emit_wall(dirs[i0], dirs[i2|i1], r, r-skirt, c)`.
+			if gi == 0:
+				var hi_l := maxf(r, r - skirt); var lo_l := minf(r, r - skirt)
+				var a_hi_l := dirs[i0] * hi_l; var b_hi_l := dirs[i2] * hi_l
+				var a_lo_l := dirs[i0] * lo_l; var b_lo_l := dirs[i2] * lo_l
+				tp[w] = a_hi_l; tp[w + 1] = a_lo_l; tp[w + 2] = b_hi_l
+				tp[w + 3] = b_hi_l; tp[w + 4] = a_lo_l; tp[w + 5] = b_lo_l
+				tc[w] = c; tc[w + 1] = c; tc[w + 2] = c; tc[w + 3] = c; tc[w + 4] = c; tc[w + 5] = c
+				if tex:
+					tu[w] = uv0; tu[w + 1] = uv0; tu[w + 2] = uv2
+					tu[w + 3] = uv2; tu[w + 4] = uv0; tu[w + 5] = uv2
+					tu2[w] = fuv2; tu2[w + 1] = fuv2; tu2[w + 2] = fuv2
+					tu2[w + 3] = fuv2; tu2[w + 4] = fuv2; tu2[w + 5] = fuv2
+				w += 6
+			if gj == 0:
+				var hi_b := maxf(r, r - skirt); var lo_b := minf(r, r - skirt)
+				var a_hi_b := dirs[i0] * hi_b; var b_hi_b := dirs[i1] * hi_b
+				var a_lo_b := dirs[i0] * lo_b; var b_lo_b := dirs[i1] * lo_b
+				tp[w] = a_hi_b; tp[w + 1] = a_lo_b; tp[w + 2] = b_hi_b
+				tp[w + 3] = b_hi_b; tp[w + 4] = a_lo_b; tp[w + 5] = b_lo_b
+				tc[w] = c; tc[w + 1] = c; tc[w + 2] = c; tc[w + 3] = c; tc[w + 4] = c; tc[w + 5] = c
+				if tex:
+					tu[w] = uv0; tu[w + 1] = uv0; tu[w + 2] = uv1
+					tu[w + 3] = uv1; tu[w + 4] = uv0; tu[w + 5] = uv1
+					tu2[w] = fuv2; tu2[w + 1] = fuv2; tu2[w + 2] = fuv2
+					tu2[w + 3] = fuv2; tu2[w + 4] = fuv2; tu2[w + 5] = fuv2
+				w += 6
+	parts.append([tp, tc, tu, tu2])
+	return n
+
+## FP_FARRING_BULK_EMIT (P3): the alloc-diet twin of `_emit_cached`'s SMOOTH welded-grid emit stage — identical
+## vertices/colors/uvs in the identical i0,i2,i1 / i1,i2,i3 order, preallocated + index-assigned. Appends
+## `[pos, col, uv, uv2]` to `parts` (uv/uv2 empty when `_tex_on()` is off). Returns the triangle count.
+func _emit_smooth_bulk(parts: Array, pos: PackedVector3Array, col: PackedColorArray, cells: int, stride: int,
+		fid: int) -> int:
+	var tex := _tex_on()
+	var t_a := 0
+	var t_b := 0
+	var t_k := 1
+	var fuv2 := Vector2.ZERO
+	var inv_k := 0.0
+	var inv_c := 0.0
+	if tex:
+		var d := _tex_decode(fid)
+		fuv2 = Vector2(float(d[0]), _uv2_y(fid))
+		t_a = d[1]; t_b = d[2]; t_k = d[3]
+		inv_k = 1.0 / float(t_k)
+		inv_c = 1.0 / float(cells)
+	var cull_dense := cells == CubeSphere.BACKSTOP_CELLS and _cull_on()
+	# COUNT pass (2 tris per emitted cell — the only decision is the cull).
+	var n := 0
+	if cull_dense:
+		for ci in range(cells * cells):
+			if not is_cell_culled(fid, ci):
+				n += 2
+	else:
+		n = cells * cells * 2
+	var nv := n * 3
+	var tp := PackedVector3Array(); tp.resize(nv)
+	var tc := PackedColorArray(); tc.resize(nv)
+	var tu := PackedVector2Array()
+	var tu2 := PackedVector2Array()
+	if tex:
+		tu.resize(nv); tu2.resize(nv)
+	var w := 0
+	for gj in range(cells):
+		for gi in range(cells):
+			if cull_dense and is_cell_culled(fid, gj * cells + gi):
+				continue
+			var i0 := gj * stride + gi
+			var i1 := i0 + 1
+			var i2 := i0 + stride
+			var i3 := i2 + 1
+			tp[w] = pos[i0]; tp[w + 1] = pos[i2]; tp[w + 2] = pos[i1]
+			tp[w + 3] = pos[i1]; tp[w + 4] = pos[i2]; tp[w + 5] = pos[i3]
+			tc[w] = col[i0]; tc[w + 1] = col[i2]; tc[w + 2] = col[i1]
+			tc[w + 3] = col[i1]; tc[w + 4] = col[i2]; tc[w + 5] = col[i3]
+			if tex:
+				var u0 := (float(t_a) + float(gi) * inv_c) * inv_k
+				var u1 := (float(t_a) + float(gi + 1) * inv_c) * inv_k
+				var v0 := (float(t_b) + float(gj) * inv_c) * inv_k
+				var v1 := (float(t_b) + float(gj + 1) * inv_c) * inv_k
+				var uv0 := Vector2(u0, v0); var uv1 := Vector2(u1, v0)
+				var uv2c := Vector2(u0, v1); var uv3 := Vector2(u1, v1)
+				tu[w] = uv0; tu[w + 1] = uv2c; tu[w + 2] = uv1
+				tu[w + 3] = uv1; tu[w + 4] = uv2c; tu[w + 5] = uv3
+				tu2[w] = fuv2; tu2[w + 1] = fuv2; tu2[w + 2] = fuv2
+				tu2[w + 3] = fuv2; tu2[w + 4] = fuv2; tu2[w + 5] = fuv2
+			w += 6
+	parts.append([tp, tc, tu, tu2])
+	return n
+
+## FP_FARRING_BULK_EMIT (P3): merge the per-facet bulk parts (append_array = C++ memcpy, same facet order as the
+## SurfaceTool emit) and reproduce the IDENTICAL committed surface: SurfaceTool.create_from_arrays is a pure-CPU
+## ingest of the arrays (NO mesh RID, NO RenderingServer — worker-safe exactly like commit_to_arrays), then the SAME
+## C++ generate_normals runs the identical GLOBAL vertex-hash smoothing (cross-facet seams included) on the identical
+## vertex list — the round trip is bit-exact (G-FR-BULK). Empty parts ⇒ an ARRAY_MAX-shaped arrays block with an
+## empty vertex array — `_swap_in_arrays`' size guard turns both paths into the same empty ArrayMesh.
+func _bulk_assemble(parts: Array) -> Array:
+	var pos := PackedVector3Array()
+	var col := PackedColorArray()
+	var uv := PackedVector2Array()
+	var uv2 := PackedVector2Array()
+	var tex := false
+	for pr in parts:
+		pos.append_array(pr[0])
+		col.append_array(pr[1])
+		if (pr[2] as PackedVector2Array).size() > 0:   # uniform per build (_tex_on()/FP_BLOCKY_TEX are consts)
+			tex = true
+			uv.append_array(pr[2])
+			uv2.append_array(pr[3])
+	var arr := []
+	arr.resize(Mesh.ARRAY_MAX)
+	arr[Mesh.ARRAY_VERTEX] = pos
+	arr[Mesh.ARRAY_COLOR] = col
+	if tex:
+		arr[Mesh.ARRAY_TEX_UV] = uv
+		arr[Mesh.ARRAY_TEX_UV2] = uv2
+	if pos.size() == 0:
+		return arr
+	var st := SurfaceTool.new()
+	st.create_from_arrays(arr, Mesh.PRIMITIVE_TRIANGLES)
+	st.generate_normals()
+	return st.commit_to_arrays()
+
 ## `from_worker` (REVISION 2 LAW R-D): true when called from `_async_build_worker` (off the main thread). The R-D
 ## reduced interim sink reads `_smooth`/`_excluded`/`_active_fid` — MAIN-THREAD-OWNED state (`_smooth.step()` /
 ## `set_pool_excluded` mutate it while an async build runs concurrently, exactly the hazard `_async_backstop`'s
@@ -4308,8 +4837,14 @@ func _emit_wall(st: SurfaceTool, da: Vector3, db: Vector3, r0: float, r1: float,
 ## emit path; the async worker keeps the plain full sink unconditionally (byte-identical to pre-R-D there). R-D's
 ## target — the near-field rim — is a surface/near-voxel concern the async whole-planet path doesn't serve anyway
 ## (`_shell_orbit()` is true exactly when there is no near voxel field to rim against).
+## FP_FARRING_BULK_EMIT (P3, flag doc in cube_sphere.gd): `bulk` is null (the default — the shipped SurfaceTool emit
+## runs verbatim) or a PARTS COLLECTOR Array: the emit then routes through `_emit_blocky_bulk`/`_emit_smooth_bulk`,
+## which append this facet's `[pos, col, uv, uv2]` packed arrays (preallocated, index-assigned) to it instead of
+## touching `st` at all (`st` may be null in that mode). The pos/col/cells SELECTION above the emit stage is shared
+## untouched, so both modes emit the identical geometry — `_bulk_assemble` later reproduces the identical committed
+## surface (normals included) via the C++ create_from_arrays → generate_normals round trip (G-FR-BULK).
 func _emit_cached(st: SurfaceTool, fid: int, sunk: bool, from_worker: bool = false,
-		uncovered_true_on := CubeSphere.FP_FARRING_UNCOVERED_TRUE) -> int:
+		uncovered_true_on := CubeSphere.FP_FARRING_UNCOVERED_TRUE, bulk = null) -> int:
 	var pos: PackedVector3Array
 	var col: PackedColorArray
 	var cells := CELLS
@@ -4367,6 +4902,13 @@ func _emit_cached(st: SurfaceTool, fid: int, sunk: bool, from_worker: bool = fal
 		col = _col_cache[fid]
 	var stride := cells + 1
 	var n := 0
+	# FP_FARRING_BULK_EMIT (P3): a non-null parts collector diverts the emit STAGE (never the selection above) into
+	# the preallocated packed-array fill — identical vertices/colors/uvs in identical order, no per-vertex SurfaceTool
+	# call. null (the default, and always with the flag off) ⇒ the shipped emit below runs verbatim (byte-identical).
+	if bulk != null:
+		if CubeSphere.FP_BLOCKY_FARRING:
+			return _emit_blocky_bulk(bulk, pos, col, cells, stride, fid, CubeSphere.FP_BLOCKY_TEX and _tex_on())
+		return _emit_smooth_bulk(bulk, pos, col, cells, stride, fid)
 	# FP_BLOCKY_FARRING: emit flat-topped blocks instead of the smooth welded grid (same cached pos/col, so no-protrusion
 	# holds — the block top is the corner MIN ≤ the smooth surface). Off ⇒ the shipped smooth emit below (byte-identical).
 	# COSMOS TEXTURED-LOD T1 (§1.2): under FP_BLOCKY_TEX (∧ FP_FACET_TEX ∧ FP_SHELL_ABSOLUTE, i.e. _tex_on()) the blocky
@@ -5669,20 +6211,43 @@ func gate_facet_uvs(fid: int) -> PackedVector2Array:
 ## COSMOS LOD-TEXTURE Phase 1 gate (G-FT-UV / G-FT-OFF): the committed ring surface's raw arrays (ARRAY_VERTEX,
 ## ARRAY_COLOR, ARRAY_TEX_UV, ARRAY_TEX_UV2, …). Empty when nothing is built. Read-only.
 func mesh_arrays() -> Array:
-	if _mi == null or _mi.mesh == null:
+	# P2 (FP_FARRING_SECTORS): with sector meshes resident the committed cap is their UNION — concatenate every
+	# non-empty surface (the single `_mi` mesh first, then sectors in index order). With the flag off `_sector_mi`
+	# is empty, so this returns the single surface's arrays verbatim (byte-identical to the shipped body).
+	var srcs: Array = []
+	if _mi != null and _mi.mesh != null and (_mi.mesh as ArrayMesh).get_surface_count() > 0:
+		srcs.append((_mi.mesh as ArrayMesh).surface_get_arrays(0))
+	for smi in _sector_mi:
+		if smi != null and (smi as MeshInstance3D).mesh != null \
+				and ((smi as MeshInstance3D).mesh as ArrayMesh).get_surface_count() > 0:
+			srcs.append(((smi as MeshInstance3D).mesh as ArrayMesh).surface_get_arrays(0))
+	if srcs.is_empty():
 		return []
-	var mesh: ArrayMesh = _mi.mesh
-	if mesh.get_surface_count() == 0:
-		return []
-	return mesh.surface_get_arrays(0)
+	if srcs.size() == 1:
+		return srcs[0]
+	var out: Array = (srcs[0] as Array).duplicate()
+	for i in range(1, srcs.size()):
+		var a: Array = srcs[i]
+		for slot in [Mesh.ARRAY_VERTEX, Mesh.ARRAY_NORMAL]:
+			if out[slot] != null and a[slot] != null:
+				var pv: PackedVector3Array = out[slot]
+				pv.append_array(a[slot])
+				out[slot] = pv
+		if out[Mesh.ARRAY_COLOR] != null and a[Mesh.ARRAY_COLOR] != null:
+			var pc: PackedColorArray = out[Mesh.ARRAY_COLOR]
+			pc.append_array(a[Mesh.ARRAY_COLOR])
+			out[Mesh.ARRAY_COLOR] = pc
+		for slot in [Mesh.ARRAY_TEX_UV, Mesh.ARRAY_TEX_UV2]:
+			if out[slot] != null and a[slot] != null:
+				var pu: PackedVector2Array = out[slot]
+				pu.append_array(a[slot])
+				out[slot] = pu
+	return out
 
-## Triangle count of the built ring mesh (gate).
+## Triangle count of the built ring mesh (gate). P2: sums the sector meshes too (empty list off — shipped count).
 func triangle_count() -> int:
-	if _mi == null or _mi.mesh == null:
+	var arr := mesh_arrays()
+	if arr.is_empty():
 		return 0
-	var mesh: ArrayMesh = _mi.mesh
-	if mesh.get_surface_count() == 0:
-		return 0
-	var arr := mesh.surface_get_arrays(0)
 	var vv: Variant = arr[Mesh.ARRAY_VERTEX]
 	return (vv as PackedVector3Array).size() / 3

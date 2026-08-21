@@ -5023,12 +5023,37 @@ static func _apply_flatcolor(code: String) -> String:
 		code = code.replace("	v_face = UV2.x;\n", "	v_face = UV2.x;\n	v_bslot = UV2.y;\n")
 		code = code.replace("	ALBEDO = mix(v_col_raw, col, wt) * v_st;\n", meta_albedo)
 		code = code.replace("	if (v_slot >= 0.0) {\n", "	if (v_slot >= 0.0 && v_slot < 63.5) {\n")
-		return code
+		return _apply_shade_pack(code)
 	code = code.replace(base_decl, base_decl + (_FLAT_UNIFORMS % [bl, bl, nlut]))
 	code = code.replace("varying float v_face;\n", "varying float v_face;\nvarying float v_bslot;\n")
 	code = code.replace("	v_face = UV2.x;\n", "	v_face = UV2.x;\n	v_bslot = UV2.y;\n")
 	code = code.replace("	ALBEDO = mix(v_col_raw, col, wt) * v_st;\n", _FLAT_ALBEDO % bl)
 	code = code.replace("	if (v_slot >= 0.0) {\n", "	if (v_slot >= 0.0 && v_slot < 63.5) {\n")
+	return _apply_shade_pack(code)
+
+# FP_SKIN_SHADE_PACK (docs/COSMOS-SKIN-SHADE-PACK): swap the flat lineage's L8 decodes — band `_bid` (both the
+# uniform-array `_FLAT_ALBEDO` and meta-tex `_FLAT_ALBEDO_META`/`_FLAT_ALBEDO_META_FINE` splices) and fine `_f8` —
+# for the PACKED decode: byte b>0 carries `p = b-1 = idx + 14·shade_q`, so `idx = p % 14`, `shade_q = p / 14`
+# (integer div), `shade = 0.15 + 0.85·q/17` (the SurfaceShot._shade [0.15,1] range re-expanded), and the resolved
+# `far_lut[idx]` is multiplied by `shade` — UNDER the `v_st` sun term (single-owner rule: v_st owns sun/moon, the
+# packed byte owns the sun-INDEPENDENT AO/hillshade — the exact `_BAND_SHOT_ALBEDO` layering, which multiplied its
+# RG8 shade into the block colour before v_st). Applied to the ASSEMBLED string AFTER the flat splices, so each
+# target line exists at most once; a target absent (e.g. no fine tier) is a no-op replace. `pack` is a param so the
+# gate builds both variants; off ⇒ code returned VERBATIM (byte-identical shader string, FLAT 6042/0).
+static func _apply_shade_pack(code: String, pack := CubeSphere.FP_SKIN_SHADE_PACK) -> String:
+	if not pack:
+		return code
+	var lanes := CubeSphere.SHADE_PACK_LANES
+	var qmax := CubeSphere.SHADE_PACK_STEPS - 1
+	code = code.replace(
+		"vec3 _bcol = (_bid > 0) ? far_lut[_bid - 1] : col;",
+		("int _bp = _bid - 1;\n\t\tvec3 _bcol = (_bid > 0) ? far_lut[_bp %% %d] * (0.15 + 0.85 * float(_bp / %d) / %d.0) : col;" % [lanes, lanes, qmax]))
+	code = code.replace(
+		"vec3 _fc = (_f8 > 0) ? far_lut[_f8 - 1] : col;",
+		("int _fp = _f8 - 1;\n\tvec3 _fc = (_f8 > 0) ? far_lut[_fp %% %d] * (0.15 + 0.85 * float(_fp / %d) / %d.0) : col;" % [lanes, lanes, qmax]))
+	code = code.replace(
+		"_bc = (_bid > 0) ? far_lut[_bid - 1] : _fc;",
+		("int _bp = _bid - 1;\n\t\t\t_bc = (_bid > 0) ? far_lut[_bp %% %d] * (0.15 + 0.85 * float(_bp / %d) / %d.0) : _fc;" % [lanes, lanes, qmax]))
 	return code
 
 # COSMOS TEXTURED-LOD V1 (FP_SHADE_UNIFIED, docs/COSMOS-TEXTURED-LOD-DESIGN.md §2V.3): swap the shell LIGHT head's inline

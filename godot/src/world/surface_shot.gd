@@ -101,3 +101,11 @@ static func _shade(fid: int, x: int, z: int, g: int, is_tree: bool, clamped_sea:
 		if TreeGen.top_decoration(x, z - 1, pcache) != BlockCatalog.AIR: near += 1
 		s -= minf(float(near) * CANOPY_SHADOW, CANOPY_SHADOW_MAX)
 	return clampf(s, SHADE_FLOOR, 1.0)
+
+## FP_SKIN_SHADE_PACK (docs/COSMOS-SKIN-SHADE-PACK): THE canonical quantiser of `_shade`'s [0.15, 1] value to the
+## 18 packed steps (shade_q ∈ [0, 17]; decode = 0.15 + 0.85·q/17). LITERALS ARE LOAD-BEARING: the C++ bake
+## (patch 0014 bake_far_tile) spells the IDENTICAL `floor((s - 0.15) / 0.85 * 17.0 + 0.5)` — note `1.0 - 0.15`
+## is NOT bit-equal to the literal `0.85` in f64, so both sides must keep the literals, not derive them. Pure +
+## inert flag-off (nothing calls it); the packed byte is `1 + far_idx + 14·q` (CubeSphere.SHADE_PACK_LANES).
+static func shade_q(s: float) -> int:
+	return clampi(int(floor((s - 0.15) / 0.85 * 17.0 + 0.5)), 0, CubeSphere.SHADE_PACK_STEPS - 1)

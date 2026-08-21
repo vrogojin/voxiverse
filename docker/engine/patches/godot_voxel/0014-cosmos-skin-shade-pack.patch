@@ -1,0 +1,167 @@
+diff --git a/generators/cosmos/voxel_generator_cosmos.cpp b/generators/cosmos/voxel_generator_cosmos.cpp
+index 66b8fae..cde07b3 100644
+--- a/generators/cosmos/voxel_generator_cosmos.cpp
++++ b/generators/cosmos/voxel_generator_cosmos.cpp
+@@ -158,6 +158,11 @@ bool VoxelGeneratorCosmos::setup(Dictionary config) {
+ 	p.climate_biomes = bool(config.get("climate_biomes", false));
+ 	p.skin_block_exact = bool(config.get("skin_block_exact", false));
+ 
++	// FP_SKIN_SHADE_PACK (docs/COSMOS-SKIN-SHADE-PACK): mirror CubeSphere.FP_SKIN_SHADE_PACK -- gates
++	// bake_far_tile's packed {1 + far_idx + 14*shade_q} L8 byte. Default false (key absent) => the
++	// idx-only bytes, byte-identical legacy (the 0011 "not supplied => legacy" sentinel discipline).
++	p.skin_shade_pack = bool(config.get("skin_shade_pack", false));
++
+ 	// COSMOS STRUCTURES P1b (docs/COSMOS-STRUCTURES-DESIGN.md §12.6): mirror CubeSphere.FP_STRUCT_GEN + the
+ 	// village-house material ids + the Earth facet count (the body gate). Default false / 0 -- the 0011 "not
+ 	// supplied => legacy" sentinel discipline: an old pck without these keys never claims a structure cell, so
+@@ -2563,6 +2568,59 @@ struct EditTable {
+ 
+ } // namespace
+ 
++// FP_SKIN_SHADE_PACK (docs/COSMOS-SKIN-SHADE-PACK): the packed L8 protocol. Stored byte =
++// 1 + far_idx + SHADE_PACK_LANES*shade_q with far_idx in [0, 13] and shade_q in [0, 17] (18 quantised
++// steps of the [0.15, 1] analytic shade) -- max byte 1 + 13 + 14*17 = 252 <= 255, and 0 stays the
++// un-baked sentinel. far_idx is ALWAYS 0..13 in bake_far_tile's path: every branch resolves through
++// canon_idx / deco_far_idx / edit_far_idx, all of which hold nearest-in-far_colors indices (FC_COUNT
++// = 14 entries); a rogue fi >= 14 (malformed caller LUT) skips packing and writes the legacy idx byte.
++// The quantiser literals (0.15 / 0.85 / 17.0, floor(x + 0.5)) MUST literal-match SurfaceShot.shade_q
++// (surface_shot.gd) -- (1.0 - 0.15) != 0.85 in f64, so both sides spell the same literals.
++constexpr int SHADE_PACK_LANES = 14;
++constexpr int SHADE_PACK_STEPS = 18;
++
++// FP_SKIN_SHADE_PACK: byte-equal port of SurfaceShot._shade (surface_shot.gd:80-103). Term order,
++// literals, and the [0.15, 1] clamp are line-for-line; every neighbour height/canopy resolves through
++// the already-byte-equal column_profile_core / tree_top_decoration mirrors, so `s` is bit-identical
++// to the GDScript reference for the same column. GDScript floats are f64: minf == MIN(double),
++// absi == Math::abs(int), maxi == MAX(int), clampf == CLAMP(double).
++double VoxelGeneratorCosmos::bake_shade(
++		const Parameters &p, int fid, int x, int z, int g, bool is_tree, bool clamped_sea) {
++	// (a) hillshade / AO from the 4-neighbour column-height stencil (cliff-base & slope darkening).
++	const int gE = int(column_profile_core(p, fid, x + 1, z).x);
++	const int gW = int(column_profile_core(p, fid, x - 1, z).x);
++	const int gN = int(column_profile_core(p, fid, x, z + 1).x);
++	const int gS = int(column_profile_core(p, fid, x, z - 1).x);
++	const int slope = Math::abs(gE - gW) + Math::abs(gN - gS); // central-difference gradient magnitude (blocks)
++	const int concave = (gE + gW + gN + gS) - 4 * g; // >0 => column below its neighbours (in a hollow)
++	double s = 1.0;
++	s -= MIN(double(slope) * 0.045, 0.45); // AO_SLOPE_K / AO_SLOPE_MAX
++	s -= MIN(double(MAX(concave, 0)) * 0.030, 0.35); // AO_CONCAVE_K / AO_CONCAVE_MAX
++	// (b) water-depth darkening -- deeper sea floor reads darker. Only for submerged columns.
++	if (clamped_sea) {
++		s -= MIN(double(cosmos::SEA_LEVEL - g) * 0.030, 0.55); // WATER_DEPTH_K / WATER_DEPTH_MAX
++	}
++	// (c) canopy ground-shadow -- a GROUND column adjacent to a canopy sits in its penumbra. Tree-top
++	// columns ARE the canopy (lit), so they take no ground shadow.
++	if (!is_tree) {
++		int near_c = 0;
++		if (tree_top_decoration(p, fid, x + 1, z) != cosmos::ID_AIR) {
++			near_c += 1;
++		}
++		if (tree_top_decoration(p, fid, x - 1, z) != cosmos::ID_AIR) {
++			near_c += 1;
++		}
++		if (tree_top_decoration(p, fid, x, z + 1) != cosmos::ID_AIR) {
++			near_c += 1;
++		}
++		if (tree_top_decoration(p, fid, x, z - 1) != cosmos::ID_AIR) {
++			near_c += 1;
++		}
++		s -= MIN(double(near_c) * 0.07, 0.28); // CANOPY_SHADOW / CANOPY_SHADOW_MAX
++	}
++	return CLAMP(s, 0.15, 1.0); // SHADE_FLOOR
++}
++
+ // FP_CPP_TILE_BAKE (F1, docs/COSMOS-CPP-PARALLEL-SAMPLER-DESIGN.md §2): ENTRY POINT 4. The whole
+ // _pbm_compute texel loop (facet_tex_baker.gd:1793-1880, cpp branch) in ONE call: one RWLockRead per
+ // FACET (not per texel/row, unlike the chunked sample_columns dispatch this replaces), zero GDScript
+@@ -2620,7 +2678,14 @@ PackedByteArray VoxelGeneratorCosmos::bake_far_tile(int fid, PackedVector2Array
+ 			const int lz = int(cosmos::roundi(bilerp(v00z, v10z, v11z, v01z, s, t)));
+ 
+ 			// EDIT -> STRUCT (P2) -> TREE -> TERRAIN, mirroring facet_tex_baker.gd's cpp branch exactly.
++			// FP_SKIN_SHADE_PACK: deco_known/is_tree + g_known/g remember what the TREE / TERRAIN branches
++			// already computed, so the shade pack below re-derives NOTHING on the common (bare-terrain /
++			// tree) texels. Flag off => the trackers are written but never read => byte-identical legacy.
+ 			int fi = -1;
++			bool deco_known = false;
++			bool is_tree = false;
++			bool g_known = false;
++			int g = 0;
+ 			if (have_edits) {
+ 				int32_t ev = 0;
+ 				if (edit_table.find(pack_xz(lx, lz), &ev)) {
+@@ -2637,18 +2702,40 @@ PackedByteArray VoxelGeneratorCosmos::bake_far_tile(int fid, PackedVector2Array
+ 			}
+ 			if (fi < 0) {
+ 				const int deco = tree_top_decoration(p, fid, lx, lz);
++				deco_known = true;
++				is_tree = deco != cosmos::ID_AIR;
+ 				if (deco != cosmos::ID_AIR) {
+ 					fi = (deco >= 0 && deco < p.deco_far_idx.size()) ? p.deco_far_idx[deco] : 0;
+ 				}
+ 			}
+ 			if (fi < 0) {
+ 				const Vector4 pr = column_profile_core(p, fid, lx, lz);
+-				const int g = int(pr.x);
++				g = int(pr.x);
++				g_known = true;
+ 				const int biome = int(pr.y);
+ 				const double temp = double(pr.w);
+ 				fi = far_index(p, g, biome, temp, g < cosmos::SEA_LEVEL, lx, lz);
+ 			}
+-			w[row_off + bx] = uint8_t(fi + 1);
++			if (p.skin_shade_pack && fi >= 0 && fi < SHADE_PACK_LANES) {
++				// FP_SKIN_SHADE_PACK: pack the quantised analytic shade beside the far idx (byte =
++				// 1 + fi + 14*sq -- see the protocol comment above bake_shade). EDIT/STRUCT texels carry
++				// the analytic terrain/tree shade of their column too (SurfaceShot has no edit/struct
++				// notion; a chopped-tree EDIT column still shades by its generated canopy -- the shade cue
++				// field stays continuous, and both are invisible-at-range approximations by design).
++				if (!g_known) {
++					g = int(column_profile_core(p, fid, lx, lz).x);
++				}
++				if (!deco_known) {
++					is_tree = tree_top_decoration(p, fid, lx, lz) != cosmos::ID_AIR;
++				}
++				const double sh = bake_shade(p, fid, lx, lz, g, is_tree, g < cosmos::SEA_LEVEL);
++				// Quantiser: MUST literal-match SurfaceShot.shade_q (surface_shot.gd) -- same literals,
++				// same floor(x + 0.5) half-up rule, so the C++ and GDScript bakes quantise identically.
++				const int sq = CLAMP(int(Math::floor((sh - 0.15) / 0.85 * 17.0 + 0.5)), 0, SHADE_PACK_STEPS - 1);
++				w[row_off + bx] = uint8_t(1 + fi + SHADE_PACK_LANES * sq);
++			} else {
++				w[row_off + bx] = uint8_t(fi + 1);
++			}
+ 		}
+ 	}
+ 	return out;
+diff --git a/generators/cosmos/voxel_generator_cosmos.h b/generators/cosmos/voxel_generator_cosmos.h
+index ae6d946..e9222f0 100644
+--- a/generators/cosmos/voxel_generator_cosmos.h
++++ b/generators/cosmos/voxel_generator_cosmos.h
+@@ -299,6 +299,14 @@ private:
+ 	// FP_CPP_TILE_BAKE (F1): port of TreeGen.top_decoration (tree_gen.gd:208-224), built entirely from
+ 	// the primitives above -- see bake_far_tile.
+ 	static int tree_top_decoration(const Parameters &p, int fid, int x, int z);
++	// FP_SKIN_SHADE_PACK: line-for-line port of SurfaceShot._shade (surface_shot.gd:80-103) -- the
++	// sun-INDEPENDENT analytic hillshade/AO in [0.15, 1] for column (x, z): 4-neighbour height-stencil
++	// slope + cliff/pit concavity darkening, water-depth darkening for submerged columns, canopy
++	// ground-shadow beside trees. Neighbour heights come from column_profile_core (byte-equal to
++	// TerrainConfig.column_profile) and neighbour canopies from tree_top_decoration (byte-equal to
++	// TreeGen.top_decoration), so the f64 term order below the clamp is bit-identical to the GDScript.
++	// Consulted ONLY by bake_far_tile under p.skin_shade_pack.
++	static double bake_shade(const Parameters &p, int fid, int x, int z, int g, bool is_tree, bool clamped_sea);
+ 
+ 	// --- StructureGen (structure_gen.gd) -- the P1b village-generator mirror (§12.3/§12.4/§12.6). Every
+ 	// one is a line-for-line port of a StructureGen static, sharing cosmos::tree_hash01 with new salts.
+@@ -462,6 +470,13 @@ private:
+ 		bool climate_biomes = false;
+ 		bool skin_block_exact = false;
+ 
++		// FP_SKIN_SHADE_PACK (docs/COSMOS-SKIN-SHADE-PACK, Defect 3 near<->far brightness step): mirrors
++		// CubeSphere.FP_SKIN_SHADE_PACK. Gates bake_far_tile's PACKED L8 byte -- stored byte becomes
++		// 1 + far_idx + 14*shade_q (shade_q in [0,17], the quantised SurfaceShot._shade analytic AO/
++		// hillshade) instead of 1 + far_idx. Default false (key absent) => idx-only bytes, byte-identical
++		// legacy (the 0011 "not supplied => legacy" sentinel discipline).
++		bool skin_shade_pack = false;
++
+ 		// COSMOS STRUCTURES P1b (docs/COSMOS-STRUCTURES-DESIGN.md §12.6): the village generator mirror.
+ 		// struct_gen mirrors CubeSphere.FP_STRUCT_GEN; struct_earth_facets == 6*K*K is the body gate
+ 		// (villages exist ONLY on Earth facets, fid < this -- the Moon aliases biome ids); the six ids are

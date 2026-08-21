@@ -569,7 +569,10 @@ func _key(fid: int, tx: int, tz: int) -> String:
 
 ## Build the compiled generator frozen for `active_fid`, exactly as module_world/verify_cppgen do (noise
 ## stack + material tables + frozen atlas + the §7.2 far_colors). Null if the class is not in the binary.
-static func _build_cpp_gen(active_fid: int) -> Object:
+## `overrides` (gate-only, default {}): extra/overriding config keys merged in AFTER material_tables — lets a
+## verify gate build a generator with a flag the source consts hold false (e.g. verify_skin_shade_pack.gd's
+## {"skin_shade_pack": true} pair). No production caller passes it ⇒ default {} ⇒ byte-identical setup.
+static func _build_cpp_gen(active_fid: int, overrides: Dictionary = {}) -> Object:
 	if not ClassDB.class_exists("VoxelGeneratorCosmos"):
 		return null
 	var gen: Object = ClassDB.instantiate("VoxelGeneratorCosmos")
@@ -597,6 +600,8 @@ static func _build_cpp_gen(active_fid: int) -> Object:
 		cfg["facet_frame"] = atlas["facet_frame"]
 		cfg["facet_off"] = atlas["facet_off"]
 		cfg["facet_r_blocks"] = atlas["facet_r_blocks"]
+	for k in overrides:
+		cfg[k] = overrides[k]
 	if not gen.call("setup", cfg):
 		return null
 	return gen

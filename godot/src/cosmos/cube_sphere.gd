@@ -712,6 +712,24 @@ const FP_CPP_TILE_BAKE := false
 ## overrides those columns; and the chop invalidates the facet's baked band/fine tiles so they re-bake. GDScript-only
 ## (no engine change). Off ⇒ empty snapshots + no invalidation ⇒ byte-identical bakes.
 const FP_FT_SKIN_CHOP := false
+## FP_SKIN_SHADE_PACK (docs/COSMOS-SKIN-SHADE-PACK, Defect 3): close the near↔far COLOUR/BRIGHTNESS step under the
+## player — the flat far skin (FP_SKIN_FLATCOLOR band + FP_PLANET_MAP fine) is a relief-less {palette-idx}→colour,
+## so it reads brighter/cleaner than the lit 3D near-field. Fix: bake the SUN-INDEPENDENT analytic shade
+## (SurfaceShot._shade — hillshade/AO + water-depth + canopy ground-shadow, [0.15,1]) INTO the existing L8 byte,
+## packed as `1 + idx + 14·shade_q` (idx ∈ [0,13] — the 14 frozen_colors lanes; shade_q ∈ [0,17] — 18 quantised
+## steps; max 252 ≤ 255, 0 stays the un-baked sentinel), and decode+multiply it in the flat shaders
+## (far_lut[idx]·shade UNDER the v_st sun term — single-owner rule, exactly where _BAND_SHOT_ALBEDO multiplied its
+## shade; FP_BAND_SHOT itself is DEAD: RG8 blew the byte ledger and it lived on the wrong FP_BLOCK_DETAIL lineage).
+## Same L8 byte size (no OOM), same multi-core C++ bake (patch 0014 extends bake_far_tile, near-free — it reuses
+## the per-texel heights the id classification already computes). Both the band (512²) AND fine (64²) tiles pack,
+## so there is no shade seam at the fine↔band handoff; the GDScript _pbm fallback branches pack identically (the
+## C++/GDScript byte-equality law extends to the packed byte). Default false ⇒ bytes stay `idx + 1` and every
+## shader string is byte-identical (FLAT 6042/0). Gate: verify_skin_shade_pack.gd.
+const FP_SKIN_SHADE_PACK := false
+## FP_SKIN_SHADE_PACK protocol constants — the pack stride (the 14 palette lanes) and the shade step count.
+## MUST match patch 0014's SHADE_PACK_LANES/SHADE_PACK_STEPS and the shader decode literals in facet_far_ring.gd.
+const SHADE_PACK_LANES := 14
+const SHADE_PACK_STEPS := 18
 
 ## FP_OBJ_LOD (docs/COSMOS-OBJECT-LOD-DESIGN.md): the physical-object far-render + LOD ladder. Discrete objects
 ## (VoxelBody debris; ships/stations/asteroids later) get a size-derived ladder — full mesh → StructDecimator

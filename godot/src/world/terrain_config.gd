@@ -533,6 +533,11 @@ static func material_tables() -> Dictionary:
 		# skin_block_exact routes far_color/far_index through deco_far_idx[top_block_id]. Flags default false ⇒ legacy.
 		"climate_biomes": CubeSphere.FP_CLIMATE_BIOMES,
 		"skin_block_exact": CubeSphere.FP_SKIN_BLOCK_EXACT,
+		# FP_SKIN_SHADE_PACK (docs/COSMOS-SKIN-SHADE-PACK, patch 0014): mirror the flag into the C++ bake_far_tile —
+		# gates the packed {1 + far_idx + 14·shade_q} L8 byte (quantised SurfaceShot._shade analytic AO). Default-off
+		# sentinel (key absent ⇒ false in setup) ⇒ idx-only bytes ⇒ byte-identical legacy. Single home beside
+		# skin_block_exact/struct_lod so the far tile-bake gen can never drift from the GDScript flag.
+		"skin_shade_pack": CubeSphere.FP_SKIN_SHADE_PACK,
 		"id_acacia_log": BlockCatalog.id_of(&"acacia_log"), "id_acacia_leaf": BlockCatalog.id_of(&"acacia_leaves"),
 		"id_jungle_log": BlockCatalog.id_of(&"jungle_log"), "id_jungle_leaf": BlockCatalog.id_of(&"jungle_leaves"),
 		"id_cactus": BlockCatalog.id_of(&"cactus"),

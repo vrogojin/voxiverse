@@ -2279,6 +2279,10 @@ func _async_build_worker() -> void:
 		return
 	var st := SurfaceTool.new()
 	st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	# FP_FARRING_BULK_EMIT (P3): a non-null parts collector switches every `_emit_cached` below to the preallocated
+	# packed-array fill (the SurfaceTool above stays begun-but-empty and unused); `_bulk_assemble` then reproduces the
+	# identical committed arrays. Off ⇒ null ⇒ every call runs the shipped per-vertex SurfaceTool emit verbatim.
+	var bulk = [] if CubeSphere.FP_FARRING_BULK_EMIT else null
 	var warmed := 0
 	# FP_ENV_FALL_HOLD: a CHORD-ONLY dispatch caps the env batch at 0 → every facet takes the cheap chord-fill path
 	# below (coverage stays complete, hole=0), NO expensive env build runs. Off / not-holding ⇒ the full ENV_WARM_BATCH.
@@ -2307,20 +2311,23 @@ func _async_build_worker() -> void:
 					# Batch spent this cycle — the chord fallback above draws it NOW (never a hole); its upgrade lands later.
 					if not v2_excl:
 						if target and _bpos_cache.has(fid):
-							_emit_cached(st, fid, true, true)
+							_emit_cached(st, fid, true, true, CubeSphere.FP_FARRING_UNCOVERED_TRUE, bulk)
 						elif _pos_cache.has(fid):
-							_emit_cached(st, fid, false)
+							_emit_cached(st, fid, false, false, CubeSphere.FP_FARRING_UNCOVERED_TRUE, bulk)
 					continue
 				warmed += 1
 		# Emit by cache PRESENCE (never sunk-read a missing dense cache): a warmed/ready dense target → dense sunk; a
 		# mid-dense target whose dense cache is still pending → its coarse fallback; every other facet → coarse (shipped).
 		if not v2_excl:
 			if target and _bpos_cache.has(fid):
-				_emit_cached(st, fid, true, true)
+				_emit_cached(st, fid, true, true, CubeSphere.FP_FARRING_UNCOVERED_TRUE, bulk)
 			elif _pos_cache.has(fid):
-				_emit_cached(st, fid, false)
-	st.generate_normals()
-	_async_arrays = st.commit_to_arrays()
+				_emit_cached(st, fid, false, false, CubeSphere.FP_FARRING_UNCOVERED_TRUE, bulk)
+	if bulk != null:
+		_async_arrays = _bulk_assemble(bulk)
+	else:
+		st.generate_normals()
+		_async_arrays = st.commit_to_arrays()
 	_async_build_us = Time.get_ticks_usec() - t0
 
 ## MAIN THREAD: swap a finished off-thread build onto the MeshInstance3D. The double-buffer is implicit — the previous
@@ -4301,6 +4308,279 @@ func _emit_wall(st: SurfaceTool, da: Vector3, db: Vector3, r0: float, r1: float,
 		st.set_color(c); st.add_vertex(b_lo)
 	return 2
 
+## FP_FARRING_BULK_EMIT (P3): the alloc-diet twin of `_emit_blocky` — the IDENTICAL vertices/colors/uvs in the
+## IDENTICAL order (top, +gi wall/skirt, +gj wall/skirt, -gi skirt, -gj skirt per cell; wall vertex order/colour/uv
+## exactly `_emit_wall`'s), but written by index into packed arrays preallocated from an exact COUNT pass (one resize,
+## no per-vertex append/SurfaceTool call/alloc). Appends `[pos, col, uv, uv2]` (uv/uv2 EMPTY when `tex` is off) to the
+## `parts` collector; `_bulk_assemble` merges the parts and reproduces the identical committed surface. Returns the
+## triangle count (same contract as `_emit_blocky`). Thread-safety identical to `_emit_blocky` (reads only the passed
+## arrays + pure fid decode + the frozen cull state).
+func _emit_blocky_bulk(parts: Array, pos: PackedVector3Array, col: PackedColorArray, cells: int, stride: int,
+		fid: int = -1, tex: bool = false) -> int:
+	var ncell := cells * cells
+	var top_r := PackedFloat32Array(); top_r.resize(ncell)
+	var dirs := PackedVector3Array(); dirs.resize(stride * stride)
+	for i in range(stride * stride):
+		var p: Vector3 = pos[i]
+		var l := p.length()
+		dirs[i] = (p / l) if l > 1.0 else Vector3.UP
+	for gj in range(cells):
+		for gi in range(cells):
+			var i0c := gj * stride + gi
+			top_r[gj * cells + gi] = minf(minf(pos[i0c].length(), pos[i0c + 1].length()),
+				minf(pos[i0c + stride].length(), pos[i0c + stride + 1].length()))
+	var fuv2 := Vector2.ZERO; var t_a := 0; var t_b := 0; var inv_k := 0.0; var inv_c := 0.0
+	if tex:
+		var d := _tex_decode(fid)
+		fuv2 = Vector2(float(d[0]), _uv2_y(fid))
+		t_a = d[1]; t_b = d[2]
+		inv_k = 1.0 / float(d[3]); inv_c = 1.0 / float(cells)
+	var skirt := (PI * 0.5 * FacetAtlas.R_BLOCKS / float(FacetAtlas.K)) / float(cells)
+	var cull_dense := cells == CubeSphere.BACKSTOP_CELLS and fid >= 0 and _cull_on()
+	# COUNT pass — the same top/wall/skirt decisions the fill below (and `_emit_blocky`) makes, so ONE resize is exact.
+	var n := 0
+	for gj in range(cells):
+		for gi in range(cells):
+			if cull_dense and is_cell_culled(fid, gj * cells + gi):
+				continue
+			n += 2
+			var r: float = top_r[gj * cells + gi]
+			if gi + 1 < cells:
+				if absf(r - top_r[gj * cells + gi + 1]) > 0.01:
+					n += 2
+			else:
+				n += 2
+			if gj + 1 < cells:
+				if absf(r - top_r[(gj + 1) * cells + gi]) > 0.01:
+					n += 2
+			else:
+				n += 2
+			if gi == 0:
+				n += 2
+			if gj == 0:
+				n += 2
+	var nv := n * 3
+	var tp := PackedVector3Array(); tp.resize(nv)
+	var tc := PackedColorArray(); tc.resize(nv)
+	var tu := PackedVector2Array()
+	var tu2 := PackedVector2Array()
+	if tex:
+		tu.resize(nv); tu2.resize(nv)
+	var w := 0
+	for gj in range(cells):
+		for gi in range(cells):
+			if cull_dense and is_cell_culled(fid, gj * cells + gi):
+				continue
+			var i0 := gj * stride + gi
+			var i1 := i0 + 1
+			var i2 := i0 + stride
+			var i3 := i2 + 1
+			var r: float = top_r[gj * cells + gi]
+			var c: Color = col[i0]
+			var t0 := dirs[i0] * r; var t1 := dirs[i1] * r; var t2 := dirs[i2] * r; var t3 := dirs[i3] * r
+			var uv0 := Vector2.ZERO; var uv1 := Vector2.ZERO; var uv2 := Vector2.ZERO; var uv3 := Vector2.ZERO
+			if tex:
+				var uu0 := (float(t_a) + float(gi) * inv_c) * inv_k
+				var uu1 := (float(t_a) + float(gi + 1) * inv_c) * inv_k
+				var vv0 := (float(t_b) + float(gj) * inv_c) * inv_k
+				var vv1 := (float(t_b) + float(gj + 1) * inv_c) * inv_k
+				uv0 = Vector2(uu0, vv0); uv1 = Vector2(uu1, vv0)   # i0=(gi,gj)  i1=(gi+1,gj)
+				uv2 = Vector2(uu0, vv1); uv3 = Vector2(uu1, vv1)   # i2=(gi,gj+1) i3=(gi+1,gj+1)
+			# FLAT top (2 tris) — `_emit_blocky`'s order verbatim: t0,t2,t1 / t1,t2,t3, all colour c.
+			tp[w] = t0; tp[w + 1] = t2; tp[w + 2] = t1
+			tp[w + 3] = t1; tp[w + 4] = t2; tp[w + 5] = t3
+			tc[w] = c; tc[w + 1] = c; tc[w + 2] = c; tc[w + 3] = c; tc[w + 4] = c; tc[w + 5] = c
+			if tex:
+				tu[w] = uv0; tu[w + 1] = uv2; tu[w + 2] = uv1
+				tu[w + 3] = uv1; tu[w + 4] = uv2; tu[w + 5] = uv3
+				tu2[w] = fuv2; tu2[w + 1] = fuv2; tu2[w + 2] = fuv2
+				tu2[w + 3] = fuv2; tu2[w + 4] = fuv2; tu2[w + 5] = fuv2
+			w += 6
+			# +gi internal edge (shared corners i1,i3) — wall a_hi,a_lo,b_hi / b_hi,a_lo,b_lo with uva,uva,uvb / uvb,uva,uvb.
+			if gi + 1 < cells:
+				var rn: float = top_r[gj * cells + gi + 1]
+				if absf(r - rn) > 0.01:
+					var wc: Color = c if r >= rn else col[i0 + 1]
+					var hi := maxf(r, rn); var lo := minf(r, rn)
+					var a_hi := dirs[i1] * hi; var b_hi := dirs[i3] * hi
+					var a_lo := dirs[i1] * lo; var b_lo := dirs[i3] * lo
+					tp[w] = a_hi; tp[w + 1] = a_lo; tp[w + 2] = b_hi
+					tp[w + 3] = b_hi; tp[w + 4] = a_lo; tp[w + 5] = b_lo
+					tc[w] = wc; tc[w + 1] = wc; tc[w + 2] = wc; tc[w + 3] = wc; tc[w + 4] = wc; tc[w + 5] = wc
+					if tex:
+						tu[w] = uv1; tu[w + 1] = uv1; tu[w + 2] = uv3
+						tu[w + 3] = uv3; tu[w + 4] = uv1; tu[w + 5] = uv3
+						tu2[w] = fuv2; tu2[w + 1] = fuv2; tu2[w + 2] = fuv2
+						tu2[w + 3] = fuv2; tu2[w + 4] = fuv2; tu2[w + 5] = fuv2
+					w += 6
+			else:
+				var hi_s := maxf(r, r - skirt); var lo_s := minf(r, r - skirt)
+				var a_hi_s := dirs[i1] * hi_s; var b_hi_s := dirs[i3] * hi_s
+				var a_lo_s := dirs[i1] * lo_s; var b_lo_s := dirs[i3] * lo_s
+				tp[w] = a_hi_s; tp[w + 1] = a_lo_s; tp[w + 2] = b_hi_s
+				tp[w + 3] = b_hi_s; tp[w + 4] = a_lo_s; tp[w + 5] = b_lo_s
+				tc[w] = c; tc[w + 1] = c; tc[w + 2] = c; tc[w + 3] = c; tc[w + 4] = c; tc[w + 5] = c
+				if tex:
+					tu[w] = uv1; tu[w + 1] = uv1; tu[w + 2] = uv3
+					tu[w + 3] = uv3; tu[w + 4] = uv1; tu[w + 5] = uv3
+					tu2[w] = fuv2; tu2[w + 1] = fuv2; tu2[w + 2] = fuv2
+					tu2[w + 3] = fuv2; tu2[w + 4] = fuv2; tu2[w + 5] = fuv2
+				w += 6
+			# +gj internal edge (shared corners i2,i3).
+			if gj + 1 < cells:
+				var rd: float = top_r[(gj + 1) * cells + gi]
+				if absf(r - rd) > 0.01:
+					var wc2: Color = c if r >= rd else col[i0 + stride]
+					var hi2 := maxf(r, rd); var lo2 := minf(r, rd)
+					var a_hi2 := dirs[i2] * hi2; var b_hi2 := dirs[i3] * hi2
+					var a_lo2 := dirs[i2] * lo2; var b_lo2 := dirs[i3] * lo2
+					tp[w] = a_hi2; tp[w + 1] = a_lo2; tp[w + 2] = b_hi2
+					tp[w + 3] = b_hi2; tp[w + 4] = a_lo2; tp[w + 5] = b_lo2
+					tc[w] = wc2; tc[w + 1] = wc2; tc[w + 2] = wc2; tc[w + 3] = wc2; tc[w + 4] = wc2; tc[w + 5] = wc2
+					if tex:
+						tu[w] = uv2; tu[w + 1] = uv2; tu[w + 2] = uv3
+						tu[w + 3] = uv3; tu[w + 4] = uv2; tu[w + 5] = uv3
+						tu2[w] = fuv2; tu2[w + 1] = fuv2; tu2[w + 2] = fuv2
+						tu2[w + 3] = fuv2; tu2[w + 4] = fuv2; tu2[w + 5] = fuv2
+					w += 6
+			else:
+				var hi_t := maxf(r, r - skirt); var lo_t := minf(r, r - skirt)
+				var a_hi_t := dirs[i2] * hi_t; var b_hi_t := dirs[i3] * hi_t
+				var a_lo_t := dirs[i2] * lo_t; var b_lo_t := dirs[i3] * lo_t
+				tp[w] = a_hi_t; tp[w + 1] = a_lo_t; tp[w + 2] = b_hi_t
+				tp[w + 3] = b_hi_t; tp[w + 4] = a_lo_t; tp[w + 5] = b_lo_t
+				tc[w] = c; tc[w + 1] = c; tc[w + 2] = c; tc[w + 3] = c; tc[w + 4] = c; tc[w + 5] = c
+				if tex:
+					tu[w] = uv2; tu[w + 1] = uv2; tu[w + 2] = uv3
+					tu[w + 3] = uv3; tu[w + 4] = uv2; tu[w + 5] = uv3
+					tu2[w] = fuv2; tu2[w + 1] = fuv2; tu2[w + 2] = fuv2
+					tu2[w + 3] = fuv2; tu2[w + 4] = fuv2; tu2[w + 5] = fuv2
+				w += 6
+			# -gi / -gj FACET-boundary skirts (first row/col only) — `_emit_wall(dirs[i0], dirs[i2|i1], r, r-skirt, c)`.
+			if gi == 0:
+				var hi_l := maxf(r, r - skirt); var lo_l := minf(r, r - skirt)
+				var a_hi_l := dirs[i0] * hi_l; var b_hi_l := dirs[i2] * hi_l
+				var a_lo_l := dirs[i0] * lo_l; var b_lo_l := dirs[i2] * lo_l
+				tp[w] = a_hi_l; tp[w + 1] = a_lo_l; tp[w + 2] = b_hi_l
+				tp[w + 3] = b_hi_l; tp[w + 4] = a_lo_l; tp[w + 5] = b_lo_l
+				tc[w] = c; tc[w + 1] = c; tc[w + 2] = c; tc[w + 3] = c; tc[w + 4] = c; tc[w + 5] = c
+				if tex:
+					tu[w] = uv0; tu[w + 1] = uv0; tu[w + 2] = uv2
+					tu[w + 3] = uv2; tu[w + 4] = uv0; tu[w + 5] = uv2
+					tu2[w] = fuv2; tu2[w + 1] = fuv2; tu2[w + 2] = fuv2
+					tu2[w + 3] = fuv2; tu2[w + 4] = fuv2; tu2[w + 5] = fuv2
+				w += 6
+			if gj == 0:
+				var hi_b := maxf(r, r - skirt); var lo_b := minf(r, r - skirt)
+				var a_hi_b := dirs[i0] * hi_b; var b_hi_b := dirs[i1] * hi_b
+				var a_lo_b := dirs[i0] * lo_b; var b_lo_b := dirs[i1] * lo_b
+				tp[w] = a_hi_b; tp[w + 1] = a_lo_b; tp[w + 2] = b_hi_b
+				tp[w + 3] = b_hi_b; tp[w + 4] = a_lo_b; tp[w + 5] = b_lo_b
+				tc[w] = c; tc[w + 1] = c; tc[w + 2] = c; tc[w + 3] = c; tc[w + 4] = c; tc[w + 5] = c
+				if tex:
+					tu[w] = uv0; tu[w + 1] = uv0; tu[w + 2] = uv1
+					tu[w + 3] = uv1; tu[w + 4] = uv0; tu[w + 5] = uv1
+					tu2[w] = fuv2; tu2[w + 1] = fuv2; tu2[w + 2] = fuv2
+					tu2[w + 3] = fuv2; tu2[w + 4] = fuv2; tu2[w + 5] = fuv2
+				w += 6
+	parts.append([tp, tc, tu, tu2])
+	return n
+
+## FP_FARRING_BULK_EMIT (P3): the alloc-diet twin of `_emit_cached`'s SMOOTH welded-grid emit stage — identical
+## vertices/colors/uvs in the identical i0,i2,i1 / i1,i2,i3 order, preallocated + index-assigned. Appends
+## `[pos, col, uv, uv2]` to `parts` (uv/uv2 empty when `_tex_on()` is off). Returns the triangle count.
+func _emit_smooth_bulk(parts: Array, pos: PackedVector3Array, col: PackedColorArray, cells: int, stride: int,
+		fid: int) -> int:
+	var tex := _tex_on()
+	var t_a := 0
+	var t_b := 0
+	var t_k := 1
+	var fuv2 := Vector2.ZERO
+	var inv_k := 0.0
+	var inv_c := 0.0
+	if tex:
+		var d := _tex_decode(fid)
+		fuv2 = Vector2(float(d[0]), _uv2_y(fid))
+		t_a = d[1]; t_b = d[2]; t_k = d[3]
+		inv_k = 1.0 / float(t_k)
+		inv_c = 1.0 / float(cells)
+	var cull_dense := cells == CubeSphere.BACKSTOP_CELLS and _cull_on()
+	# COUNT pass (2 tris per emitted cell — the only decision is the cull).
+	var n := 0
+	if cull_dense:
+		for ci in range(cells * cells):
+			if not is_cell_culled(fid, ci):
+				n += 2
+	else:
+		n = cells * cells * 2
+	var nv := n * 3
+	var tp := PackedVector3Array(); tp.resize(nv)
+	var tc := PackedColorArray(); tc.resize(nv)
+	var tu := PackedVector2Array()
+	var tu2 := PackedVector2Array()
+	if tex:
+		tu.resize(nv); tu2.resize(nv)
+	var w := 0
+	for gj in range(cells):
+		for gi in range(cells):
+			if cull_dense and is_cell_culled(fid, gj * cells + gi):
+				continue
+			var i0 := gj * stride + gi
+			var i1 := i0 + 1
+			var i2 := i0 + stride
+			var i3 := i2 + 1
+			tp[w] = pos[i0]; tp[w + 1] = pos[i2]; tp[w + 2] = pos[i1]
+			tp[w + 3] = pos[i1]; tp[w + 4] = pos[i2]; tp[w + 5] = pos[i3]
+			tc[w] = col[i0]; tc[w + 1] = col[i2]; tc[w + 2] = col[i1]
+			tc[w + 3] = col[i1]; tc[w + 4] = col[i2]; tc[w + 5] = col[i3]
+			if tex:
+				var u0 := (float(t_a) + float(gi) * inv_c) * inv_k
+				var u1 := (float(t_a) + float(gi + 1) * inv_c) * inv_k
+				var v0 := (float(t_b) + float(gj) * inv_c) * inv_k
+				var v1 := (float(t_b) + float(gj + 1) * inv_c) * inv_k
+				var uv0 := Vector2(u0, v0); var uv1 := Vector2(u1, v0)
+				var uv2c := Vector2(u0, v1); var uv3 := Vector2(u1, v1)
+				tu[w] = uv0; tu[w + 1] = uv2c; tu[w + 2] = uv1
+				tu[w + 3] = uv1; tu[w + 4] = uv2c; tu[w + 5] = uv3
+				tu2[w] = fuv2; tu2[w + 1] = fuv2; tu2[w + 2] = fuv2
+				tu2[w + 3] = fuv2; tu2[w + 4] = fuv2; tu2[w + 5] = fuv2
+			w += 6
+	parts.append([tp, tc, tu, tu2])
+	return n
+
+## FP_FARRING_BULK_EMIT (P3): merge the per-facet bulk parts (append_array = C++ memcpy, same facet order as the
+## SurfaceTool emit) and reproduce the IDENTICAL committed surface: SurfaceTool.create_from_arrays is a pure-CPU
+## ingest of the arrays (NO mesh RID, NO RenderingServer — worker-safe exactly like commit_to_arrays), then the SAME
+## C++ generate_normals runs the identical GLOBAL vertex-hash smoothing (cross-facet seams included) on the identical
+## vertex list — the round trip is bit-exact (G-FR-BULK). Empty parts ⇒ an ARRAY_MAX-shaped arrays block with an
+## empty vertex array — `_swap_in_arrays`' size guard turns both paths into the same empty ArrayMesh.
+func _bulk_assemble(parts: Array) -> Array:
+	var pos := PackedVector3Array()
+	var col := PackedColorArray()
+	var uv := PackedVector2Array()
+	var uv2 := PackedVector2Array()
+	var tex := false
+	for pr in parts:
+		pos.append_array(pr[0])
+		col.append_array(pr[1])
+		if (pr[2] as PackedVector2Array).size() > 0:   # uniform per build (_tex_on()/FP_BLOCKY_TEX are consts)
+			tex = true
+			uv.append_array(pr[2])
+			uv2.append_array(pr[3])
+	var arr := []
+	arr.resize(Mesh.ARRAY_MAX)
+	arr[Mesh.ARRAY_VERTEX] = pos
+	arr[Mesh.ARRAY_COLOR] = col
+	if tex:
+		arr[Mesh.ARRAY_TEX_UV] = uv
+		arr[Mesh.ARRAY_TEX_UV2] = uv2
+	if pos.size() == 0:
+		return arr
+	var st := SurfaceTool.new()
+	st.create_from_arrays(arr, Mesh.PRIMITIVE_TRIANGLES)
+	st.generate_normals()
+	return st.commit_to_arrays()
+
 ## `from_worker` (REVISION 2 LAW R-D): true when called from `_async_build_worker` (off the main thread). The R-D
 ## reduced interim sink reads `_smooth`/`_excluded`/`_active_fid` — MAIN-THREAD-OWNED state (`_smooth.step()` /
 ## `set_pool_excluded` mutate it while an async build runs concurrently, exactly the hazard `_async_backstop`'s
@@ -4308,8 +4588,14 @@ func _emit_wall(st: SurfaceTool, da: Vector3, db: Vector3, r0: float, r1: float,
 ## emit path; the async worker keeps the plain full sink unconditionally (byte-identical to pre-R-D there). R-D's
 ## target — the near-field rim — is a surface/near-voxel concern the async whole-planet path doesn't serve anyway
 ## (`_shell_orbit()` is true exactly when there is no near voxel field to rim against).
+## FP_FARRING_BULK_EMIT (P3, flag doc in cube_sphere.gd): `bulk` is null (the default — the shipped SurfaceTool emit
+## runs verbatim) or a PARTS COLLECTOR Array: the emit then routes through `_emit_blocky_bulk`/`_emit_smooth_bulk`,
+## which append this facet's `[pos, col, uv, uv2]` packed arrays (preallocated, index-assigned) to it instead of
+## touching `st` at all (`st` may be null in that mode). The pos/col/cells SELECTION above the emit stage is shared
+## untouched, so both modes emit the identical geometry — `_bulk_assemble` later reproduces the identical committed
+## surface (normals included) via the C++ create_from_arrays → generate_normals round trip (G-FR-BULK).
 func _emit_cached(st: SurfaceTool, fid: int, sunk: bool, from_worker: bool = false,
-		uncovered_true_on := CubeSphere.FP_FARRING_UNCOVERED_TRUE) -> int:
+		uncovered_true_on := CubeSphere.FP_FARRING_UNCOVERED_TRUE, bulk = null) -> int:
 	var pos: PackedVector3Array
 	var col: PackedColorArray
 	var cells := CELLS
@@ -4367,6 +4653,13 @@ func _emit_cached(st: SurfaceTool, fid: int, sunk: bool, from_worker: bool = fal
 		col = _col_cache[fid]
 	var stride := cells + 1
 	var n := 0
+	# FP_FARRING_BULK_EMIT (P3): a non-null parts collector diverts the emit STAGE (never the selection above) into
+	# the preallocated packed-array fill — identical vertices/colors/uvs in identical order, no per-vertex SurfaceTool
+	# call. null (the default, and always with the flag off) ⇒ the shipped emit below runs verbatim (byte-identical).
+	if bulk != null:
+		if CubeSphere.FP_BLOCKY_FARRING:
+			return _emit_blocky_bulk(bulk, pos, col, cells, stride, fid, CubeSphere.FP_BLOCKY_TEX and _tex_on())
+		return _emit_smooth_bulk(bulk, pos, col, cells, stride, fid)
 	# FP_BLOCKY_FARRING: emit flat-topped blocks instead of the smooth welded grid (same cached pos/col, so no-protrusion
 	# holds — the block top is the corner MIN ≤ the smooth surface). Off ⇒ the shipped smooth emit below (byte-identical).
 	# COSMOS TEXTURED-LOD T1 (§1.2): under FP_BLOCKY_TEX (∧ FP_FACET_TEX ∧ FP_SHELL_ABSOLUTE, i.e. _tex_on()) the blocky

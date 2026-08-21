@@ -315,6 +315,21 @@ const FP_FARRING_FAST_REBUILD := false
 ## rebuild. Default OFF → the synchronous path, byte-identical (FLAT stays 6035/0).
 const FP_FARRING_ASYNC_REBUILD := false
 
+## COSMOS FARRING-SWAP-DIET P3 (FP_FARRING_BULK_EMIT) — alloc-diet the async worker's mesh emit. The shipped worker
+## builds the whole visible cap (~790 facets / ~176k verts) through ~700k per-vertex SurfaceTool calls
+## (set_uv/set_color/add_vertex — each a GDScript→C++ round trip with per-call marshalling), an allocation-dense storm
+## that feeds the WASM dlmalloc single-lock convoy and starves the MAIN thread for the whole off-thread build. When
+## true, `_emit_cached` on the worker routes through `_emit_blocky_bulk`/`_emit_smooth_bulk`: the per-facet vertex
+## count is computed up front, the packed pos/col/uv arrays are resize()d ONCE and index-assigned (no per-vertex
+## append/alloc/VM call), and the merged cap runs the IDENTICAL C++ global normal smoothing via
+## SurfaceTool.create_from_arrays → generate_normals → commit_to_arrays (create_from_arrays is pure CPU ingest — NO
+## mesh RID, NO RenderingServer — worker-safe exactly like commit_to_arrays). The committed surface arrays are
+## BYTE-IDENTICAL to the SurfaceTool path — same vertices/colors/uvs in the same order and the same globally-smoothed
+## normals (verify_farring_emit / G-FR-BULK proves equality; the create_from_arrays round trip is bit-exact). Pure
+## emit-MECHANISM change: emit set, heights, sink, colours untouched. Default OFF → the shipped per-vertex SurfaceTool
+## worker emit verbatim (byte-identical, FLAT 6042/0).
+const FP_FARRING_BULK_EMIT := false
+
 ## COSMOS far-ring full coverage (docs/COSMOS-FARRING-COVERAGE-DESIGN.md) — the see-through-gap fix. The shipped far
 ## ring EXCLUDES the active facet + the live-pool neighbours (`_excluded`), so beyond the ~128-block near-blocky disk on
 ## those facets there is no far quad at all and the camera sees straight through to the opposite inner side of the globe

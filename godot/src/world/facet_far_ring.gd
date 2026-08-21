@@ -124,6 +124,7 @@ var _async_unsink_have_col := false
 # not every frame. Unused with the flag off.
 var _unsink_armed_col: Vector3 = Vector3.ZERO
 var _unsink_armed := false
+var _unsink_last_arm_ms := 0            # FP_UNSINK_DRIFT_CALM: wall-clock of the last SRC_UNSINK arm (fall-regime throttle)
 # COSMOS-NEAR-FAR-HEIGHT-DESIGN.md §3.2 (FP_FARRING_APPLIED_COVER): the probed scalar radius (blocks, quantized
 # to APPLIED_PROBE_STEP) to which the near voxel field is ACTUALLY APPLIED around the player column — the
 # coverage signal `_blend_uncovered`'s zone-C territory shrinks to (§3.1). Grown ≤1 ladder step/cadence tick on a
@@ -1755,10 +1756,21 @@ func _noblack_near_meshed(fid: int) -> bool:
 func _unsink_drift_check(on := CubeSphere.FP_FARRING_UNCOVERED_TRUE) -> void:
 	if not on or not _unsink_have_col:
 		return
+	# FP_UNSINK_DRIFT_CALM (orbit/fall smoothness): the un-sink pattern only alters the emit where the near field applies.
+	# Off-surface at orbit the backstop set is empty and _applied_r == 0, so a re-arm rebuilds byte-identical geometry —
+	# at 244 blk/s that is a full-cap rebuild + 20-43 ms main-thread swap EVERY frame. Suppress the arm when its output is
+	# provably unconsumed, and wall-clock-throttle the fall regime (SRC_UNSINK bypasses FP_SHELL_FALL_HOLD's axis throttle).
+	# Off ⇒ the two guards below are skipped ⇒ the shipped drift-only arm, byte-identical (the extra ms write is inert off).
+	if CubeSphere.FP_UNSINK_DRIFT_CALM:
+		if _shell_orbit() or (_applied_r <= 0.0 and not _emit_floored_last):
+			return
+		if _unsink_armed and (Time.get_ticks_msec() - _unsink_last_arm_ms) < CubeSphere.SHELL_FALL_REEMIT_MS:
+			return
 	if not _unsink_armed or _player_col_abs.distance_to(_unsink_armed_col) >= CubeSphere.UNSINK_DRIFT_BLOCKS:
 		_unsink_armed_col = _player_col_abs
 		_unsink_armed = true
-		_arm_pending(SRC_UNSINK)   # SAFETY: already ≥ UNSINK_DRIFT_BLOCKS drift-gated (rare)
+		_unsink_last_arm_ms = Time.get_ticks_msec()
+		_arm_pending(SRC_UNSINK)   # SAFETY: already ≥ UNSINK_DRIFT_BLOCKS drift-gated (rare on foot; calm-gated off-surface)
 
 ## COSMOS-NEAR-FAR-HEIGHT-DESIGN.md §3.2 (FP_FARRING_APPLIED_COVER): is a box of horizontal half-extent `r`,
 ## vertical half-extent `h`, centred on world point `col`, fully meshed by the near voxel field? Mirrors

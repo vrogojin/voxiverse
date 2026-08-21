@@ -2026,6 +2026,15 @@ const UNSINK_MARGIN_BLOCKS := 24
 ## only on the player's column (not on time, not on warm state), so it need not re-run every frame — only once
 ## the column has actually moved this far since the last emit (≤ 1 extra rebuild per this many blocks walked).
 const UNSINK_DRIFT_BLOCKS := 16
+## FP_UNSINK_DRIFT_CALM (orbit/fall smoothness) — the SRC_UNSINK re-arm in FacetFarRing._unsink_drift_check fires on every
+## UNSINK_DRIFT_BLOCKS(16) of column drift; at orbital speed (~244 blk/s) that is EVERY frame, keeping `_pending` armed so
+## the FP_SHELL_ORBIT_IDLE short-circuit never engages ⇒ a full-cap 176k-vert mesh rebuild + 20-43 ms main-thread swap
+## every frame, forever. But the un-sink pattern only affects the emit where the near field applies (applied_r>0 / floored
+## near-surface); at orbit the backstop set is empty and applied_r=0, so the rebuild output is PROVABLY invariant (24
+## consecutive byte-identical builds observed) — pure churn. This gate suppresses the arm when its output is unconsumed
+## (orbit, or applied_r≤0 and not floored) and wall-clock-throttles the fall regime to SHELL_FALL_REEMIT_MS. Off ⇒ the
+## shipped drift-only arm, byte-identical. The far-render is UNCHANGED — only redundant re-emits are dropped.
+const FP_UNSINK_DRIFT_CALM := false
 
 ## COSMOS-NEAR-FAR-HEIGHT-DESIGN.md §3 (FP_FARRING_APPLIED_COVER) — REFINES FP_FARRING_UNCOVERED_TRUE: that
 ## deployed un-sink proves a vertex unreachable by near mesh only OUTSIDE the *streamed-target* ellipsoid (128 +

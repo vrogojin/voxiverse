@@ -315,6 +315,41 @@ const FP_FARRING_FAST_REBUILD := false
 ## rebuild. Default OFF → the synchronous path, byte-identical (FLAT stays 6035/0).
 const FP_FARRING_ASYNC_REBUILD := false
 
+## COSMOS FARRING-SWAP-DIET P3 (FP_FARRING_BULK_EMIT) — alloc-diet the async worker's mesh emit. The shipped worker
+## builds the whole visible cap (~790 facets / ~176k verts) through ~700k per-vertex SurfaceTool calls
+## (set_uv/set_color/add_vertex — each a GDScript→C++ round trip with per-call marshalling), an allocation-dense storm
+## that feeds the WASM dlmalloc single-lock convoy and starves the MAIN thread for the whole off-thread build. When
+## true, `_emit_cached` on the worker routes through `_emit_blocky_bulk`/`_emit_smooth_bulk`: the per-facet vertex
+## count is computed up front, the packed pos/col/uv arrays are resize()d ONCE and index-assigned (no per-vertex
+## append/alloc/VM call), and the merged cap runs the IDENTICAL C++ global normal smoothing via
+## SurfaceTool.create_from_arrays → generate_normals → commit_to_arrays (create_from_arrays is pure CPU ingest — NO
+## mesh RID, NO RenderingServer — worker-safe exactly like commit_to_arrays). The committed surface arrays are
+## BYTE-IDENTICAL to the SurfaceTool path — same vertices/colors/uvs in the same order and the same globally-smoothed
+## normals (verify_farring_emit / G-FR-BULK proves equality; the create_from_arrays round trip is bit-exact). Pure
+## emit-MECHANISM change: emit set, heights, sink, colours untouched. Default OFF → the shipped per-vertex SurfaceTool
+## worker emit verbatim (byte-identical, FLAT 6042/0).
+const FP_FARRING_BULK_EMIT := false
+
+## COSMOS FARRING-SWAP-DIET P2 (FP_FARRING_SECTORS) — sector the cap, swap only dirty sectors. The shipped async path
+## swaps the WHOLE ~176k-vert cap ArrayMesh on the main thread (a measured 20–43 ms add_surface_from_arrays + RID
+## create) even when only a handful of facets changed (axis drift every ~6 s at orbit, floor crossings, warm-phase env
+## upgrades). When true, the cap is partitioned into 24 STATIC face-quadrant sectors (6 faces × 2×2 — a pure function
+## of fid, so membership never churns with the emit axis; ~12 populated per cap ⇒ ~+12 draws, trivial at draws≈36),
+## each its OWN MeshInstance3D child sharing the ONE shell material. Each async dispatch freezes a per-facet emit
+## SIGNATURE (role/cache/slot/limb/v2 state, plus the frozen unsink-column/applied/cull fingerprint for SUNK-emitting
+## facets) on the main thread; a sector is rebuilt+swapped ONLY if its membership or any member's signature differs
+## from what its resident mesh was built from — clean sectors stay resident, bounding the swap to the changed slice
+## (~3–5 ms). A facet emits into exactly ONE sector (partition — no double-emit, no gap; the union of sector meshes is
+## vertex-for-vertex the single cap mesh, G-FR-SECT proves it) and shared facet edges come from the same welded caches,
+## so sector borders weld exactly like facet welds. Worker env-warm still walks the FULL frozen set (converge law
+## unchanged); the sectored emit rides the P3 bulk collectors per sector. Total verts unchanged (NEVER-OOM: the same
+## cap, partitioned). Sync rebuilds (force_rebuild/boot) keep the shipped single mesh and invalidate all sectors.
+## Normals are smoothed per sector (the cross-SECTOR-border vertex-hash merge of the single-mesh generate_normals is
+## the one intentional difference — visually dead: the shell shader shades radially, never from NORMAL, for COLOR.a
+## ≥ 0.5 far-ring vertices). Default OFF → the shipped single-MeshInstance whole-swap path verbatim (byte-identical,
+## FLAT 6042/0).
+const FP_FARRING_SECTORS := false
+
 ## COSMOS far-ring full coverage (docs/COSMOS-FARRING-COVERAGE-DESIGN.md) — the see-through-gap fix. The shipped far
 ## ring EXCLUDES the active facet + the live-pool neighbours (`_excluded`), so beyond the ~128-block near-blocky disk on
 ## those facets there is no far quad at all and the camera sees straight through to the opposite inner side of the globe
@@ -1576,6 +1611,24 @@ const BG_FRAME_BUDGET_MS := 22.0      # ms: dispatch only when the last frame ha
 const BG_MAX_INFLIGHT_SURFACE := 1    # at most one background fine-tier bake task in flight while on-surface
 const BG_VIEWFIRST := true            # documents the (already-free) _next_fine_fid(emit_axis) view-cone-first order
 
+## PERF P4 (FP_BG_OFFSURF_CALM): extend the FP_BG_PREBAKE interactive throttle to the OFF-SURFACE fine-map
+## dispatch. Measured (live, fully-settled frozen orbit, far-ring rebuilds=0): ~7.8 hitches/s + a 292 ms proc
+## spike while `fm_baked` climbs 4-5/s — the whole-planet fine-map bakers running at ~100% duty on all _pbm_n
+## slots with NO frame-health gate (the `bg_frame_ms < BG_FRAME_BUDGET_MS` governor only guards the ON-surface
+## background path), saturating cores and starving the main thread (the WASM dlmalloc convoy). Under this flag,
+## when the last frame ran OVER the budget (the SAME `bg_frame_ms >= BG_FRAME_BUDGET_MS` signal the surface
+## gate already consumes — a real wall-clock delta from WorldManager, never a Performance monitor), NEW
+## off-surface fine-map dispatch is capped so total fine-mode in-flight stays <= BG_MAX_INFLIGHT_OFFSURF_BUSY
+## (enforced PER SLOT inside the dispatch loop, the same anti-burst pattern as the surface cap). Healthy frames
+## keep the full pool parallelism so the map still converges at speed when there is headroom. Smoothness beats
+## convergence: the same tasks bake, just paced — WHAT is baked and the NEVER-OOM byte caps are untouched, and
+## the busy cap is >= 1 (a single-baker floor, never 0) so the map always eventually finishes even under
+## sustained overload. Default FALSE ⇒ `bg_offsurf_calm` is always false, the off-surface dispatch loop is
+## exactly the shipped code — byte-identical, FLAT verify_feature 6042/0. Gate: verify_bg_prebake.gd
+## (G-BGP-OSCALM).
+const FP_BG_OFFSURF_CALM := false
+const BG_MAX_INFLIGHT_OFFSURF_BUSY := 1   # off-surface fine-map in-flight cap while the frame is over budget (>= 1: never starves)
+
 ## §2.1: re-request (worker-paced, replace-in-place) the S2 collar only once the player's frozen world column has
 ## drifted more than this many blocks since the last bake — never a per-frame rebake. The OLD tile keeps drawing
 ## until the NEW one commits (same make-before-break law as the backstop→S2 hand-off itself).
@@ -2026,6 +2079,15 @@ const UNSINK_MARGIN_BLOCKS := 24
 ## only on the player's column (not on time, not on warm state), so it need not re-run every frame — only once
 ## the column has actually moved this far since the last emit (≤ 1 extra rebuild per this many blocks walked).
 const UNSINK_DRIFT_BLOCKS := 16
+## FP_UNSINK_DRIFT_CALM (orbit/fall smoothness) — the SRC_UNSINK re-arm in FacetFarRing._unsink_drift_check fires on every
+## UNSINK_DRIFT_BLOCKS(16) of column drift; at orbital speed (~244 blk/s) that is EVERY frame, keeping `_pending` armed so
+## the FP_SHELL_ORBIT_IDLE short-circuit never engages ⇒ a full-cap 176k-vert mesh rebuild + 20-43 ms main-thread swap
+## every frame, forever. But the un-sink pattern only affects the emit where the near field applies (applied_r>0 / floored
+## near-surface); at orbit the backstop set is empty and applied_r=0, so the rebuild output is PROVABLY invariant (24
+## consecutive byte-identical builds observed) — pure churn. This gate suppresses the arm when its output is unconsumed
+## (orbit, or applied_r≤0 and not floored) and wall-clock-throttles the fall regime to SHELL_FALL_REEMIT_MS. Off ⇒ the
+## shipped drift-only arm, byte-identical. The far-render is UNCHANGED — only redundant re-emits are dropped.
+const FP_UNSINK_DRIFT_CALM := false
 
 ## COSMOS-NEAR-FAR-HEIGHT-DESIGN.md §3 (FP_FARRING_APPLIED_COVER) — REFINES FP_FARRING_UNCOVERED_TRUE: that
 ## deployed un-sink proves a vertex unreachable by near mesh only OUTSIDE the *streamed-target* ellipsoid (128 +
@@ -4049,6 +4111,20 @@ const MOVE_PROBE_CACHE_CAP := 512  # max cells memoized per epoch (NEVER-OOM: st
 ## is the URL param, never a default: no param ⇒ 0.25 s ⇒ the telemetry stream is wire-identical. Off ⇒ the
 ## parse branch is dead ⇒ byte-identical.
 const FP_TELEM_10HZ := false
+## FP_TELEM_LITE (PERF P5) — observer diet. The remote-bridge telemetry emitter runs on the MAIN thread and its
+## own build+send cost (`telem_ms` self-measurement) is 8–21 ms per emission at the default 4 Hz — up to ~4
+## hitch-scale bumps/second injected exactly while the relay observes (i.e. while the user is driving/testing).
+## ON: (a) the DEFAULT ambient cadence drops 4 Hz → 1 Hz unless an explicit `?telem=Nhz` override is present
+## (`?telem=4hz` restores the legacy rate; `?telem=10hz` still requires FP_TELEM_10HZ; `?telem=1hz` unchanged);
+## (b) the per-emission build is dieted — the `heap_mb` probe (a SYNCHRONOUS JS-bridge round-trip, the largest
+## single per-emit term per `eval_ms`) refreshes every 4th emission and serves the cached value between (heap
+## size is a slow NEVER-OOM trend, not a per-window signal), and the ~15 per-emission `has_method` capability
+## probes in the rich-state merge are memoized once per session; (c) two UNAMBIGUOUS fields are ADDED:
+## `frame_ms` (the real last-frame period in ms — the existing `frame_v` is SN2 nav VELOCITY and was misread
+## as frame time in a prior perf session) and `nav_v_bci` (explicit alias of `frame_v`; `frame_v` itself is
+## untouched — HUD/consumers read it). Every existing field keeps its name and meaning. OFF ⇒ byte-identical
+## stream (and FLAT never runs the bridge at all — telemetry only exists under an observed remote session).
+const FP_TELEM_LITE := false
 ## FP_AGENT_POSE (P1) — additive body-orientation telemetry. view_telemetry() gains the SCENE-frame body
 ## basis (fwd/right/up), camera right/up, velocity VECTOR + on_ground; a new player.orientation_telemetry()
 ## adds the BCI planet-local frame (up/north/east/fwd/pos + heading, keys suffixed _bci). Additive +

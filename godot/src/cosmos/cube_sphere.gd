@@ -2776,6 +2776,20 @@ static func approach_view_distance(d: float, full: float, lo: float) -> float:
 		return 0.0 if d >= ANCHOR_REL_HI else full
 	return full * clampf((ANCHOR_REL_HI - d) / (ANCHOR_REL_HI - lo), 0.0, 1.0)
 
+## COSMOS-FALL-STREAM-PACING §2.2 (FP_REENTRY_VIEW_RAMP) — bound the approach-anchor near-view RE-GROWTH on a
+## FAST DESCENT to ANCHOR_GROW_STEP blocks per debounced write, staging the near-field streaming demand over
+## many writes instead of one Δd-sized view_distance jump. At descent speed, d drops 10-50+ blocks between the
+## 100 ms anchor writes, so the shipped approach_view_distance ramp jumps view_distance by ~13-40+ blocks in
+## ONE write — godot_voxel then streams/meshes a whole new ellipsoid annulus at once (the measured alt≈700
+## stream 38 ms / phys 48.6 ms band, ANCHOR_REL_LO being 700). Pure static (headless-testable, the
+## approach_view_distance precedent; gate G-AVR-CLAMP). SHRINKING (ascent/release) is never clamped,
+## `last_vd < 0` (no write recorded yet) passes through, and with the flag off / not descending fast this is
+## the identity — byte-identical.
+static func anchor_grow_clamp(want_vd: int, last_vd: int, descending_fast: bool) -> int:
+	if not FP_REENTRY_VIEW_RAMP or not descending_fast or last_vd < 0 or want_vd <= last_vd:
+		return want_vd
+	return mini(want_vd, last_vd + ANCHOR_GROW_STEP)
+
 ## COSMOS ORBITAL O0 (docs/COSMOS-ORBITAL-DESIGN.md §4.4 / §11 O0) — the SKY master toggle. When true,
 ## main.gd builds a CosmosSky (Sun sphere + THE DirectionalLight + Moon impostor + star dome + a
 ## day-night environment ramp) driven by the pure f64 CosmosEphemeris kernel, and the planet gains a
@@ -4234,6 +4248,25 @@ const LAND_RAMP_HOLD_BLOCKS := 64.0   # near-view radius (blocks) held during th
 ## resume (byte-identical). Requires FP_ENV_FLOORED_ASYNC. Gate G-LAND-RAMP.
 const FP_ENV_RESUME_PACED := false
 const ENV_RESUME_MS := 300            # min ms between floored env-upgrade dispatches (the touchdown resume throttle)
+
+## COSMOS-FALL-STREAM-PACING (docs/COSMOS-FALL-STREAM-PACING-DESIGN.md, task #144) — the de-orbit fall
+## t_stream_us fix. §2.1 FP_STREAM_FALL_PACE: while the RADIAL descent rate exceeds STREAM_FALL_PACE_VY,
+## round-robin the three heavy update_streaming tail drivers (skin re-rank / facet-tex bake / G2 DEM step) so
+## at most ONE pays its cost on any frame — each still advances at ~20 Hz (a cadence, not a hold). The signal
+## is a NEW radial-altitude-rate EMA (WorldManager._stream_pace_update_rate): _radial_altitude_lattice is
+## continuous across facet flips/crossings, so only a teleport clamp is needed — the existing _fall_vy_ema is
+## unusable here because VEL_PREDICT_SPEED_CLAMP (40) rejects orbital plunge speeds as relocations. The
+## fall-through-critical tail steps (_update_alt_regime's re-entry release, _update_approach_anchor, the pool
+## manager, load-defer, flip-settle) are NEVER paced, and the paced drivers write no collision state (pinned
+## by gate G-SFP-FLOOR). Rate calm (walk / settled orbit / touchdown) ⇒ phase −1 ⇒ byte-identical. The
+## threshold sits above walk/jump vertical (~0-9 b/s, the ENV_FALL_HOLD_VY note) and below the SN-BRAKE
+## terminal speed (20), so pacing covers the alt≈70 surface-entry burst and releases only as landing arrests
+## the fall. §2.2 FP_REENTRY_VIEW_RAMP: see anchor_grow_clamp. Gate: verify_stream_fall_pace.gd.
+const FP_STREAM_FALL_PACE := false   # §2.1: round-robin the 3 heavy update_streaming tail drivers on fast descent
+const STREAM_FALL_PACE_VY := 15.0    # blocks/s radial descent rate that engages pacing (walk/jump ≈ 0-9; SN-BRAKE terminal 20)
+const STREAM_PACE_RATE_CLAMP := 2000.0  # reject |alt-rate| samples above this (a set_alt/teleport relocation, not motion)
+const FP_REENTRY_VIEW_RAMP := false  # §2.2: bounded-step near-view re-growth while descending fast (anchor_grow_clamp)
+const ANCHOR_GROW_STEP := 8          # max view_distance growth (blocks) per debounced anchor write on fast descent
 
 const M5C_CORNER := false        # master M5c toggle — default OFF: shipped build unchanged
 const M5C_TELEPORT := true       # true = §5 anomaly teleport; false = §8 energy barrier

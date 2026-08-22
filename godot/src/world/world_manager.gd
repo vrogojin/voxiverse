@@ -230,6 +230,16 @@ var _dbg_tail_runs := 0                 # FP_STREAM_TICK_ONCE gate: cumulative o
 func debug_tail_runs() -> int: return _dbg_tail_runs
 func debug_set_tail_frame(f: int) -> void: _stream_tail_frame = f   # gate-only: simulate a render-frame change (get_process_frames advances)
 
+# COSMOS-FALL-STREAM-PACING gate hooks (verify_stream_fall_pace.gd — the debug_set_tail_frame precedent above;
+# no live caller). Headless wall-clock deltas are sub-ms, so a synthetic descent cannot drive the estimator to
+# a plausible rate — the gate forces one (frozen against the estimator) and asserts the round-robin off it.
+func debug_pace_runs() -> Dictionary:
+	return {"skin": _dbg_pace_skin, "tex": _dbg_pace_tex, "relief": _dbg_pace_relief}
+func debug_alt_rate() -> float: return _alt_rate_ema
+func debug_set_alt_rate(v: float, freeze: bool) -> void:
+	_alt_rate_ema = v
+	_alt_rate_frozen = freeze
+
 ## COSMOS-MOTION-PHYS §6.5 (FP_MOVE_PROBE_CACHE) A/B readback: since-last-read window counts of generated-branch
 ## queries and cache hits (the §6.5 accept ratio n_probe_hit/n_probe_cva ≥ 0.5), plus current epoch size. Reading
 ## resets the window so the telemetry sample reflects the last snapshot interval (motion vs rest read distinctly).
@@ -245,11 +255,31 @@ func gen_cache_stats() -> Dictionary:
 # fast descent. Position-based so it works in every locomotion regime (incl. the rails coast that zeroes velocity).
 var _fall_last_usec: int = -1
 var _fall_vy_ema: float = 0.0
+# COSMOS-FALL-STREAM-PACING §2.1 (FP_STREAM_FALL_PACE / FP_REENTRY_VIEW_RAMP): the RADIAL altitude-rate EMA
+# (blocks/s, negative = descending) — the pacing signal. Separate from _fall_vy_ema above, whose 40 b/s
+# VEL_PREDICT_SPEED_CLAMP rejects orbital plunge speeds; radial altitude is continuous across flips/crossings,
+# so only the generous STREAM_PACE_RATE_CLAMP teleport guard applies. Advanced by _stream_pace_update_rate,
+# only ever called under one of the two flags ⇒ all of this stays 0/-1 (dead state) with both flags off.
+var _alt_rate_ema: float = 0.0
+var _alt_rate_last_usec: int = -1
+var _alt_rate_last_alt: float = 0.0
+var _alt_rate_frozen := false           # gate-only (debug_set_alt_rate): hold a forced rate against the estimator
+var _pace_counter := 0                  # round-robin phase counter — advances only while pacing is engaged
+var _anchor_last_vd := -1               # FP_REENTRY_VIEW_RAMP: last view_distance written by _apply_approach_anchor
+var _dbg_pace_skin := 0                 # gate read-back: tail frames on which each paced driver was ALLOWED to run
+var _dbg_pace_tex := 0                  # (they advance every tail frame off-flag / at calm rate — the OFF/CALM arms)
+var _dbg_pace_relief := 0
 # T2f (docs/COSMOS-PERF-POSTPORT-DESIGN.md §3): per-consumer main-thread attribution. The WORST single-frame cost (usec)
 # of the snowfall fixed step + the load-controller tick since the last telemetry drain; RemoteBridge samples the max once
 # per window (take_perf_attrib) so the 0.5 s snowfall spike is attributed instead of folded anonymously into worst_ms.
 var _snow_us_max := 0
 var _ctrl_us_max := 0
+# COSMOS-FALL-STREAM-PACING §2.4: per-driver attribution for the update_streaming tail — the WORST single-frame
+# cost (usec) of the skin re-rank / facet-tex bake / G2 DEM step since the last telemetry drain (same contract
+# as _snow_us_max above). Lets the live A/B prove which driver dominated t_stream_us and that pacing removed it.
+var _skin_us_max := 0
+var _tex_us_max := 0
+var _relief_us_max := 0
 # CROSSING-FASTGEN obs-2 fix (3): the EMA'd player speed (blocks/s), measured from the inter-update position delta and
 # consumed ONLY under FP_VEL_PREDICT to lead the imminent promote/commit distances. Computed lazily inside its flag gate
 # in update_streaming, so with the flag off it stays 0 and this is a literal no-op (no behaviour change, no read path).
@@ -745,6 +775,34 @@ func _update_alt_regime(player_pos: Vector3) -> void:
 		if alt > CubeSphere.ATMO_TOP + CubeSphere.ALT_REGIME_REENTRY_PREP + CubeSphere.ALT_REGIME_HYST:
 			_alt_orbital = true           # FREEZE the near field (nothing near-field is on screen up here)
 
+## COSMOS-FALL-STREAM-PACING §2.1 — advance the RADIAL altitude-rate EMA (the pacing signal), once per
+## orchestration-tail frame, under FP_STREAM_FALL_PACE or FP_REENTRY_VIEW_RAMP (the FP_ENV_FALL_HOLD-or-
+## FP_LAND_RAMP_HOLD shared-signal pattern). Radial altitude (_radial_altitude_lattice) is continuous across
+## facet flips/crossings — a per-sample |rate| above STREAM_PACE_RATE_CLAMP is a set_alt/teleport relocation,
+## not motion, and is rejected (the sample still re-anchors the latch so ONE bad frame never poisons the next).
+## The gate's debug_set_alt_rate freeze suppresses the whole step so a forced rate survives headless sub-ms
+## wall-clock deltas. Never called with both flags off ⇒ byte-identical.
+func _stream_pace_update_rate(player_pos: Vector3) -> void:
+	if _alt_rate_frozen:
+		return
+	var alt := _radial_altitude_lattice(player_pos)
+	var nowu := Time.get_ticks_usec()
+	if _alt_rate_last_usec >= 0:
+		var dt := float(nowu - _alt_rate_last_usec) / 1.0e6
+		if dt > 0.0:
+			var r := (alt - _alt_rate_last_alt) / dt
+			if absf(r) < CubeSphere.STREAM_PACE_RATE_CLAMP:
+				_alt_rate_ema = lerpf(_alt_rate_ema, r, 0.3)
+	_alt_rate_last_usec = nowu
+	_alt_rate_last_alt = alt
+
+## True while the estimator reads a FAST DESCENT (radial rate below −STREAM_FALL_PACE_VY). Both consumers —
+## the §2.1 round-robin phase and the §2.2 anchor grow-clamp — read this one predicate. A settled orbit has
+## ~0 radial rate (its 569 b/s is horizontal and never enters the signal), so both stay dormant there; with
+## both flags off _alt_rate_ema is never written and this is a constant false (byte-identical).
+func _pace_descending() -> bool:
+	return _alt_rate_ema < -CubeSphere.STREAM_FALL_PACE_VY
+
 ## COSMOS SEAMLESS-TRANSITION S1 (FP_APPROACH_ANCHOR, §3.1/§3.2) — the ground-anchored viewer + τ-timed release,
 ## driven once per streaming tick from update_streaming. `h` is the SAME analytic altitude the regime ladder uses
 ## (_radial_altitude_lattice → radius − R_BLOCKS; NEVER the voxel buffer — collision/floor queries are untouched).
@@ -770,7 +828,11 @@ func _update_approach_anchor(player_pos: Vector3) -> void:
 ## The compute+apply core shared by the debounced driver and the verify hook (approach_anchor_step_now). Advances the
 ## release-latch hysteresis, computes the anchor offset + release view_distance from the analytic altitude, and pushes
 ## both to the single player VoxelViewer. Pure w.r.t. gameplay — it only mutates the viewer node (render/streaming).
-func _apply_approach_anchor(player_pos: Vector3) -> void:
+## `bypass_ramp` (COSMOS-FALL-STREAM-PACING §2.2): the DIRECT callers — approach_anchor_step_now's teleport/settle
+## path and the verify hook — must restore the view immediately rather than stage it, so they pass true and
+## CubeSphere.anchor_grow_clamp becomes the identity regardless of descent rate. The debounced per-tick driver
+## (_update_approach_anchor) passes the default false, so a genuine fast descent stages the growth.
+func _apply_approach_anchor(player_pos: Vector3, bypass_ramp: bool = false) -> void:
 	var h := _radial_altitude_lattice(player_pos)   # the regime-ladder altitude (analytic; never the voxel buffer)
 	# COSMOS SUMMIT-STREAM S1 (FP_SUMMIT_STREAM, docs/COSMOS-SUMMIT-STREAM-PRIORITY-DESIGN.md §S1): the anchor/release
 	# input must be height above the LOCAL GROUND under the player, not radial altitude above the datum sphere. Shipped
@@ -799,6 +861,12 @@ func _apply_approach_anchor(player_pos: Vector3) -> void:
 	var full := float(TerrainConfig.near_render_radius())
 	var view_f := CubeSphere.approach_view_distance(d, full, lo)
 	var near_vd := int(round(view_f))
+	# COSMOS-FALL-STREAM-PACING §2.2 (FP_REENTRY_VIEW_RAMP): stage the near-view RE-GROWTH to ANCHOR_GROW_STEP
+	# blocks per write while descending fast — identity (want_vd unchanged) when bypassed, calm, shrinking, or
+	# the flag is off. `_anchor_last_vd` is the ONE state this reads/writes, so every caller (debounced tick or
+	# a bypassed direct jump) sees the true last-written view_distance.
+	near_vd = CubeSphere.anchor_grow_clamp(near_vd, _anchor_last_vd, (not bypass_ramp) and _pace_descending())
+	_anchor_last_vd = near_vd
 	_module_world.call("set_approach_anchor", offset_y, near_vd)
 	# COSMOS SEAMLESS-TRANSITION S1↔L1 rim coupling (SEAMLESS-SCALES §4): drive the L1 megablock ring's EFFECTIVE
 	# engagement rim from the SAME near view_distance just written to the viewer, so as S1 shrinks the near field below
@@ -811,13 +879,15 @@ func _apply_approach_anchor(player_pos: Vector3) -> void:
 
 ## FP_APPROACH_ANCHOR verify hook (verify_approach_anchor.gd — no live caller): run one compute+apply immediately,
 ## bypassing the wall-clock debounce (headless ticks are sub-ms apart). Gated exactly like the driver so an OFF build
-## is a no-op. Mirrors the module's pool_ramp_tick test-hook pattern.
+## is a no-op. Mirrors the module's pool_ramp_tick test-hook pattern. Also the DIRECT anchor path (dev_reanchor_near's
+## teleport/settle jump) — bypass_ramp := true so a fast-descent view-growth clamp never delays a teleport's restore
+## (COSMOS-FALL-STREAM-PACING §2.2; STREAM-SETTLE already holds the player until near_column_meshed).
 func approach_anchor_step_now(player_pos: Vector3) -> void:
 	if not CubeSphere.FP_APPROACH_ANCHOR or not CubeSphere.FACETED:
 		return
 	if not using_module or _module_world == null or not _module_world.has_method("set_approach_anchor"):
 		return
-	_apply_approach_anchor(player_pos)
+	_apply_approach_anchor(player_pos, true)
 
 ## COSMOS STREAM-SETTLE (feat/voxiverse-stream-settle) — the dev teleport / fast-travel RE-ANCHOR. A dev
 ## _dev_reposition sets the active facet + player pose, but the near field (the godot_voxel VoxelViewer's terrain)
@@ -1315,11 +1385,24 @@ func update_streaming(player_pos: Vector3) -> void:
 	# maybe_cross_facet freeze sites read it). Above the ATMO_TOP gate this flips `_alt_orbital` true (freeze the near
 	# field); on descent back through it, arms the one-shot re-entry restore. No-op / byte-identical with the flag off.
 	_update_alt_regime(player_pos)
+	# COSMOS-FALL-STREAM-PACING §2.1: advance the radial altitude-rate EMA BEFORE the approach anchor below reads
+	# _pace_descending() for its §2.2 grow-clamp. Shared by both flags (the ENV_FALL_HOLD/LAND_RAMP_HOLD pattern);
+	# never runs with both off (byte-identical).
+	if CubeSphere.FP_STREAM_FALL_PACE or CubeSphere.FP_REENTRY_VIEW_RAMP:
+		_stream_pace_update_rate(player_pos)
 	# COSMOS SEAMLESS-TRANSITION S1 (FP_APPROACH_ANCHOR): keep the meshed near plate anchored to the sub-player ground
 	# during a climb and release it rim-inward only once its blocks are sub-τ on screen. Debounced viewer offset +
 	# view_distance writes; no-op / byte-identical with the flag off. Runs after the alt regime so the freezes above
 	# ATMO_TOP stay authoritative (the released plate is empty up there anyway).
 	_update_approach_anchor(player_pos)
+	# COSMOS-FALL-STREAM-PACING §2.1: while plunging, pick this tail frame's round-robin phase — exactly ONE of the
+	# three heavy drivers below (0 = skin, 1 = facet-tex, 2 = DEM) pays its cost per frame; the rest of the tail
+	# (regime latch + anchor above, the far-ring callables, pool manage, load-defer, flip-settle below) is NEVER
+	# paced. −1 (flag off, or rate calm — walking, settled orbit, touchdown) ⇒ every driver runs (byte-identical).
+	var _pace_phase := -1
+	if CubeSphere.FP_STREAM_FALL_PACE and _pace_descending():
+		_pace_counter = (_pace_counter + 1) % 3
+		_pace_phase = _pace_counter
 	# COSMOS SEAMLESS-SCALES C3: schedule the skin tiles around the player (nearest-first, evict-farthest,
 	# 8 MB-capped). player_pos is in the active facet lattice (the frame the pool works in). Candidate
 	# facets = active + live-pool neighbours. No-op unless FP_SKIN_TIER created the node.
@@ -1330,9 +1413,16 @@ func update_streaming(player_pos: Vector3) -> void:
 	var cover_query := Callable()
 	if using_module and _module_world != null and _module_world.has_method("skin_near_meshed"):
 		cover_query = Callable(_module_world, "skin_near_meshed")
-	if _skin != null:
-		# hand the skin the coverage query so it can drop tiles wholly behind confirmed-meshed near voxels (fill overdraw).
-		_skin.call("update", TerrainConfig.active_facet(), player_pos, _skin_candidate_fids(), cover_query)
+	# COSMOS-FALL-STREAM-PACING §2.1 phase 0 — the skin's full candidate re-rank + coverage probes, re-paid every
+	# frame while the centre moves. Paced to 1-in-3 tail frames during a plunge; tiles persist across skipped
+	# frames (a scheduling skip, not an evict). The cheap far-ring callable plumbing below stays every-frame.
+	if _pace_phase < 0 or _pace_phase == 0:
+		_dbg_pace_skin += 1
+		if _skin != null:
+			# hand the skin the coverage query so it can drop tiles wholly behind confirmed-meshed near voxels (fill overdraw).
+			var _t_skin := Time.get_ticks_usec()
+			_skin.call("update", TerrainConfig.active_facet(), player_pos, _skin_candidate_fids(), cover_query)
+			_skin_us_max = maxi(_skin_us_max, Time.get_ticks_usec() - _t_skin)
 	# COSMOS TEXTURED-LOD U2 (FP_FARRING_CULL_COVERED): hand the far ring the SAME coverage query so it stops emitting
 	# backstop cells the near field fully covers. No-op / inert unless the flag is on and the callable is valid.
 	if _facet_ring != null and _facet_ring.has_method("set_cover_query"):
@@ -1385,7 +1475,15 @@ func update_streaming(player_pos: Vector3) -> void:
 	# see THE HARD PERF CONSTRAINT); when the close-up slot map changes (epoch bump) push it + the reverse-map to the
 	# ring (which re-emits so UV2.y carries the new slots) and bind the close-up texture the first time it exists. No-op
 	# unless FP_FACET_TEX && FP_SHELL_ABSOLUTE created the baker (byte-identical off).
-	if _facet_tex != null and _facet_ring != null:
+	# COSMOS-FALL-STREAM-PACING §2.1 phase 1 — the baker's budget is checked BEFORE each unit and the V4 SSE law
+	# re-tiers continuously as cam_dist shrinks on a descent, so the ~5-10 ms spend recurs every frame. Paced to
+	# 1-in-3 tail frames during a plunge; the slot/band epoch pushes only ever change inside update(), so skipping
+	# the whole block keeps them consistent. (Side effect: _bg_frame_ms then measures a ~3-frame delta → the
+	# FP_BG_PREBAKE governor reads "no headroom" and background fine bakes self-suppress during the plunge.)
+	if _pace_phase < 0 or _pace_phase == 1:
+		_dbg_pace_tex += 1
+	if (_pace_phase < 0 or _pace_phase == 1) and _facet_tex != null and _facet_ring != null:
+		var _t_tex := Time.get_ticks_usec()
 		var eaxis := _facet_ring.shell_emit_axis()
 		var offs: bool = _facet_ring.shell_offsurface()
 		# COSMOS TEXTURED-LOD V4 (§2V.2, FP_SKIN_SSE): the camera's scale-correct distance from the body centre so the baker's
@@ -1417,6 +1515,7 @@ func update_streaming(player_pos: Vector3) -> void:
 		if _facet_tex.band_epoch() != _tex_band_epoch:
 			_tex_band_epoch = _facet_tex.band_epoch()
 			_facet_ring.set_band_slots(_facet_tex.band_slots(), _facet_tex.band_facet_map(), _facet_tex.band_n_map())
+		_tex_us_max = maxi(_tex_us_max, Time.get_ticks_usec() - _t_tex)   # §2.4 attribution (tex_ms)
 	# docs/COSMOS-FAR-GEOMETRY-PREBAKE-DESIGN.md (task #99, G2): the SAME governed-pacer discipline as the
 	# texture prebake above, but its OWN frame-time measurement (independent of _facet_tex's existence -- G2
 	# must pace even when FP_FACET_TEX/FP_SHELL_ABSOLUTE are off). At most one facet bakes per call, nearest
@@ -1428,7 +1527,13 @@ func update_streaming(player_pos: Vector3) -> void:
 	_load_defer_tick(player_pos)
 	if CubeSphere.FP_LOAD_DEFER and _facet_ring != null and _facet_ring.has_method("set_stream_credit_ok"):
 		_facet_ring.set_stream_credit_ok(stream_load_credit() > 0.0)
-	if _relief_data != null and _facet_ring != null:
+	# COSMOS-FALL-STREAM-PACING §2.1 phase 2 — the G2 DEM want-list scan + governed bake. Paced to 1-in-3 tail
+	# frames during a plunge; the FP_DEM_DEFER settle latch just re-checks two frames later (one-shot, no state
+	# is lost across a skip).
+	if _pace_phase < 0 or _pace_phase == 2:
+		_dbg_pace_relief += 1
+	if (_pace_phase < 0 or _pace_phase == 2) and _relief_data != null and _facet_ring != null:
+		var _t_relief := Time.get_ticks_usec()
 		# FP_DEM_DEFER (docs/COSMOS-STREAM-PARALLEL-DESIGN.md Phase A — the fresh-reload fix): defer the whole-planet
 		# DEM bake until the near view has MESHED. During the load window the DEM's only on-surface consumer (the
 		# far-ring shade multiply) self-degrades to 1.0 for unbaked facets, so baking it early buys zero visible value
@@ -1449,6 +1554,7 @@ func update_streaming(player_pos: Vector3) -> void:
 		# surface it sweeps the rest of the planet (the near field is frozen, so there is headroom). Ignored off the flag.
 		var _g2_baked_fid := _relief_data.step(_facet_ring.shell_emit_axis(), _g2_frame_ms, _facet_ring.shell_offsurface())
 		_facet_ring.relief_baked(_g2_baked_fid)
+		_relief_us_max = maxi(_relief_us_max, Time.get_ticks_usec() - _t_relief)   # §2.4 attribution (relief_ms)
 	# FP-M1c (§4.3): drive the neighbour pool — spawn a facet when the player's own-side ridge distance drops
 	# below D_WARM, retire it past D_RETIRE (+ MIN_LIVE_S), ≤1 op/s, hard cap 1+4. Dormant unless FP_M1_POOL.
 	# COSMOS-PERF UNATTENDED R3: suspend the whole neighbour-pool manager (spawn/retire/imminent-select/ring-resync
@@ -3984,9 +4090,18 @@ func take_perf_attrib() -> Dictionary:
 		# (0.0 with the flag off / no lane). This is the number that must DROP as TH1+ move compute off main —
 		# it isolates the main-thread commit cost from the worker compute (which no longer sits on the frame).
 		"main_commit_ms": snappedf(_job_lane.take_main_commit_ms() if _job_lane != null else 0.0, 0.01),
+		# COSMOS-FALL-STREAM-PACING §2.4: the update_streaming tail's three heavy driver costs, unconditional
+		# (two ticks_usec reads per block — noise) like snow_ms above, so a live A/B can attribute which driver
+		# dominated t_stream_us and confirm FP_STREAM_FALL_PACE's round-robin removed it (≤ one hot per window).
+		"skin_ms": snappedf(float(_skin_us_max) / 1000.0, 0.01),
+		"tex_ms": snappedf(float(_tex_us_max) / 1000.0, 0.01),
+		"relief_ms": snappedf(float(_relief_us_max) / 1000.0, 0.01),
 	}
 	_snow_us_max = 0
 	_ctrl_us_max = 0
+	_skin_us_max = 0
+	_tex_us_max = 0
+	_relief_us_max = 0
 	return out
 
 ## path keeps the analytic far field as cover during the drop (full dual-window handoff is M4).

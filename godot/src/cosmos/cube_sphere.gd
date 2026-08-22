@@ -1629,6 +1629,34 @@ const BG_VIEWFIRST := true            # documents the (already-free) _next_fine_
 const FP_BG_OFFSURF_CALM := false
 const BG_MAX_INFLIGHT_OFFSURF_BUSY := 1   # off-surface fine-map in-flight cap while the frame is over budget (>= 1: never starves)
 
+## PERF P7a (FP_PREBAKE_COAST_CAP): the PROACTIVE twin of FP_BG_OFFSURF_CALM. Live analysis of the residual orbit
+## hitches (fresh clean-browser telemetry, whole-planet fine-map grinding): the worst frames cluster where
+## `fm_baked` is LOW (grind in progress) with `bg_inflight` ~1.9 and `proc_ms` broadly elevated (91 vs 25 median) —
+## the classic memory-bandwidth convoy: while N bakers grind 4096-column tiles, ALL main-thread work slows
+## proportionally (t_stream/t_nav/t_sky all ~2-3x). P4 only caps REACTIVELY (after an over-budget frame), so a
+## healthy frame refills the pool to _pbm_n and the NEXT frame hitches — an oscillation. This flag caps total
+## off-surface fine-mode in-flight to BG_MAX_INFLIGHT_OFFSURF_BUSY (=1) UNCONDITIONALLY off-surface (no
+## bg_frame_ms gate) ⇒ a steady single baker instead of a 1↔4 sawtooth: minimal, non-oscillating convoy. Trades
+## fill SPEED for smoothness (the user's stated preference: low fps > jerkiness); the same tiles bake, just
+## serialised, and the busy floor is still >= 1 so the map always finishes. Default FALSE ⇒ inert (the off-surface
+## dispatch is exactly P4/shipped) — byte-identical, FLAT 6042/0. Gate: verify_prebake_scope.gd (G-PBS-COAST).
+const FP_PREBAKE_COAST_CAP := false
+
+## PERF P7b (FP_PREBAKE_VIEW_SCOPE): SCOPE the whole-planet fine sweep to the visible near hemisphere. `_next_fine_fid`
+## bakes the most view-aligned un-baked facet first but has NO cutoff — it grinds all 6·K² (~3456) facets INCLUDING
+## the ~half that are on the FAR side of the planet, permanently OCCLUDED by the planet body (can never be seen from
+## the current position). Baking them is pure convoy cost for zero pixels. Under this flag, off-surface with a valid
+## view axis, `_next_fine_fid` skips any facet whose centre-direction·axis < PREBAKE_SCOPE_DOT and returns -1 once
+## the in-cone set is covered (never falling through to the whole-planet cursor sweep) ⇒ the grind ENDS at cone
+## coverage and steady-state bakers → 0 (smooth). As the view moves (orbit), facets crossing the threshold bake
+## on approach — the same on-demand behaviour the band tier already has. PREBAKE_SCOPE_DOT = 0.0 is the SAFE default
+## (near hemisphere: the visible cap is a strict subset, so NO base ever shows in view; only the occluded backside
+## is dropped) — can be tightened toward the true horizon cap (higher dot) via live A/B for a shorter grind. Default
+## FALSE ⇒ `_next_fine_fid` and the fine_pending sentinel are the shipped whole-planet logic — byte-identical,
+## FLAT 6042/0. Gate: verify_prebake_scope.gd (G-PBS-SCOPE / G-PBS-BACKSIDE).
+const FP_PREBAKE_VIEW_SCOPE := false
+const PREBAKE_SCOPE_DOT := 0.0            # centre-dir·view-axis cutoff; 0.0 = near hemisphere (occluded backside dropped)
+
 ## §2.1: re-request (worker-paced, replace-in-place) the S2 collar only once the player's frozen world column has
 ## drifted more than this many blocks since the last bake — never a per-frame rebake. The OLD tile keeps drawing
 ## until the NEW one commits (same make-before-break law as the backstop→S2 hand-off itself).

@@ -63,6 +63,8 @@ func _initialize() -> void:
 	_gate_pacing()
 	_gate_cpp_degrade()
 	_gate_offsurf_calm()
+	_gate_scope()
+	_gate_coast()
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
@@ -316,7 +318,9 @@ func _gate_offsurf_calm() -> void:
 		var n_hot2 := _occupied(b_hot)
 		_ok(n_hot2 <= CubeSphere.BG_MAX_INFLIGHT_OFFSURF_BUSY,
 			"G-BGP-OSCALM: a repeat over-budget call holds total in-flight <= the busy cap (got %d)" % n_hot2)
-	else:
+	elif not CubeSphere.FP_PREBAKE_COAST_CAP:
+		# (PERF P7a FP_PREBAKE_COAST_CAP ALSO caps off-surface dispatch, proactively — when it is on, the "full
+		# pool" byte-off expectation for OSCALM no longer holds; G-PBS-COAST validates that cap in its own config.)
 		_ok(n_hot == b_hot._pbm_n,
 			"G-BGP-OSCALM byte-off: FP_BG_OFFSURF_CALM=false — an over-budget off-surface frame still fills EVERY free slot (shipped full parallelism, got %d/%d)" % [n_hot, b_hot._pbm_n])
 	b_hot._offsurface = false   # settle must be reap-only (see gate doc comment)
@@ -328,7 +332,71 @@ func _gate_offsurf_calm() -> void:
 	b_ok._pbm_tile_ok = false
 	b_ok._update_band_parallel(axis, true, 1.0)
 	var n_ok := _occupied(b_ok)
-	_ok(n_ok == b_ok._pbm_n,
-		"G-BGP-OSCALM: a HEALTHY off-surface frame fills the full pool (%d/%d) — flag %s" % [n_ok, b_ok._pbm_n, str(CubeSphere.FP_BG_OFFSURF_CALM)])
+	if not CubeSphere.FP_PREBAKE_COAST_CAP:
+		# (FP_PREBAKE_COAST_CAP proactively caps a healthy off-surface frame too — skip the full-pool check when it's on.)
+		_ok(n_ok == b_ok._pbm_n,
+			"G-BGP-OSCALM: a HEALTHY off-surface frame fills the full pool (%d/%d) — flag %s" % [n_ok, b_ok._pbm_n, str(CubeSphere.FP_BG_OFFSURF_CALM)])
 	b_ok._offsurface = false
 	_settle(b_ok, axis)
+
+## G-PBS-SCOPE / G-PBS-BACKSIDE (PERF P7b FP_PREBAKE_VIEW_SCOPE, self-describing on the CURRENT compiled value):
+## off-surface, _next_fine_fid must confine the sweep to the near hemisphere (centre-dir·axis >= PREBAKE_SCOPE_DOT).
+## ON: the picked facet is in-cone; once ALL in-cone facets are baked it returns -1 (never a backside facet), so the
+## grind ENDS at cone coverage. OFF: with only backside facets left unbaked it STILL returns one (whole-planet sweep)
+## — the falsifier proving the scope cutoff is what changes behaviour, not the fixture.
+func _gate_scope() -> void:
+	var fid := FacetAtlas.spawn_facet()
+	var b := _prime(fid, 1)
+	b._offsurface = true
+	var av := _centre_dir(fid)
+	var axis := [av.x, av.y, av.z]
+	var sdot := CubeSphere.PREBAKE_SCOPE_DOT
+	# Partition the planet by the cone cutoff.
+	var incone := []
+	var backside := []
+	for f in range(b._base_all):
+		if _centre_dir(f).dot(av) >= sdot:
+			incone.append(f)
+		else:
+			backside.append(f)
+	_ok(incone.size() > 0 and backside.size() > 0,
+		"G-PBS-SCOPE: fixture axis splits the planet into in-cone (%d) and occluded-backside (%d) facets" % [incone.size(), backside.size()])
+	# 1) the first pick is always in-cone (highest dot) regardless of flag (whole-planet also picks the nearest).
+	var first := b._next_fine_fid(axis)
+	_ok(first >= 0 and _centre_dir(first).dot(av) >= sdot,
+		"G-PBS-SCOPE: first pick %d is in-cone (dot=%.3f >= %.3f)" % [first, _centre_dir(first).dot(av) if first >= 0 else -9.0, sdot])
+	# 2) DISCRIMINATOR: mark every in-cone facet baked; leave the backside unbaked. Scope ON => -1 (sweep done);
+	#    scope OFF => the whole-planet cursor/axis sweep still returns a backside facet.
+	var b2 := _prime(fid, 1)
+	b2._offsurface = true
+	for f in incone:
+		b2._fine_baked[f] = true
+	var pick := b2._next_fine_fid(axis)
+	if CubeSphere.FP_PREBAKE_VIEW_SCOPE:
+		_ok(pick == -1,
+			"G-PBS-BACKSIDE: scope ON — in-cone fully baked, %d backside facets unbaked, _next_fine_fid returns -1 (grind ends, no backside bake)" % backside.size())
+	else:
+		_ok(pick >= 0 and _centre_dir(pick).dot(av) < sdot,
+			"G-PBS-BACKSIDE: scope OFF (byte-off) — whole-planet sweep still returns a backside facet %d (dot=%.3f < %.3f)" % [pick, _centre_dir(pick).dot(av) if pick >= 0 else 9.0, sdot])
+
+## G-PBS-COAST (PERF P7a FP_PREBAKE_COAST_CAP, self-describing): a HEALTHY off-surface frame (bg_ms below budget)
+## must dispatch at most BG_MAX_INFLIGHT_OFFSURF_BUSY fine tasks when the flag is ON (proactive single-baker),
+## vs the FULL pool when OFF (P4 only throttles reactively on an over-budget frame). n_slots>1 makes the cap visible.
+func _gate_coast() -> void:
+	var fid := FacetAtlas.spawn_facet()
+	var slots := 3
+	var b := _prime(fid, slots)
+	b._offsurface = true
+	b._pbm_tile_ok = false
+	var av := _centre_dir(fid)
+	var axis := [av.x, av.y, av.z]
+	b._update_band_parallel(axis, true, 1.0)   # healthy off-surface frame (1.0 ms << BG_FRAME_BUDGET_MS)
+	var n := _occupied(b)
+	if CubeSphere.FP_PREBAKE_COAST_CAP:
+		_ok(n <= CubeSphere.BG_MAX_INFLIGHT_OFFSURF_BUSY and n >= 1,
+			"G-PBS-COAST: COAST_CAP ON — a HEALTHY off-surface frame caps fine dispatch to %d (<= %d, >=1 floor)" % [n, CubeSphere.BG_MAX_INFLIGHT_OFFSURF_BUSY])
+	else:
+		_ok(n == b._pbm_n,
+			"G-PBS-COAST: COAST_CAP OFF (byte-off) — a healthy off-surface frame fills the full pool (%d/%d)" % [n, b._pbm_n])
+	b._offsurface = false
+	_settle(b, axis)

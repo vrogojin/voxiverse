@@ -1733,6 +1733,11 @@ func _next_fine_fid(axis: Array) -> int:
 	# find nothing — a permanent idle-CPU tax after convergence. Early-out the moment coverage is complete.
 	if _fine_baked.size() >= _base_all:
 		return -1
+	# PERF P7b (FP_PREBAKE_VIEW_SCOPE): off-surface with a valid view axis, bound the sweep to the near hemisphere
+	# (dt >= PREBAKE_SCOPE_DOT). The far side is occluded by the planet body, so those bakes are pure convoy cost —
+	# skip them and return -1 once the in-cone set is covered (no fall-through to the whole-planet cursor sweep).
+	# Off ⇒ `scope` false ⇒ the two guards below are inert and the fallback sweep runs — byte-identical to shipped.
+	var scope := CubeSphere.FP_PREBAKE_VIEW_SCOPE and _offsurface and axis.size() == 3
 	if axis.size() == 3:
 		var ax := float(axis[0]); var ay := float(axis[1]); var az := float(axis[2])
 		if ax * ax + ay * ay + az * az > 0.5:
@@ -1743,10 +1748,16 @@ func _next_fine_fid(axis: Array) -> int:
 					continue
 				var cd := _centre_pack[fid]
 				var dt := cd.x * ax + cd.y * ay + cd.z * az
+				if scope and dt < CubeSphere.PREBAKE_SCOPE_DOT:
+					continue                    # out-of-cone (occluded backside / beyond horizon margin)
 				if dt > best_d:
 					best_d = dt; best = fid
 			if best >= 0:
 				return best
+			if scope:
+				return -1                       # in-cone set fully baked → sweep done (no backside grind)
+	if scope:
+		return -1                               # scope on but axis invalid this frame → hold (resume when axis valid)
 	for k in range(_base_all):
 		var fid := (_fm_cursor + k) % _base_all
 		if not _fine_baked.has(fid) and not _pbm_inflight(fid):
@@ -1906,7 +1917,18 @@ func _update_band_parallel(emit_axis: Array = [], fine_pause_on := CubeSphere.FP
 	# expensive 174k-shot/facet bakes at mid-orbit were hogging both workers, starving the fine tier → the washed
 	# mid-orbit disc). Once the planet is fully fine-covered, the band gets the slots to sharpen close approach. Uses
 	# the size sentinel (no _next_fine_fid side-effect on _fm_cursor).
-	var fine_pending: bool = _fm_on and _fine_baked.size() < _base_all
+	# PERF P7b (FP_PREBAKE_VIEW_SCOPE): under scope the whole-planet size sentinel would stay true forever (the
+	# occluded backside never bakes) and permanently starve the band of slots. Derive `fine_pending` from a single
+	# scope-aware `_next_fine_fid` probe (reused for the first fine dispatch below via `_fine_next` so `_fm_cursor`
+	# advances once, not twice). Off ⇒ `_fine_next` stays the not-computed sentinel and the shipped size test runs —
+	# byte-identical (no early `_next_fine_fid` call, so `_fm_cursor` timing is unchanged).
+	var _fine_next := -2                         # -2 = not computed (non-scope path); >= -1 once probed under scope
+	var fine_pending: bool
+	if CubeSphere.FP_PREBAKE_VIEW_SCOPE and _fm_on:
+		_fine_next = _next_fine_fid(emit_axis)
+		fine_pending = _fine_next >= 0
+	else:
+		fine_pending = _fm_on and _fine_baked.size() < _base_all
 	# 2) dispatch idle slots to the next wanted band facets — ONLY when the fine coverage tier has nothing pending.
 	if not fine_pending:
 		for i in range(active):
@@ -1966,8 +1988,13 @@ func _update_band_parallel(emit_axis: Array = [], fine_pause_on := CubeSphere.FP
 		# unchanged when there's headroom. Enforced PER SLOT inside the loop below (sharing `bg_new` with the
 		# mutually-exclusive on-surface path — `_offsurface` differs) for the same anti-burst reason documented
 		# above. Off ⇒ `bg_offsurf_calm` is always false, both new checks are inert — byte-identical.
-		var bg_offsurf_calm := CubeSphere.FP_BG_OFFSURF_CALM and _offsurface \
-				and bg_frame_ms >= CubeSphere.BG_FRAME_BUDGET_MS
+		# PERF P7a (FP_PREBAKE_COAST_CAP): the PROACTIVE off-surface cap — engages the SAME per-slot
+		# BG_MAX_INFLIGHT_OFFSURF_BUSY ceiling as P4 but UNCONDITIONALLY off-surface (no `bg_frame_ms >= budget`
+		# gate), so the fine-map runs a steady single baker instead of P4's reactive 1↔_pbm_n sawtooth. Off ⇒
+		# reduces to exactly the P4 term (byte-identical when both flags off).
+		var bg_offsurf_calm := (CubeSphere.FP_BG_OFFSURF_CALM and _offsurface \
+				and bg_frame_ms >= CubeSphere.BG_FRAME_BUDGET_MS) \
+				or (CubeSphere.FP_PREBAKE_COAST_CAP and _offsurface)
 		if not fine_pause_on or _offsurface or bg_surface_pass:
 			var bg_new := 0   # NEW dispatches this call, under the governed (surface or calm) paths only
 			for i in range(active):
@@ -1982,7 +2009,15 @@ func _update_band_parallel(emit_axis: Array = [], fine_pause_on := CubeSphere.FP
 					# Off-surface over-budget frame: same per-slot total-in-flight cap, busy ceiling.
 					if _bg_inflight() + bg_new >= CubeSphere.BG_MAX_INFLIGHT_OFFSURF_BUSY:
 						break
-				var ff := _next_fine_fid(emit_axis)
+				# Reuse the scope-aware probe from the fine_pending test for the FIRST dispatch (so `_fm_cursor`
+				# advances once, not twice); subsequent slots recompute. `_fine_next == -2` = not probed (non-scope
+				# path) ⇒ always call _next_fine_fid — byte-identical to shipped.
+				var ff: int
+				if _fine_next >= -1:
+					ff = _fine_next
+					_fine_next = -2
+				else:
+					ff = _next_fine_fid(emit_axis)
 				if ff < 0:
 					break
 				var flc := PackedVector2Array()

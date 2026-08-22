@@ -1830,8 +1830,9 @@ func _drain_skin_stale(fid: int) -> void:
 
 ## COSMOS-BACKGROUND-PREBAKE (FP_BG_PREBAKE): count of fine-mode (_pbm_mode==1) tasks currently in flight
 ## across all slots — the governor's inflight cap. Off-surface this can legitimately be up to _pbm_n (full
-## parallelism, unchanged); on-surface under the flag it caps NEW dispatch to BG_MAX_INFLIGHT_SURFACE. Only
-## ever consulted under the flag (elsewhere dead-cheap: one pass over the small fixed _pbm_n slot array).
+## parallelism — unless FP_BG_OFFSURF_CALM holds NEW dispatch at BG_MAX_INFLIGHT_OFFSURF_BUSY while the frame
+## is over budget); on-surface under FP_BG_PREBAKE it caps NEW dispatch to BG_MAX_INFLIGHT_SURFACE. Only
+## ever consulted under the flags (elsewhere dead-cheap: one pass over the small fixed _pbm_n slot array).
 func _bg_inflight() -> int:
 	var n := 0
 	for i in range(_pbm_n):
@@ -1954,8 +1955,21 @@ func _update_band_parallel(emit_axis: Array = [], fine_pause_on := CubeSphere.FP
 		# to exactly the shipped `not fine_pause_on or _offsurface`, and the per-slot cap check never applies
 		# (both `else` branches below are unconstrained, matching shipped behaviour) — byte-identical.
 		var bg_surface_pass := CubeSphere.FP_BG_PREBAKE and bg_frame_ms < CubeSphere.BG_FRAME_BUDGET_MS
+		# PERF P4 (FP_BG_OFFSURF_CALM): the OFF-surface twin of the governor above. Off-surface the fine-map
+		# dispatch historically filled ALL `active` slots unconditionally — measured at a fully-settled frozen
+		# orbit as ~7.8 hitches/s + a 292 ms proc spike while fm_baked climbs 4-5/s (the bakers at ~100% duty
+		# starving the main thread). Under the flag, when the caller's last REAL frame delta ran over the SAME
+		# BG_FRAME_BUDGET_MS the surface gate consumes, cap total fine-mode in-flight to
+		# BG_MAX_INFLIGHT_OFFSURF_BUSY (>= 1: the reap above keeps draining, and once in-flight falls below the
+		# cap one new task always dispatches — a single-baker floor, so the map still finishes). Healthy frames
+		# (or bg_frame_ms 0.0 from a caller that doesn't measure) keep the full pool so convergence speed is
+		# unchanged when there's headroom. Enforced PER SLOT inside the loop below (sharing `bg_new` with the
+		# mutually-exclusive on-surface path — `_offsurface` differs) for the same anti-burst reason documented
+		# above. Off ⇒ `bg_offsurf_calm` is always false, both new checks are inert — byte-identical.
+		var bg_offsurf_calm := CubeSphere.FP_BG_OFFSURF_CALM and _offsurface \
+				and bg_frame_ms >= CubeSphere.BG_FRAME_BUDGET_MS
 		if not fine_pause_on or _offsurface or bg_surface_pass:
-			var bg_new := 0   # NEW dispatches this call, under the on-surface background path only
+			var bg_new := 0   # NEW dispatches this call, under the governed (surface or calm) paths only
 			for i in range(active):
 				if int(_pbm_fid[i]) >= 0:
 					continue
@@ -1963,6 +1977,10 @@ func _update_band_parallel(emit_axis: Array = [], fine_pause_on := CubeSphere.FP
 					# On-surface background path: stop once already-inflight + this call's new dispatches hits
 					# the cap, regardless of how many `active` slots are still free.
 					if _bg_inflight() + bg_new >= CubeSphere.BG_MAX_INFLIGHT_SURFACE:
+						break
+				if bg_offsurf_calm:
+					# Off-surface over-budget frame: same per-slot total-in-flight cap, busy ceiling.
+					if _bg_inflight() + bg_new >= CubeSphere.BG_MAX_INFLIGHT_OFFSURF_BUSY:
 						break
 				var ff := _next_fine_fid(emit_axis)
 				if ff < 0:
@@ -1990,7 +2008,7 @@ func _update_band_parallel(emit_axis: Array = [], fine_pause_on := CubeSphere.FP
 				_pbm_ny[i] = _fm_texels
 				_snap_slot(i, ff)   # FP_FT_SKIN_CHOP: freeze the chop snapshot for this bake (MAIN, pre-dispatch)
 				_pbm_task[i] = WorkerThreadPool.add_task(Callable(self, "_pbm_compute").bind(i), false, "finemap")
-				if fine_pause_on and not _offsurface:
+				if (fine_pause_on and not _offsurface) or bg_offsurf_calm:
 					bg_new += 1
 		# throttled sub-page upload (one 2.36 MB update_layer every ~15 frames — measured-equivalent to band uploads).
 		# Unconditional: flushes whatever is already baked even while the dispatch above is paused.

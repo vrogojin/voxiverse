@@ -24,6 +24,12 @@ extends SceneTree
 ##   G-BGP-CPP-DEGRADE with `_pbm_tile_ok=false` (module absent/refused), the background slot still
 ##                     dispatches via the GDScript path (no dead slot, no stall, no crash) and successfully
 ##                     bakes.
+##   G-BGP-OSCALM      PERF P4 (FP_BG_OFFSURF_CALM), self-describing on the CURRENT compiled flag value.
+##                     OFF: an off-surface OVER-budget frame still fills EVERY free slot (shipped full
+##                     parallelism — the byte-off arm). ON: an off-surface over-budget frame caps total
+##                     fine-mode in-flight at BG_MAX_INFLIGHT_OFFSURF_BUSY with a >=1 single-baker floor
+##                     (never 0 — the map still eventually finishes), while a HEALTHY off-surface frame
+##                     keeps the full pool (convergence speed untouched when there is headroom).
 ##
 ## RUN (sed FACETED + FP_BG_PREBAKE (+ FP_BG_PREBAKE_CPP for that arm) ON):
 ##   docker/engine/bin/godot.linuxbsd.editor.x86_64 --headless --path godot \
@@ -31,6 +37,8 @@ extends SceneTree
 ## Byte-off proof: re-run with ONLY FP_BG_PREBAKE sed'd back OFF (FACETED still ON) — G-BGP-OFF still
 ## passes (self-describing: it checks whatever the CURRENT compiled value is), and FLAT verify_feature
 ## must stay 6042/0.
+## G-BGP-OSCALM arms: run once with defaults (byte-off arm) and once with FP_BG_OFFSURF_CALM sed'd ON
+## (FACETED ON both times; FP_BG_PREBAKE is irrelevant to this gate).
 ## Exits 0 all-pass / 1 on any failure.
 
 const FA := preload("res://src/cosmos/facet_atlas.gd")
@@ -54,6 +62,7 @@ func _initialize() -> void:
 	_gate_budget()
 	_gate_pacing()
 	_gate_cpp_degrade()
+	_gate_offsurf_calm()
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
@@ -270,3 +279,56 @@ func _gate_cpp_degrade() -> void:
 	_drain(b, axis, true, 0.0)
 	_ok(b._fine_baked.size() > 0, "G-BGP-CPP-DEGRADE: the GDScript-fallback bake actually completes and commits (no stall, no crash)")
 	_settle(b, axis)
+
+## Count occupied parallel-bake slots (fine-mode in-flight-or-just-dispatched) — G-BGP-OSCALM helper.
+func _occupied(b: FacetTexBaker) -> int:
+	var n := 0
+	for i in range(b._pbm_n):
+		if int(b._pbm_fid[i]) >= 0:
+			n += 1
+	return n
+
+## G-BGP-OSCALM (PERF P4, FP_BG_OFFSURF_CALM): the OFF-surface calm governor, self-describing on the CURRENT
+## compiled flag value (independent of FP_BG_PREBAKE — the calm path rides the `_offsurface` arm of the
+## dispatch condition). The fixtures force `_pbm_tile_ok=false` (GDScript bake path, proven live by
+## G-BGP-CPP-DEGRADE) and flip `_offsurface=false` before settling so the settle reap-passes cannot dispatch
+## (on-surface + hot frame closes every dispatch arm) — otherwise an off-surface settle would legitimately
+## re-dispatch each round and never drain.
+func _gate_offsurf_calm() -> void:
+	var fid := FacetAtlas.spawn_facet()
+	var axis_v := _centre_dir(fid)
+	var axis := [axis_v.x, axis_v.y, axis_v.z]
+	var slots: int = CubeSphere.BG_MAX_INFLIGHT_OFFSURF_BUSY + 2   # spare slots prove the CAP, not "some slots were free"
+	var hot: float = CubeSphere.BG_FRAME_BUDGET_MS + 50.0
+
+	# --- over-budget frame, off-surface. ---
+	var b_hot := _prime(fid, slots)
+	b_hot._offsurface = true
+	b_hot._pbm_tile_ok = false
+	b_hot._update_band_parallel(axis, true, hot)
+	var n_hot := _occupied(b_hot)
+	if CubeSphere.FP_BG_OFFSURF_CALM:
+		_ok(n_hot >= 1 and n_hot <= CubeSphere.BG_MAX_INFLIGHT_OFFSURF_BUSY,
+			"G-BGP-OSCALM: over-budget off-surface frame caps in-flight to BG_MAX_INFLIGHT_OFFSURF_BUSY (%d) with a >=1 floor (got %d, %d slots free)" % [CubeSphere.BG_MAX_INFLIGHT_OFFSURF_BUSY, n_hot, slots])
+		# A second hot call must HOLD the cap (total in-flight, not just per-call new dispatch — a fast bake
+		# may legitimately have been reaped and replaced in between; the invariant is the TOTAL).
+		b_hot._update_band_parallel(axis, true, hot)
+		var n_hot2 := _occupied(b_hot)
+		_ok(n_hot2 <= CubeSphere.BG_MAX_INFLIGHT_OFFSURF_BUSY,
+			"G-BGP-OSCALM: a repeat over-budget call holds total in-flight <= the busy cap (got %d)" % n_hot2)
+	else:
+		_ok(n_hot == b_hot._pbm_n,
+			"G-BGP-OSCALM byte-off: FP_BG_OFFSURF_CALM=false — an over-budget off-surface frame still fills EVERY free slot (shipped full parallelism, got %d/%d)" % [n_hot, b_hot._pbm_n])
+	b_hot._offsurface = false   # settle must be reap-only (see gate doc comment)
+	_settle(b_hot, axis)
+
+	# --- healthy frame, off-surface: full pool regardless of the flag (convergence speed untouched). ---
+	var b_ok := _prime(fid, slots)
+	b_ok._offsurface = true
+	b_ok._pbm_tile_ok = false
+	b_ok._update_band_parallel(axis, true, 1.0)
+	var n_ok := _occupied(b_ok)
+	_ok(n_ok == b_ok._pbm_n,
+		"G-BGP-OSCALM: a HEALTHY off-surface frame fills the full pool (%d/%d) — flag %s" % [n_ok, b_ok._pbm_n, str(CubeSphere.FP_BG_OFFSURF_CALM)])
+	b_ok._offsurface = false
+	_settle(b_ok, axis)

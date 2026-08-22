@@ -1611,6 +1611,24 @@ const BG_FRAME_BUDGET_MS := 22.0      # ms: dispatch only when the last frame ha
 const BG_MAX_INFLIGHT_SURFACE := 1    # at most one background fine-tier bake task in flight while on-surface
 const BG_VIEWFIRST := true            # documents the (already-free) _next_fine_fid(emit_axis) view-cone-first order
 
+## PERF P4 (FP_BG_OFFSURF_CALM): extend the FP_BG_PREBAKE interactive throttle to the OFF-SURFACE fine-map
+## dispatch. Measured (live, fully-settled frozen orbit, far-ring rebuilds=0): ~7.8 hitches/s + a 292 ms proc
+## spike while `fm_baked` climbs 4-5/s — the whole-planet fine-map bakers running at ~100% duty on all _pbm_n
+## slots with NO frame-health gate (the `bg_frame_ms < BG_FRAME_BUDGET_MS` governor only guards the ON-surface
+## background path), saturating cores and starving the main thread (the WASM dlmalloc convoy). Under this flag,
+## when the last frame ran OVER the budget (the SAME `bg_frame_ms >= BG_FRAME_BUDGET_MS` signal the surface
+## gate already consumes — a real wall-clock delta from WorldManager, never a Performance monitor), NEW
+## off-surface fine-map dispatch is capped so total fine-mode in-flight stays <= BG_MAX_INFLIGHT_OFFSURF_BUSY
+## (enforced PER SLOT inside the dispatch loop, the same anti-burst pattern as the surface cap). Healthy frames
+## keep the full pool parallelism so the map still converges at speed when there is headroom. Smoothness beats
+## convergence: the same tasks bake, just paced — WHAT is baked and the NEVER-OOM byte caps are untouched, and
+## the busy cap is >= 1 (a single-baker floor, never 0) so the map always eventually finishes even under
+## sustained overload. Default FALSE ⇒ `bg_offsurf_calm` is always false, the off-surface dispatch loop is
+## exactly the shipped code — byte-identical, FLAT verify_feature 6042/0. Gate: verify_bg_prebake.gd
+## (G-BGP-OSCALM).
+const FP_BG_OFFSURF_CALM := false
+const BG_MAX_INFLIGHT_OFFSURF_BUSY := 1   # off-surface fine-map in-flight cap while the frame is over budget (>= 1: never starves)
+
 ## §2.1: re-request (worker-paced, replace-in-place) the S2 collar only once the player's frozen world column has
 ## drifted more than this many blocks since the last bake — never a per-frame rebake. The OLD tile keeps drawing
 ## until the NEW one commits (same make-before-break law as the backstop→S2 hand-off itself).

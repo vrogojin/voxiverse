@@ -1655,7 +1655,7 @@ const FP_PREBAKE_COAST_CAP := false
 ## FALSE ⇒ `_next_fine_fid` and the fine_pending sentinel are the shipped whole-planet logic — byte-identical,
 ## FLAT 6042/0. Gate: verify_prebake_scope.gd (G-PBS-SCOPE / G-PBS-BACKSIDE).
 const FP_PREBAKE_VIEW_SCOPE := false
-const PREBAKE_SCOPE_DOT := 0.0            # centre-dir·view-axis cutoff; 0.0 = near hemisphere (occluded backside dropped)
+const PREBAKE_SCOPE_DOT := 0.5            # centre-dir·view-axis cutoff; 0.5 = ~60° cone (covers the ~44° horizon cap at alt 2500 with margin; 0.0 = full near hemisphere)
 
 ## §2.1: re-request (worker-paced, replace-in-place) the S2 collar only once the player's frozen world column has
 ## drifted more than this many blocks since the last bake — never a per-frame rebake. The OLD tile keeps drawing

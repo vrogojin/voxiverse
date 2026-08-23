@@ -170,6 +170,14 @@ var _anchor_last_write_ms := -100000
 # it lands mid-grow); grounded/slow writes bypass the gate entirely, so a stale/high _anchor_last_vd can never
 # hard-wedge a stationary player.
 var _anchor_last_vd := -1
+# C-lite (COSMOS-FALL-CLITE §2): the freeze-independent descent latch, advanced once per debounced anchor write
+# from the analytic radial altitude (never _fall_vy_ema — §1: the EMA is speed-clamp frozen across the whole
+# de-orbit band). All inert (never written) unless FP_REENTRY_BACKLOG_GATE or FP_REENTRY_REGROW_DEFER ⇒
+# byte-identical off.
+var _reentry_prev_alt := 0.0
+var _reentry_prev_alt_ms := -1          # -1 = no baseline yet (first write only samples the baseline)
+var _reentry_descending := false
+var _reentry_calm_writes := 0
 # A1 CROSSING INSTRUMENTATION (#114): a bounded FIFO of per-crossing attribution records built in maybe_cross_facet
 # and drained by RemoteBridge (take_crossing_events) to publish over the telemetry socket. Only APPENDED on an actual
 # committed crossing (seconds apart), so it is normally empty and adds no per-frame cost; bounded so a drain-less
@@ -249,6 +257,15 @@ func gen_cache_stats() -> Dictionary:
 	_gen_cache_cva = 0
 	_gen_cache_hit = 0
 	return out
+
+## C-lite (COSMOS-FALL-CLITE §5.2f) A/B read-back: the descent-latch arming (rg_desc), its self-describing arming
+## revision (rg_rev — a served pck with rg_rev==2 has the freeze-independent latch, disambiguating it from the
+## measured-dead rev-1 falling_fast build), and the last-written near view_distance. Returns {} unless a reentry
+## flag is on ⇒ byte-identical telemetry, exactly like gen_cache_stats/fall_timing.
+func reentry_gate_stats() -> Dictionary:
+	if not (CubeSphere.FP_REENTRY_BACKLOG_GATE or CubeSphere.FP_REENTRY_REGROW_DEFER):
+		return {}
+	return {"rg_rev": CubeSphere.REENTRY_GATE_REV, "rg_desc": _reentry_descending, "rg_last_vd": _anchor_last_vd}
 # FP_ENV_FALL_HOLD: position-based downward-speed estimate (blocks/s, EMA) to pause the far-ring env-warm during a
 # fast descent. Position-based so it works in every locomotion regime (incl. the rails coast that zeroes velocity).
 var _fall_last_usec: int = -1
@@ -783,8 +800,8 @@ var _voxel_engine: Object = null
 ## COSMOS FALL-MESH-STALL (§3.1): the live godot_voxel GenerateBlock backlog (VoxelEngine.get_stats().tasks
 ## .generation), the closed-loop input reentry_admit_view gates growth on. Lazy cached-singleton lookup; returns 0
 ## when the engine/stat is unavailable (⇒ no throttle — reentry_admit_view degrades to want_vd verbatim, same as
-## flag-off). Called only under FP_REENTRY_BACKLOG_GATE AND while falling_fast (the airborne-only gate, §5 review
-## fix), at most once per debounced anchor write (≤10 Hz).
+## flag-off). Called only under FP_REENTRY_BACKLOG_GATE while descent-armed (C-lite §2: the freeze-independent
+## descent latch AND h > REENTRY_DESCENT_MIN_ALT), at most once per debounced anchor write (≤10 Hz).
 func _voxel_gen_backlog() -> int:
 	if _voxel_engine == null:
 		if Engine.has_singleton("VoxelEngine"):
@@ -795,6 +812,26 @@ func _voxel_gen_backlog() -> int:
 		return 0
 	var st: Dictionary = _voxel_engine.call("get_stats")
 	return int((st.get("tasks", {}) as Dictionary).get("generation", 0))
+
+## C-lite (COSMOS-FALL-CLITE §2.1): advance the freeze-independent descent latch from the analytic radial altitude.
+## Called only from _apply_approach_anchor (≤ ~10 Hz by the anchor debounce) and only under the reentry flags. vy_w
+## is Δ(radial altitude)/Δt between debounced writes — regime-independent, no EMA, no speed clamp; feeds the pure
+## reentry_descent_step latch. First call only samples the baseline (no rate yet).
+func _reentry_descent_tick(h: float) -> void:
+	var now_ms := Time.get_ticks_msec()
+	if _reentry_prev_alt_ms < 0:
+		_reentry_prev_alt = h
+		_reentry_prev_alt_ms = now_ms
+		return
+	var dt := float(now_ms - _reentry_prev_alt_ms) / 1000.0
+	if dt <= 0.0:
+		return
+	var vy_w := (h - _reentry_prev_alt) / dt
+	_reentry_prev_alt = h
+	_reentry_prev_alt_ms = now_ms
+	var r: Array = CubeSphere.reentry_descent_step(vy_w, _reentry_descending, _reentry_calm_writes)
+	_reentry_descending = r[0]
+	_reentry_calm_writes = r[1]
 
 ## The compute+apply core shared by the debounced driver and the verify hook (approach_anchor_step_now). Advances the
 ## release-latch hysteresis, computes the anchor offset + release view_distance from the analytic altitude, and pushes
@@ -831,22 +868,26 @@ func _apply_approach_anchor(player_pos: Vector3) -> void:
 	# hold the wanted view at the proven small landing disc instead of re-growing toward full early — most of that
 	# early growth is generated against the stale pre-restore facet designation and re-issued by the restore anyway.
 	# Off ⇒ view_f unchanged (byte-identical).
-	view_f = CubeSphere.reentry_hold_view(view_f, h, _fall_vy_ema < -CubeSphere.ENV_FALL_HOLD_VY)
+	# C-lite (COSMOS-FALL-CLITE §2.1): advance the freeze-independent descent latch from Δ(radial altitude) between
+	# debounced writes BEFORE both consumers, so the hold + the backlog gate below see this write's fresh latch.
+	# Inert unless a reentry flag is on ⇒ byte-identical off. NOT _fall_vy_ema (§1: speed-clamp frozen mid-fall).
+	if CubeSphere.FP_REENTRY_BACKLOG_GATE or CubeSphere.FP_REENTRY_REGROW_DEFER:
+		_reentry_descent_tick(h)
+	view_f = CubeSphere.reentry_hold_view(view_f, h, _reentry_descending)
 	var near_vd := int(round(view_f))
-	# COSMOS FALL-MESH-STALL (FP_REENTRY_BACKLOG_GATE, §3.1): govern the WRITTEN view growth by the live godot_voxel
-	# generation backlog — never open-loop by time/rate — so a re-entry can never flood the pool with the 6-7k-task
-	# annulus that starves the main thread (§1-§2). Shrink (ascent release) always passes untouched. Off ⇒ near_vd
-	# unchanged (byte-identical).
-	# Gated on `falling_fast` (the SAME airborne signal REGROW_DEFER uses, §3.2/§5 review): the 6-7k flood is an
-	# AIRBORNE fast-descent phenomenon only — during ordinary grounded/walking play the GLOBAL VoxelEngine backlog
-	# is routinely 1.5-2.8k (§1) even though nothing is flooding, so gating unconditionally would wedge a
-	# still-growing near view below full 128 indefinitely once landed (a silent walk-stall the A/B can't see, and
-	# with no reset on `_anchor_last_vd`, a latent hard-wedge if anything else sustains a high backlog while
-	# stationary). Restricting the gate to the fast-fall regime closes both: grounded/slow ⇒ bypassed ⇒ the view
-	# always reaches its full want; airborne fast fall ⇒ gated/paced exactly as designed.
-	if CubeSphere.FP_REENTRY_BACKLOG_GATE and _fall_vy_ema < -CubeSphere.ENV_FALL_HOLD_VY:
-		var backlog := _voxel_gen_backlog()
-		near_vd = CubeSphere.reentry_admit_view(_anchor_last_vd, near_vd, backlog)
+	# COSMOS FALL-MESH-STALL (FP_REENTRY_BACKLOG_GATE, §3.1 + COSMOS-FALL-CLITE §2-§3): govern the WRITTEN view growth
+	# by the live godot_voxel generation backlog — never open-loop by time/rate — so a re-entry can never flood the
+	# pool with the 6-7k-task annulus that starves the main thread (§1-§2). Under the flag growth is ALWAYS
+	# step-clamped (reentry_admit_view v2 — kills the touchdown jump-to-full cliff); the backlog HOLD applies only
+	# while descent-armed AND above h=128. That altitude floor is > the 112-block max terrain height, so a grounded
+	# player is STRUCTURALLY unwedgeable (backlog is routinely 1.5-2.8k while walking, but can block nothing on the
+	# ground) — this retires the walk-stall risk with an inequality, no airborne-regime signal. Arming is the
+	# freeze-independent descent latch (C-lite §1: the rev-1 `_fall_vy_ema < -ENV_FALL_HOLD_VY` gate was
+	# measured-dead — the EMA is speed-clamp frozen across the whole flood band). Off ⇒ near_vd unchanged (byte-identical).
+	if CubeSphere.FP_REENTRY_BACKLOG_GATE:
+		var armed := _reentry_descending and h > CubeSphere.REENTRY_DESCENT_MIN_ALT
+		var backlog := _voxel_gen_backlog() if armed else 0   # skip the stats call when un-armed
+		near_vd = CubeSphere.reentry_admit_view(_anchor_last_vd, near_vd, backlog, armed)
 	_anchor_last_vd = near_vd
 	_module_world.call("set_approach_anchor", offset_y, near_vd)
 	# COSMOS SEAMLESS-TRANSITION S1↔L1 rim coupling (SEAMLESS-SCALES §4): drive the L1 megablock ring's EFFECTIVE

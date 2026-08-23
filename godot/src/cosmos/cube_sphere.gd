@@ -2785,29 +2785,55 @@ static func approach_view_distance(d: float, full: float, lo: float) -> float:
 ## or descent rate (that was cc2ee78's miss, §4): growth is admitted only while the backlog has drained below
 ## REENTRY_GEN_BACKLOG_MAX, and then by at most REENTRY_GROW_STEP blocks per debounced anchor write, so no single
 ## gate-open write can emit more than one shell's worth of tasks. Shrink (ascent release) always passes untouched.
-## Review fix (adversarial review of c673e35): the gate is only CONSULTED by the wiring while `falling_fast`
-## (world_manager.gd _apply_approach_anchor, the same signal §3.2 uses) — the GLOBAL VoxelEngine generation backlog
-## is routinely 1.5-2.8k during ordinary grounded/walking play (§1) even though nothing is flooding, so an
-## unconditional gate would wedge a still-growing near view below full 128 indefinitely once landed (a silent
-## walk-stall the fps/vox_gen/hole A/B cannot see) and, with no reset on the last-written state, is a latent
-## hard-wedge risk if anything else sustains a high backlog while stationary. Restricting the CALL to the airborne
-## fast-descent regime — the only regime the 6-7k flood occurs in — closes both while leaving the pure law (the
-## real backstop: the backlog cap + step clamp below) untouched. Default OFF ⇒ reentry_admit_view returns want_vd
-## verbatim (byte-identical; FLAT stays 6042/0).
+## C-lite arming (docs/COSMOS-FALL-CLITE-DESIGN.md — arming REV 2). The rev-1 arming (only consult the gate while
+## `falling_fast` = _fall_vy_ema < -ENV_FALL_HOLD_VY) was MEASURED-DEAD: _fall_vy_ema's sole update rejects any
+## sample with per-tick 3-D speed ≥ VEL_PREDICT_SPEED_CLAMP (40 b/s), and a de-orbit runs 100-570 b/s across the
+## ENTIRE flood band, so falling_fast is stale-false exactly where the flood fires (live A/B: 1-of-4 fluke bind, 3
+## flooded ≥ baseline). C-lite arms on a freeze-INDEPENDENT descent latch (reentry_descent_step, from Δ of the
+## analytic radial altitude — no EMA, no speed clamp, no regime gate) AND restructures the law: growth is ALWAYS
+## step-clamped under the flag (kills the touchdown jump-to-full cliff), and the backlog HOLD applies ONLY while
+## descent-armed (the wiring also requires h > REENTRY_DESCENT_MIN_ALT=128 > 112 max terrain, so a grounded player
+## is STRUCTURALLY unwedgeable — retires the walk-stall risk without any regime signal). Default OFF ⇒
+## reentry_admit_view returns want_vd verbatim (byte-identical; FLAT stays 6042/0).
 const FP_REENTRY_BACKLOG_GATE := false
+const REENTRY_GATE_REV := 2            # arming revision (pck-dump self-description; rev 1 = dead falling_fast)
 const REENTRY_GEN_BACKLOG_MAX := 256   # max VoxelEngine tasks.generation admitting further view growth
 const REENTRY_GROW_STEP := 8           # max viewer view_distance growth (blocks) per debounced anchor write
+const REENTRY_DESCENT_VY_ON := 10.0    # engage latch: per-write radial rate ≤ −this (b/s); > any grounded rate
+const REENTRY_DESCENT_VY_OFF := 5.0    # release threshold (Schmitt band with VY_ON; no apoapsis/hover flap)
+const REENTRY_DESCENT_CALM_N := 3      # consecutive calm writes (~0.3 s) to release the latch
+const REENTRY_DESCENT_MIN_ALT := 128.0 # backlog-block only above this radial alt (> 112 max terrain ⇒ grounded
+                                       # backlog-wedge is structurally impossible)
+const REENTRY_DESCENT_VY_CLAMP := 2000.0 # reject a per-write rate above this as teleport/pause, not motion
 
-## Pure law (gate-testable): the next viewer view_distance given the last written one, the anchor law's want, and
-## the live generation backlog. Shrink always passes (ascent release unchanged). Growth admitted only while the
-## engine pool has drained below the cap, and then by at most REENTRY_GROW_STEP per write — so one gate-open write
-## can never emit a giant annulus.
-static func reentry_admit_view(last_vd: int, want_vd: int, gen_backlog: int) -> int:
+## Pure law v2 (gate-testable): the next viewer view_distance given the last written one, the anchor law's want, the
+## live generation backlog, and whether the descent latch is armed. Shrink/first-write pass verbatim. Growth is
+## ALWAYS step-clamped under the flag (≤ +REENTRY_GROW_STEP per write — closes the touchdown jump-to-full flood);
+## the backlog HOLD applies only when descent-armed AND the pool is saturated. A missed descent (false negative)
+## degrades to step-clamped growth (still ≤ one small annulus/write vs 6-7k); a spurious arm can HOLD nothing on
+## the ground because the wiring folds h > REENTRY_DESCENT_MIN_ALT into `descending`.
+static func reentry_admit_view(last_vd: int, want_vd: int, gen_backlog: int, descending: bool) -> int:
 	if not FP_REENTRY_BACKLOG_GATE or last_vd < 0 or want_vd <= last_vd:
 		return want_vd
-	if gen_backlog > REENTRY_GEN_BACKLOG_MAX:
+	if descending and gen_backlog > REENTRY_GEN_BACKLOG_MAX:
 		return last_vd
 	return mini(want_vd, last_vd + REENTRY_GROW_STEP)
+
+## C-lite (docs/COSMOS-FALL-CLITE-DESIGN.md §2/§3.3): one descent-latch step. Pure static so verify scripts drive it
+## headless with inline loops. Returns [descending: bool, calm_writes: int]. vy_w = Δ(radial altitude)/Δt per
+## debounced anchor write; engage on a single write ≤ −VY_ON, release after CALM_N sustained writes ≥ −VY_OFF, the
+## dead zone (−VY_ON, −VY_OFF) holds the latch (hysteresis), |vy_w| > VY_CLAMP = teleport/pause (keep latch, resample).
+static func reentry_descent_step(vy_w: float, descending: bool, calm_writes: int) -> Array:
+	if absf(vy_w) > REENTRY_DESCENT_VY_CLAMP:
+		return [descending, calm_writes]
+	if vy_w <= -REENTRY_DESCENT_VY_ON:
+		return [true, 0]
+	if vy_w >= -REENTRY_DESCENT_VY_OFF:
+		calm_writes += 1
+		if calm_writes >= REENTRY_DESCENT_CALM_N:
+			return [false, calm_writes]
+		return [descending, calm_writes]
+	return [descending, calm_writes]
 
 ## COSMOS FALL-MESH-STALL (§3.2 — FP_REENTRY_REGROW_DEFER). Everything the S1 re-growth law generates at alt
 ## 900→460 is issued against the PRE-restore facet designation (barely visible — the release ramp's own sub-τ
@@ -2823,12 +2849,12 @@ const REENTRY_REGROW_DEFER_ALT := 460.0  # radial alt above which a FAST descent
 const REENTRY_HOLD_VIEW := 64.0          # the held near view — LAND_RAMP_HOLD_BLOCKS' proven landing disc
                                          # (far-ring chords cover 64-128, hole=0 proven)
 
-## Pure law: clamp the anchor's wanted view to the landing disc while plunging fast above the defer altitude.
-## `falling_fast` = _fall_vy_ema < -ENV_FALL_HOLD_VY (the FP_ENV_FALL_HOLD / FP_LAND_RAMP_HOLD shared
-## position-based signal, world_manager.gd:1283-1296). Slow descents (vy < 20 b/s) never trigger it — they don't
-## flood either.
-static func reentry_hold_view(want_vd: float, alt: float, falling_fast: bool) -> float:
-	if not FP_REENTRY_REGROW_DEFER or not falling_fast or alt <= REENTRY_REGROW_DEFER_ALT:
+## Pure law: clamp the anchor's wanted view to the landing disc while descent-armed above the defer altitude.
+## `descending` = the C-lite freeze-independent descent latch (_reentry_descending, from Δ radial altitude — see
+## reentry_descent_step / COSMOS-FALL-CLITE §2), NOT the measured-dead _fall_vy_ema speed-clamped EMA. Ascent never
+## holds (latch false); slow descents that don't flood re-grow normally once below the defer altitude.
+static func reentry_hold_view(want_vd: float, alt: float, descending: bool) -> float:
+	if not FP_REENTRY_REGROW_DEFER or not descending or alt <= REENTRY_REGROW_DEFER_ALT:
 		return want_vd
 	return minf(want_vd, REENTRY_HOLD_VIEW)
 

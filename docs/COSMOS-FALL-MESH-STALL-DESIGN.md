@@ -154,6 +154,24 @@ being byte-identical in shape). Under the backlog gate, growth happens in **gate
 and the step clamp bounds each burst's annulus (~one data-block shell ≈ 100-150 blocks) so the
 backlog can overshoot `MAX` by at most one shell per live slot.
 
+**REVISION (adversarial review of c673e35, applied — the `falling_fast` gate):** the backlog is
+a *global* engine counter, not a re-entry-specific one — it reads 1.5-2.8k during ordinary
+grounded/walking play too (§1), which is already above `REENTRY_GEN_BACKLOG_MAX`. Consulting the
+gate unconditionally therefore wedges a still-growing near view below full 128 indefinitely
+whenever the player lands mid-grow (a silent walk-stall the fps/`vox_gen`/hole-under-player A/B
+in §7 cannot detect, since it only samples the alt 200-800 fall band) — and with no reset on
+`_anchor_last_vd`, a latent hard-wedge if any other subsystem sustains a high backlog while the
+player is stationary. Fix: the call site only *consults* the gate while
+`_fall_vy_ema < -CubeSphere.ENV_FALL_HOLD_VY` (the same `falling_fast` signal §3.2 uses) —
+`if CubeSphere.FP_REENTRY_BACKLOG_GATE and _fall_vy_ema < -CubeSphere.ENV_FALL_HOLD_VY: ...`.
+Grounded/slow writes bypass the gate entirely (the view always reaches its full want); airborne
+fast falls are gated/paced exactly as designed — the 6-7k flood is an airborne-fast-descent-only
+phenomenon (§0-§2), so this loses no coverage. The pure static `reentry_admit_view` itself is
+**unchanged** — it remains the real backstop (the backlog cap + step clamp above); only the
+wiring's *call condition* changed. `_apply_approach_anchor`'s vy-EMA compute gate (`:1283`,
+shared with `FP_ENV_FALL_HOLD`/`FP_LAND_RAMP_HOLD`/`FP_REENTRY_REGROW_DEFER`) is extended to also
+include `FP_REENTRY_BACKLOG_GATE`, so `_fall_vy_ema` exists when only this flag is on.
+
 ### 3.2 `FP_REENTRY_REGROW_DEFER` — don't re-grow high, land on the proven small disc
 
 Everything generated at alt 900→460 against the pre-restore facet designation is barely
@@ -184,18 +202,26 @@ Code sites:
   `h_eff` (SUMMIT_STREAM makes h_eff ground-relative; the defer threshold must align with the
   416 restore altitude).
 - `world_manager.gd:1283`: extend the vy-EMA compute gate to
-  `FP_ENV_FALL_HOLD or FP_LAND_RAMP_HOLD or FP_REENTRY_REGROW_DEFER` (the signal must exist
-  when only the new flag is on). Off ⇒ condition is the shipped expression (byte-identical).
+  `FP_ENV_FALL_HOLD or FP_LAND_RAMP_HOLD or FP_REENTRY_REGROW_DEFER or FP_REENTRY_BACKLOG_GATE`
+  (the signal must exist whenever EITHER new flag is on alone — the backlog gate's call site
+  now also reads `_fall_vy_ema`, see the 3.1 revision above). Off ⇒ condition is the shipped
+  expression (byte-identical).
 - Note `min(64, law)` only binds below d ≈ 755 (the law reaches 64 there) — which is exactly
   why 3.1 must also run above it: the 0→64 leg alone is ~0.8-1 k blocks, still ≥ 3× the gate cap.
 
 ### 3.3 Composition (both ON — the recommended config)
 
-alt > 900: viewer 0 (unchanged) → 900-460: growth capped at 64 AND backlog-gated/step-paced
-(≤ ~1 k total, in ≤256-task slices) → 416: regime restore + redesignation exactly as shipped
-(slot-driven, ungated, proven non-collapsing at ~1-1.6 k) → below 460 with the restore drained:
-gate-paced growth 64→128 (~2.4 k blocks in ≤256 slices, ~5-6 s at the measured ~490 blocks/s)
-→ touchdown with the landing-kick finishing on the ground (today's shipped behaviour).
+alt > 900: viewer 0 (unchanged) → 900-460: **while falling_fast**, growth capped at 64 AND
+backlog-gated/step-paced (≤ ~1 k total, in ≤256-task slices) → 416: regime restore +
+redesignation exactly as shipped (slot-driven, ungated, proven non-collapsing at ~1-1.6 k) →
+below 460 with the restore drained and still falling_fast: gate-paced growth 64→128 (~2.4 k
+blocks in ≤256 slices, ~5-6 s at the measured ~490 blocks/s) → touchdown, `falling_fast` clears
+(vy EMA relaxes above `-ENV_FALL_HOLD_VY`) ⇒ both new laws bypass and any remaining growth to
+full 128 completes unthrottled, exactly as shipped, with the landing-kick finishing on the
+ground (today's shipped behaviour). A player who lands or teleports mid-grow with a transiently
+high *global* backlog (e.g. from unrelated background streaming) is walking, not falling_fast ⇒
+the gate is never consulted ⇒ the view reaches full 128 like today — this is the review fix's
+whole point (§3.1 revision): the gate binds ONLY in the regime that actually floods.
 Worst-case backlog by construction ≈ `REENTRY_GEN_BACKLOG_MAX` + one step-annulus/slot +
 the untouched restore surge ≈ **≤ ~1.6 k, briefly** — the regime live data shows is
 non-collapsing — vs today's sustained 5.9-6.8 k.
@@ -224,6 +250,17 @@ non-collapsing — vs today's sustained 5.9-6.8 k.
 - The `_anchor_released` hysteresis latch is untouched (both laws clamp the *written* value).
 - Ascent is untouched (shrink always passes both laws).
 - NEVER-OOM: both laws only *reduce* requested residency; no new allocation.
+- **No walk-stall / hard-wedge (adversarial review of c673e35, applied):** the backlog gate's
+  call site now requires `falling_fast` (`_fall_vy_ema < -CubeSphere.ENV_FALL_HOLD_VY`) in
+  addition to the flag — the same signal 3.2 already gates on. Without this, the *global*
+  VoxelEngine generation backlog (routinely 1.5-2.8k during ordinary walking, §1) would hold
+  `reentry_admit_view` closed indefinitely for a grounded/walking player whose near view was
+  still below full 128 (e.g. landed mid-grow), silently capping it below 128 forever — invisible
+  to the §7 A/B, which only samples the alt 200-800 fall band, and with `_anchor_last_vd` never
+  reset, a latent hard-wedge if anything else sustains a high backlog while stationary. Gating
+  the *call* on `falling_fast` confines the throttle to the airborne fast-descent regime that
+  actually floods (§0-§2); grounded/slow writes always reach their full want, matching shipped
+  behaviour. Covered by `verify_reentry_pace.gd`'s **G-RP-GROUNDED** arm.
 
 ## 6. (f) Gate plan — `godot/src/tools/verify_reentry_pace.gd` (headless, self-describing)
 
@@ -242,6 +279,11 @@ Follows the `verify_approach_anchor.gd` pattern (pure-law asserts + a stubbed mo
   2 step-annuli and still reach full 128 by alt 0.
 - **G-RP-OFF**: flags off ⇒ the recorded `set_approach_anchor` (offset_y, vd) write sequence
   across an altitude sweep is byte-identical to shipped (the §3 laws return their inputs).
+- **G-RP-GROUNDED** (review fix, §3.1/§5): flags ON, `falling_fast == false` — the wiring's
+  call-site condition (mirrored script-locally, same treatment as G-RP-SWEEP) must BYPASS the
+  backlog gate entirely, so the written view reaches the full `want_vd` even with a modeled
+  backlog held well above `REENTRY_GEN_BACKLOG_MAX` throughout. Proves the walk-stall /
+  hard-wedge the review found cannot recur.
 - **FLAT gate**: `verify_feature.gd` must stay **6042/0** (flags off ⇒ byte-identical).
 
 ## 7. (g) Live A/B protocol (the correct fall methodology)

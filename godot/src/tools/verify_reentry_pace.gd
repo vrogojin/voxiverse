@@ -17,8 +17,8 @@ extends SceneTree
 ##     laws. Gracefully SKIPs (not a failure) when FP_APPROACH_ANCHOR is off or the module is absent — the pure-math
 ##     + mirror layers below fully pin the two laws regardless.
 ##
-## RUN — OFF arm (FACETED=true only; FP_REENTRY_* stay false): proves G-RP-LAW/-DEFER/-SWEEP (mirror-based, always
-## exercise the gated branches) + G-RP-OFF (real statics verbatim pass-through).
+## RUN — OFF arm (FACETED=true only; FP_REENTRY_* stay false): proves G-RP-LAW/-DEFER/-SWEEP/-GROUNDED
+## (mirror-based, always exercise the gated branches) + G-RP-OFF (real statics verbatim pass-through).
 ##   sed -i 's/const FACETED := false/const FACETED := true/' godot/src/cosmos/cube_sphere.gd
 ##   docker/engine/bin/godot.linuxbsd.editor.x86_64 --headless --path godot --script res://src/tools/verify_reentry_pace.gd
 ## RUN — ON arm (FACETED + both flags true): additionally proves the real statics MATCH the mirrors (the flag wiring
@@ -54,6 +54,16 @@ static func _mirror_hold(want_vd: float, alt: float, falling_fast: bool) -> floa
 		return want_vd
 	return minf(want_vd, CubeSphere.REENTRY_HOLD_VIEW)
 
+## Script-local mirror of the WIRING at world_manager.gd _apply_approach_anchor's backlog-gate call site
+## (review fix, §3.1/§5): `if CubeSphere.FP_REENTRY_BACKLOG_GATE and falling_fast: near_vd =
+## reentry_admit_view(...)` else near_vd is left as want_vd. Unlike `_mirror_admit` (which bypasses the flag to
+## exercise the pure law's branches), this uses the REAL compiled flag — it is testing the CALL CONDITION itself,
+## not the law body, so it must observe the actual const value.
+static func _mirror_wired_near_vd(last_vd: int, want_vd: int, gen_backlog: int, falling_fast: bool) -> int:
+	if CubeSphere.FP_REENTRY_BACKLOG_GATE and falling_fast:
+		return CubeSphere.reentry_admit_view(last_vd, want_vd, gen_backlog)
+	return want_vd
+
 ## Radial altitude (blocks above the sphere) of a lattice point in facet `fid`'s frame — the WorldManager metric
 ## (== _radial_altitude_lattice), mirrored from verify_approach_anchor.gd so the G-RP-OFF reference matches the
 ## driver's actual input to the tolerance the round() comparison needs (exact at the facet centre axis).
@@ -62,7 +72,7 @@ func _radial(fid: int, x: float, y: float, z: float) -> float:
 	return sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]) - FA.R_BLOCKS
 
 func _initialize() -> void:
-	print("=== verify_reentry_pace (FALL-MESH-STALL: G-RP-LAW/DEFER/SWEEP/OFF) ===")
+	print("=== verify_reentry_pace (FALL-MESH-STALL: G-RP-LAW/DEFER/SWEEP/OFF/GROUNDED) ===")
 	print("  flags: FP_REENTRY_BACKLOG_GATE=%s FP_REENTRY_REGROW_DEFER=%s FP_APPROACH_ANCHOR=%s FACETED=%s"
 		% [str(CubeSphere.FP_REENTRY_BACKLOG_GATE), str(CubeSphere.FP_REENTRY_REGROW_DEFER),
 		   str(CubeSphere.FP_APPROACH_ANCHOR), str(CubeSphere.FACETED)])
@@ -143,6 +153,36 @@ func _initialize() -> void:
 			if CubeSphere.reentry_admit_view(lv2, wv2, CubeSphere.REENTRY_GEN_BACKLOG_MAX * 5) != wv2:
 				wrapper_passthrough = false
 		_ok(wrapper_passthrough, "G-RP-LAW(wrapper, flag OFF): CubeSphere.reentry_admit_view returns want_vd verbatim regardless of backlog (byte-identical)")
+
+	# ---------------------------------------------------------------------------------------------------------------
+	# G-RP-GROUNDED (adversarial-review fix, §3.1/§5): the WIRING at world_manager.gd's backlog-gate call site only
+	# consults the gate while falling_fast — the global VoxelEngine generation backlog is routinely 1.5-2.8k during
+	# ordinary walking (§1), so consulting it unconditionally would wedge a still-growing near view below full
+	# indefinitely once landed (silent walk-stall) and, with no reset on the last-written state, is a latent
+	# hard-wedge risk. Proves: with falling_fast == false, the wiring BYPASSES the gate and reaches full want_vd
+	# even with a modeled backlog held far above REENTRY_GEN_BACKLOG_MAX throughout. Uses _mirror_wired_near_vd,
+	# which (unlike _mirror_admit) observes the REAL compiled flag — it is testing the call CONDITION itself.
+	# ---------------------------------------------------------------------------------------------------------------
+	var grounded_bypasses_gate := true
+	var huge_backlog := CubeSphere.REENTRY_GEN_BACKLOG_MAX * 50 + 10000   # far above MAX, held constant throughout
+	for i in range(0, 60):
+		var lv3 := i                       # last_vd sweeps 0 → 59
+		var wv3 := 128                     # always wants full — this is what a landed player's anchor law asks for
+		var r5 := _mirror_wired_near_vd(lv3, wv3, huge_backlog, false)     # falling_fast == false (grounded/slow)
+		if r5 != wv3:
+			grounded_bypasses_gate = false
+	_ok(grounded_bypasses_gate, "G-RP-GROUNDED: falling_fast == false ⇒ the wiring bypasses the backlog gate entirely — want_vd(128) is always reached despite a modeled backlog (%d) far above REENTRY_GEN_BACKLOG_MAX(%d); no walk-stall / hard-wedge" % [huge_backlog, CubeSphere.REENTRY_GEN_BACKLOG_MAX])
+	# Falsify: the SAME huge backlog, same last_vd sweep, but falling_fast == true — if the flag is compiled ON this
+	# must NOT reach full want_vd in one step (the gate is genuinely doing something when airborne-fast); if the
+	# flag is compiled OFF it still passes through (matching G-RP-LAW's OFF-arm passthrough), which is expected.
+	if CubeSphere.FP_REENTRY_BACKLOG_GATE:
+		var airborne_still_gated := false
+		for i in range(0, 60):
+			var lv4 := i
+			var r6 := _mirror_wired_near_vd(lv4, 128, huge_backlog, true)  # falling_fast == true
+			if r6 != 128:
+				airborne_still_gated = true
+		_ok(airborne_still_gated, "G-RP-GROUNDED: FALSIFY — with the SAME huge backlog, falling_fast == true (flag ON) DOES still gate (the contrast proving the bypass above is the falling_fast condition, not a dead gate)")
 
 	# ---------------------------------------------------------------------------------------------------------------
 	# G-RP-DEFER — reentry_hold_view (§3.2), via the flag-independent mirror.

@@ -2785,7 +2785,15 @@ static func approach_view_distance(d: float, full: float, lo: float) -> float:
 ## or descent rate (that was cc2ee78's miss, §4): growth is admitted only while the backlog has drained below
 ## REENTRY_GEN_BACKLOG_MAX, and then by at most REENTRY_GROW_STEP blocks per debounced anchor write, so no single
 ## gate-open write can emit more than one shell's worth of tasks. Shrink (ascent release) always passes untouched.
-## Default OFF ⇒ reentry_admit_view returns want_vd verbatim (byte-identical; FLAT stays 6042/0).
+## Review fix (adversarial review of c673e35): the gate is only CONSULTED by the wiring while `falling_fast`
+## (world_manager.gd _apply_approach_anchor, the same signal §3.2 uses) — the GLOBAL VoxelEngine generation backlog
+## is routinely 1.5-2.8k during ordinary grounded/walking play (§1) even though nothing is flooding, so an
+## unconditional gate would wedge a still-growing near view below full 128 indefinitely once landed (a silent
+## walk-stall the fps/vox_gen/hole A/B cannot see) and, with no reset on the last-written state, is a latent
+## hard-wedge risk if anything else sustains a high backlog while stationary. Restricting the CALL to the airborne
+## fast-descent regime — the only regime the 6-7k flood occurs in — closes both while leaving the pure law (the
+## real backstop: the backlog cap + step clamp below) untouched. Default OFF ⇒ reentry_admit_view returns want_vd
+## verbatim (byte-identical; FLAT stays 6042/0).
 const FP_REENTRY_BACKLOG_GATE := false
 const REENTRY_GEN_BACKLOG_MAX := 256   # max VoxelEngine tasks.generation admitting further view growth
 const REENTRY_GROW_STEP := 8           # max viewer view_distance growth (blocks) per debounced anchor write

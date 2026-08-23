@@ -2776,6 +2776,54 @@ static func approach_view_distance(d: float, full: float, lo: float) -> float:
 		return 0.0 if d >= ANCHOR_REL_HI else full
 	return full * clampf((ANCHOR_REL_HI - d) / (ANCHOR_REL_HI - lo), 0.0, 1.0)
 
+## COSMOS FALL-MESH-STALL (docs/COSMOS-FALL-MESH-STALL-DESIGN.md §3.1 — FP_REENTRY_BACKLOG_GATE). Symptom: a
+## de-orbit fall through alt ~870→450 collapses to fps ~2.5 for 20-25 s. ROOT (§2): the S1 anchor re-growth law
+## (above) re-grows the ground-pinned viewer's view_distance 0→128 across that band, and godot_voxel loads a full
+## terrain-intersecting disc per growth step — ≈6-7k GenerateBlock tasks, saturating the WASM worker pool and
+## starving the main thread (the attributed convoy cost, §1; NOT any GDScript subsystem). Fix: govern the WRITTEN
+## view_distance by the LIVE engine generation backlog (`VoxelEngine.get_stats().tasks.generation`) — never by time
+## or descent rate (that was cc2ee78's miss, §4): growth is admitted only while the backlog has drained below
+## REENTRY_GEN_BACKLOG_MAX, and then by at most REENTRY_GROW_STEP blocks per debounced anchor write, so no single
+## gate-open write can emit more than one shell's worth of tasks. Shrink (ascent release) always passes untouched.
+## Default OFF ⇒ reentry_admit_view returns want_vd verbatim (byte-identical; FLAT stays 6042/0).
+const FP_REENTRY_BACKLOG_GATE := false
+const REENTRY_GEN_BACKLOG_MAX := 256   # max VoxelEngine tasks.generation admitting further view growth
+const REENTRY_GROW_STEP := 8           # max viewer view_distance growth (blocks) per debounced anchor write
+
+## Pure law (gate-testable): the next viewer view_distance given the last written one, the anchor law's want, and
+## the live generation backlog. Shrink always passes (ascent release unchanged). Growth admitted only while the
+## engine pool has drained below the cap, and then by at most REENTRY_GROW_STEP per write — so one gate-open write
+## can never emit a giant annulus.
+static func reentry_admit_view(last_vd: int, want_vd: int, gen_backlog: int) -> int:
+	if not FP_REENTRY_BACKLOG_GATE or last_vd < 0 or want_vd <= last_vd:
+		return want_vd
+	if gen_backlog > REENTRY_GEN_BACKLOG_MAX:
+		return last_vd
+	return mini(want_vd, last_vd + REENTRY_GROW_STEP)
+
+## COSMOS FALL-MESH-STALL (§3.2 — FP_REENTRY_REGROW_DEFER). Everything the S1 re-growth law generates at alt
+## 900→460 is issued against the PRE-restore facet designation (barely visible — the release ramp's own sub-τ
+## premise) and much of it is re-issued anyway by the ATMO_TOP+PREP=416 regime restore (§2.5). Defer the re-growth
+## to where it is actually needed: while plunging fast above REENTRY_REGROW_DEFER_ALT, hold the wanted view at the
+## proven small landing disc (REENTRY_HOLD_VIEW) instead of re-growing toward full early. Slow descents (< the
+## FP_ENV_FALL_HOLD vy threshold) never trigger it — they don't flood either (§0). Composes with 3.1: the 0→64 leg
+## alone is still ≥3x the backlog gate's cap, so 3.1 must also run above the defer altitude (§3.2 note).
+## Default OFF ⇒ reentry_hold_view returns want_vd verbatim (byte-identical; FLAT stays 6042/0).
+const FP_REENTRY_REGROW_DEFER := false
+const REENTRY_REGROW_DEFER_ALT := 460.0  # radial alt above which a FAST descent holds the landing disc
+                                         # (just above the ATMO_TOP+PREP=416 restore: release precedes it)
+const REENTRY_HOLD_VIEW := 64.0          # the held near view — LAND_RAMP_HOLD_BLOCKS' proven landing disc
+                                         # (far-ring chords cover 64-128, hole=0 proven)
+
+## Pure law: clamp the anchor's wanted view to the landing disc while plunging fast above the defer altitude.
+## `falling_fast` = _fall_vy_ema < -ENV_FALL_HOLD_VY (the FP_ENV_FALL_HOLD / FP_LAND_RAMP_HOLD shared
+## position-based signal, world_manager.gd:1283-1296). Slow descents (vy < 20 b/s) never trigger it — they don't
+## flood either.
+static func reentry_hold_view(want_vd: float, alt: float, falling_fast: bool) -> float:
+	if not FP_REENTRY_REGROW_DEFER or not falling_fast or alt <= REENTRY_REGROW_DEFER_ALT:
+		return want_vd
+	return minf(want_vd, REENTRY_HOLD_VIEW)
+
 ## COSMOS ORBITAL O0 (docs/COSMOS-ORBITAL-DESIGN.md §4.4 / §11 O0) — the SKY master toggle. When true,
 ## main.gd builds a CosmosSky (Sun sphere + THE DirectionalLight + Moon impostor + star dome + a
 ## day-night environment ramp) driven by the pure f64 CosmosEphemeris kernel, and the planet gains a

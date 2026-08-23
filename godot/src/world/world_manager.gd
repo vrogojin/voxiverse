@@ -162,6 +162,10 @@ var _alt_redesignate_count := 0
 # inert (never read; no writes issued) with FP_APPROACH_ANCHOR off ⇒ byte-identical.
 var _anchor_released := false
 var _anchor_last_write_ms := -100000
+# COSMOS FALL-MESH-STALL (FP_REENTRY_BACKLOG_GATE, docs/COSMOS-FALL-MESH-STALL-DESIGN.md §3.1): the last
+# view_distance actually WRITTEN to the viewer (-1 = never written), so reentry_admit_view can step-clamp the next
+# write relative to what's really resident rather than the anchor law's raw want. Inert (never read) with the flag off.
+var _anchor_last_vd := -1
 # A1 CROSSING INSTRUMENTATION (#114): a bounded FIFO of per-crossing attribution records built in maybe_cross_facet
 # and drained by RemoteBridge (take_crossing_events) to publish over the telemetry socket. Only APPENDED on an actual
 # committed crossing (seconds apart), so it is normally empty and adds no per-frame cost; bounded so a drain-less
@@ -767,6 +771,26 @@ func _update_approach_anchor(player_pos: Vector3) -> void:
 	_anchor_last_write_ms = now_ms
 	_apply_approach_anchor(player_pos)
 
+# COSMOS FALL-MESH-STALL (FP_REENTRY_BACKLOG_GATE): lazily-cached VoxelEngine singleton for _voxel_gen_backlog,
+# mirroring module_world.gd's _voxel_engine (_inflight_main_q, :615-621) — a separate instance here since this
+# class has no reference to the module's private cache.
+var _voxel_engine: Object = null
+
+## COSMOS FALL-MESH-STALL (§3.1): the live godot_voxel GenerateBlock backlog (VoxelEngine.get_stats().tasks
+## .generation), the closed-loop input reentry_admit_view gates growth on. Lazy cached-singleton lookup; returns 0
+## when the engine/stat is unavailable (⇒ no throttle — reentry_admit_view degrades to want_vd verbatim, same as
+## flag-off). Called only under FP_REENTRY_BACKLOG_GATE, at most once per debounced anchor write (≤10 Hz).
+func _voxel_gen_backlog() -> int:
+	if _voxel_engine == null:
+		if Engine.has_singleton("VoxelEngine"):
+			_voxel_engine = Engine.get_singleton("VoxelEngine")
+		else:
+			return 0
+	if not _voxel_engine.has_method("get_stats"):
+		return 0
+	var st: Dictionary = _voxel_engine.call("get_stats")
+	return int((st.get("tasks", {}) as Dictionary).get("generation", 0))
+
 ## The compute+apply core shared by the debounced driver and the verify hook (approach_anchor_step_now). Advances the
 ## release-latch hysteresis, computes the anchor offset + release view_distance from the analytic altitude, and pushes
 ## both to the single player VoxelViewer. Pure w.r.t. gameplay — it only mutates the viewer node (render/streaming).
@@ -798,7 +822,20 @@ func _apply_approach_anchor(player_pos: Vector3) -> void:
 	var lo := (CubeSphere.ANCHOR_REL_LO / CubeSphere.ANCHOR_HYST) if _anchor_released else CubeSphere.ANCHOR_REL_LO
 	var full := float(TerrainConfig.near_render_radius())
 	var view_f := CubeSphere.approach_view_distance(d, full, lo)
+	# COSMOS FALL-MESH-STALL (FP_REENTRY_REGROW_DEFER, §3.2): while plunging fast above the 416-restore altitude,
+	# hold the wanted view at the proven small landing disc instead of re-growing toward full early — most of that
+	# early growth is generated against the stale pre-restore facet designation and re-issued by the restore anyway.
+	# Off ⇒ view_f unchanged (byte-identical).
+	view_f = CubeSphere.reentry_hold_view(view_f, h, _fall_vy_ema < -CubeSphere.ENV_FALL_HOLD_VY)
 	var near_vd := int(round(view_f))
+	# COSMOS FALL-MESH-STALL (FP_REENTRY_BACKLOG_GATE, §3.1): govern the WRITTEN view growth by the live godot_voxel
+	# generation backlog — never open-loop by time/rate — so a re-entry can never flood the pool with the 6-7k-task
+	# annulus that starves the main thread (§1-§2). Shrink (ascent release) always passes untouched. Off ⇒ near_vd
+	# unchanged (byte-identical).
+	if CubeSphere.FP_REENTRY_BACKLOG_GATE:
+		var backlog := _voxel_gen_backlog()
+		near_vd = CubeSphere.reentry_admit_view(_anchor_last_vd, near_vd, backlog)
+	_anchor_last_vd = near_vd
 	_module_world.call("set_approach_anchor", offset_y, near_vd)
 	# COSMOS SEAMLESS-TRANSITION S1↔L1 rim coupling (SEAMLESS-SCALES §4): drive the L1 megablock ring's EFFECTIVE
 	# engagement rim from the SAME near view_distance just written to the viewer, so as S1 shrinks the near field below
@@ -1280,7 +1317,10 @@ func update_streaming(player_pos: Vector3) -> void:
 	# speed above the crossing/flip clamp is a relocation, not motion, and is rejected. Off ⇒ never called (byte-identical).
 	# FP_LAND_RAMP_HOLD shares the same vy signal to shrink the near VOXEL view during the plunge. One estimate,
 	# forwarded to both the far ring (env-warm pause) and the module (near-view clamp). Off both ⇒ never runs.
-	if CubeSphere.FP_ENV_FALL_HOLD or CubeSphere.FP_LAND_RAMP_HOLD:
+	# FP_REENTRY_REGROW_DEFER (COSMOS-FALL-MESH-STALL §3.2) also consumes _fall_vy_ema (reentry_hold_view's
+	# `falling_fast`), so the signal must exist when only that flag is on. All three off ⇒ the shipped condition
+	# verbatim (byte-identical).
+	if CubeSphere.FP_ENV_FALL_HOLD or CubeSphere.FP_LAND_RAMP_HOLD or CubeSphere.FP_REENTRY_REGROW_DEFER:
 		var nowu := Time.get_ticks_usec()
 		if _have_player_pos and _fall_last_usec >= 0:
 			var dtf := float(nowu - _fall_last_usec) / 1.0e6

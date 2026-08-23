@@ -302,6 +302,14 @@ var _async_sector_dirty: Dictionary = {}   # frozen at dispatch: sector -> true 
 var _async_fid_sector: Dictionary = {}     # frozen at dispatch: fid -> sector, for every fid in _async_fids
 var _async_sector_parts: Dictionary = {}   # worker-owned: sector -> P3 bulk parts collector
 var _async_sector_arrays: Dictionary = {}  # worker output: sector -> committed surface arrays (read by the swap)
+# COSMOS DE-ORBIT SHELL STAGING (FP_SHELL_STAGE_REEMIT, doc in cube_sphere.gd): stage-run state. ALL of it
+# is zero/never touched with the flag off (byte-identical).
+var _stage_active := false                 # a staged run is in progress (holds the frozen-input snapshot)
+var _stage_start_ms := 0                   # wall-clock at run start (SHELL_STAGE_MAX_MS failsafe)
+var _stage_hold: Array = []                # held [unsink_col, have_col, applied_r, applied_band] for the run
+var _stage_deferred_n := 0                 # sectors deferred by the LAST staged dispatch (0 ⇒ run drains)
+var _stage_last_emit_facets := 0           # facets actually selected for the LAST staged dispatch (telemetry)
+var _sector_sunk_built: Array = []         # sector -> _sectors_sunk_state() it was last built against (flag-on only)
 # COSMOS-PERF L1 (§3.1): pre-TRIANGULATED per-facet caches for FP_FARRING_FAST_REBUILD. Built lazily from the grid
 # caches above (only when the fast path or the equivalence gate runs → zero cost/memory with the flag off). Each holds
 # the facet's 32 tris EXPANDED to 96 vertices in the EXACT order/winding _emit_cached emits — so the fast rebuild is a
@@ -355,7 +363,8 @@ const SRC_CULL_APPLY := 14     # :2702 cull APPLY (LUXURY — dead, cull not dep
 const SRC_SLOTS := 15          # :4371 band/close-up slot pushes (SAFETY)
 const SRC_RELIEF := 16         # :5222 _drain_relief_dirty (LUXURY — dead unless FP_RELIEF_REEMIT)
 const SRC_FORCE := 17          # force_rebuild() synchronous path (reserved; no _pending arm)
-const SRC_COUNT := 18
+const SRC_STAGE := 18          # staged re-emit continuation (FP_SHELL_STAGE_REEMIT — SAFETY, drains the run)
+const SRC_COUNT := 19
 var _pending_src := PackedInt32Array()   # per-source arm counts (sensor); sized SRC_COUNT in setup() ONLY under the flag
 var _pending_luxury := false             # a LUXURY arm is parked, waiting on the credit/settle rail (_process consumes)
 var _calm_last_lux_arm_ms := 0           # ticks of the last luxury arm (settle clock)
@@ -2139,6 +2148,8 @@ func _sectors_ensure_arrays() -> void:
 	_sector_drawn.resize(ns)
 	_sector_bstop.resize(ns)
 	_sector_built_epoch.resize(ns)   # zero-filled → never built
+	if CubeSphere.FP_SHELL_STAGE_REEMIT:
+		_sector_sunk_built.resize(ns)   # nulls (never recorded) ⇒ compared as mismatch ⇒ dirty (safe default)
 	for s in range(ns):
 		_sector_sig[s] = {}
 		_sector_drawn[s] = {}
@@ -2198,7 +2209,7 @@ func _sectors_sunk_state() -> Array:
 ## MAIN THREAD, at dispatch (after every freeze step): partition the frozen fid set and mark DIRTY every sector whose
 ## membership or any member signature differs from what its resident mesh was built from (plus the sunk-state rule and
 ## the whole-mesh invalidation epoch). Clean sectors keep their resident meshes — the worker will not re-emit them.
-func _sectors_compute_dirty() -> void:
+func _sectors_compute_dirty(stage_on := CubeSphere.FP_SHELL_STAGE_REEMIT) -> void:
 	_sectors_ensure_arrays()
 	_async_fid_sector.clear()
 	_async_sector_dirty.clear()
@@ -2206,6 +2217,11 @@ func _sectors_compute_dirty() -> void:
 	var cur: Array = []
 	cur.resize(ns)
 	var sunk_changed: bool = _sector_unsink_sig != _sectors_sunk_state()
+	# FP_SHELL_STAGE_REEMIT §4.2b: under partial (staged) swaps the ONE global sunk fingerprint is insufficient — after
+	# the first staged swap it would claim the NEW state for sectors still built against the OLD one, so deferred sunk-only
+	# sectors compare clean and are dropped (the stale-wedge). On ⇒ compare each sector against the sunk-state IT was last
+	# built against (`_sector_sunk_built`). Off ⇒ cur_sunk is never computed/read (byte-identical global compare).
+	var cur_sunk: Array = _sectors_sunk_state() if stage_on else []
 	for fid in _async_fids:
 		var s := _sector_of(fid)
 		_async_fid_sector[fid] = s
@@ -2223,14 +2239,100 @@ func _sectors_compute_dirty() -> void:
 		if rec.size() != c.size():
 			_async_sector_dirty[s] = true
 			continue
+		# FP_SHELL_STAGE_REEMIT §4.2b: per-sector sunk-change test (else the shipped global `sunk_changed` verbatim).
+		var sunk_c := sunk_changed
+		if stage_on:
+			var built = _sector_sunk_built[s] if s < _sector_sunk_built.size() else null
+			sunk_c = (built == null) or (built != cur_sunk)
 		for fid in c:
 			var sg: int = c[fid]
 			if not rec.has(fid) or int(rec[fid]) != sg:
 				_async_sector_dirty[s] = true
 				break
-			if sunk_changed and _sector_sig_sunkish(sg):
+			if sunk_c and _sector_sig_sunkish(sg):
 				_async_sector_dirty[s] = true
 				break
+
+## MAIN THREAD, FP_SHELL_STAGE_REEMIT §3.2/§4.1: budget the just-computed dirty set. Deferrable sectors (a resident
+## current-epoch mesh, NOT gaining a new member) are released nearest-camera-first at ≤ SHELL_STAGE_FACETS facets per
+## dispatch when the deferrable burst exceeds SHELL_STAGE_TRIGGER (or a run is already active); the rest are removed from
+## `_async_sector_dirty` for this build (re-derived dirty next dispatch — nothing lost, §4.1). Never-built / new-member
+## sectors are class-0: always emitted, never deferred (deferring them would be a real hole). The stage-start input hold
+## is captured on run start (§4.2a). Early-returns (no-op) with the flag off or a non-sectored build → byte-identical.
+func _stage_filter_dirty(axis: Vector3, stage_on := CubeSphere.FP_SHELL_STAGE_REEMIT) -> void:
+	if not stage_on or not _async_sectored:
+		return
+	_ensure_centre_pack()
+	if _sector_sunk_built.size() != _sector_count():
+		_sector_sunk_built.resize(_sector_count())   # forced-on gate path (E4 sizes it in production under the flag)
+	# one pass over the frozen fid set: per dirty sector, facet count, max centre·axis priority, and whether it gains a
+	# member its resident sig record lacks (a growth that must not be deferred).
+	var facets := {}      # s -> int
+	var prio := {}        # s -> float
+	var newmem := {}      # s -> bool
+	for fid in _async_fids:
+		var s: int = _async_fid_sector.get(fid, -1)
+		if s < 0 or not _async_sector_dirty.has(s):
+			continue
+		facets[s] = int(facets.get(s, 0)) + 1
+		var pv: float = _centre_pack[fid].dot(axis) if fid < _centre_pack.size() else -1.0
+		if not prio.has(s) or pv > float(prio[s]):
+			prio[s] = pv
+		if not bool(newmem.get(s, false)) and not (_sector_sig[s] as Dictionary).has(fid):
+			newmem[s] = true
+	# partition: class 0 = not-deferrable (no resident current-epoch mesh) OR gaining a new member → always emit this
+	# dispatch; class 1 = deferrable replacement-only → budgetable.
+	var deferrable_dirty_facets := 0
+	var class1: Array = []
+	for s in _async_sector_dirty.keys():
+		var built_current: bool = (s < _sector_built_epoch.size()) and (_sector_built_epoch[s] == _sector_epoch)
+		if not built_current or bool(newmem.get(s, false)):
+			continue     # class 0 — stays in the dirty set unconditionally
+		deferrable_dirty_facets += int(facets.get(s, 0))
+		class1.append([float(prio.get(s, -1.0)), s])
+	# trigger: stage only when a run is in progress OR the deferrable burst exceeds the trigger.
+	if not (_stage_active or deferrable_dirty_facets > CubeSphere.SHELL_STAGE_TRIGGER):
+		_stage_deferred_n = 0
+		return
+	# failsafe (§4.4): past the wall-clock cap, emit the full remaining dirty set unbudgeted and close the run.
+	if _stage_active and Time.get_ticks_msec() - _stage_start_ms > CubeSphere.SHELL_STAGE_MAX_MS:
+		_stage_active = false
+		_stage_hold = []
+		_stage_deferred_n = 0
+		return
+	# order class 1 by DESCENDING priority (sub-camera / screen-centre sector first, coverage advances to the horizon).
+	class1.sort_custom(Callable(self, "_stage_cmp_desc"))
+	# take class-1 sectors while within budget; always take at least one (progress guarantee).
+	var kept := {}
+	var taken := 0
+	for entry in class1:
+		var s: int = entry[1]
+		var fc: int = int(facets.get(s, 0))
+		if kept.is_empty() or taken + fc <= CubeSphere.SHELL_STAGE_FACETS:
+			kept[s] = true
+			taken += fc
+	# defer the rest — drop them from the dirty set so the worker never builds them this cycle.
+	var deferred := 0
+	for entry in class1:
+		var s: int = entry[1]
+		if not kept.has(s):
+			_async_sector_dirty.erase(s)
+			deferred += 1
+	# the emitted slice = every sector still in the dirty set (kept class-1 + all class-0).
+	var emit_facets := 0
+	for s in _async_sector_dirty.keys():
+		emit_facets += int(facets.get(s, 0))
+	_stage_deferred_n = deferred
+	_stage_last_emit_facets = emit_facets
+	# start the run + capture the stage-start input hold on the FIRST staged dispatch (§4.2a).
+	if deferred > 0 and not _stage_active:
+		_stage_active = true
+		_stage_start_ms = Time.get_ticks_msec()
+		_stage_hold = [_async_unsink_col, _async_unsink_have_col, _async_applied_r, _async_applied_band]
+
+## FP_SHELL_STAGE_REEMIT: sort comparator — descending [prio, sector] (nearest-camera sector first).
+func _stage_cmp_desc(a: Array, b: Array) -> bool:
+	return a[0] > b[0]
 
 ## MAIN THREAD, at swap (worker done — cache state now equals what the worker emitted from): record what each DIRTY
 ## sector's fresh mesh was built from. Factored out of `_swap_in_sectors` so the headless gate drives the identical
@@ -2241,6 +2343,12 @@ func _sectors_record_frozen() -> void:
 		_sector_drawn[s] = {}
 		_sector_bstop[s] = {}
 		_sector_built_epoch[s] = _sector_epoch
+		# FP_SHELL_STAGE_REEMIT §4.2b: record the sunk-state THIS sector's fresh mesh was built against (per-sector, so a
+		# partial staged swap can't claim the new state for sectors still built against the old one). Off / not staging ⇒
+		# never written (byte-identical). `_stage_active` covers the forced-on gate; the global `_sector_unsink_sig` at
+		# the tail of this function stays (the flag-off law's record, harmless flag-on).
+		if (CubeSphere.FP_SHELL_STAGE_REEMIT or _stage_active) and s < _sector_sunk_built.size():
+			_sector_sunk_built[s] = _sectors_sunk_state()
 	for fid in _async_fids:
 		var s: int = _async_fid_sector.get(fid, -1)
 		if not _async_sector_dirty.has(s):
@@ -2268,6 +2376,14 @@ func _sectors_reset() -> void:
 		_sector_sig[s] = {}
 		_sector_drawn[s] = {}
 		_sector_bstop[s] = {}
+	# FP_SHELL_STAGE_REEMIT §4.4: a sync whole-mesh rebuild pre-empts any staged run — clear the per-sector sunk records
+	# and the run state so the next sectored dispatch rebuilds everything from scratch. No-op with the flag off.
+	if CubeSphere.FP_SHELL_STAGE_REEMIT:
+		for s in range(_sector_sunk_built.size()):
+			_sector_sunk_built[s] = null
+		_stage_active = false
+		_stage_deferred_n = 0
+		_stage_hold = []
 	_sector_unsink_sig = []
 
 ## MAIN THREAD: the P2 counterpart of `_swap_in_arrays` — swap ONLY the dirty sectors' freshly built surfaces onto
@@ -2314,9 +2430,12 @@ func _begin_rebuild() -> void:
 ## MAIN THREAD: snapshot the (already-warmed) visible set and hand the whole mesh-DATA build to a worker. The caches the
 ## worker reads are frozen for its lifetime — _process will not warm/dispatch again while _async_building (the gate in
 ## _process), and force_rebuild/set_excluded join first — so the worker only ever READS _pos_cache/_col_cache.
-func _dispatch_async_rebuild() -> void:
+func _dispatch_async_rebuild(sectored_on := CubeSphere.FP_FARRING_SECTORS, stage_on := CubeSphere.FP_SHELL_STAGE_REEMIT) -> void:
 	transform = _placement_xform()   # rigid re-place is cheap + main-thread-only (same as _rebuild_full's first line)
-	_refresh_slot_snapshot()         # COSMOS LOD-TEXTURE Phase 4: freeze the slot map on MAIN before the worker reads it (no-op off)
+	# FP_SHELL_STAGE_REEMIT §4.2a: during a staged run HOLD the slot snapshot (the held _slot_snapshot/_band_slot_snapshot
+	# persist) so every staged sector emits from ONE coherent slot map. Off / not staging ⇒ refresh verbatim (byte-identical).
+	if not (stage_on and _stage_active):
+		_refresh_slot_snapshot()     # COSMOS LOD-TEXTURE Phase 4: freeze the slot map on MAIN before the worker reads it (no-op off)
 	# FP_ENV_WARM_ASYNC: when the worker builds its OWN env caches, hand it the FULL front set (uncached included) so it
 	# can warm a bounded batch and emit them the same cycle. Frozen here so the worker's warm/emit is stable for its run
 	# (main will not touch the caches while _async_building). Off ⇒ the shipped cache-filtered set (byte-identical).
@@ -2337,6 +2456,15 @@ func _dispatch_async_rebuild() -> void:
 	# contract) so the worker's `_blend_uncovered` height-gates against the band that was live at dispatch. (0, 1e9)
 	# with the flag off (never read).
 	_async_applied_band = _applied_band
+	# COSMOS DE-ORBIT SHELL STAGING (FP_SHELL_STAGE_REEMIT §4.2a): during a staged run, OVERRIDE the five continuous
+	# inputs just frozen above with the stage-start hold, so every staged sector emits from ONE coherent snapshot (no
+	# sunk-depth / slot mismatch between a sector emitted at stage 1 and its neighbour at stage 12 — no seam). Off /
+	# not staging ⇒ the live freezes above stand verbatim (byte-identical).
+	if stage_on and _stage_active:
+		_async_unsink_col = _stage_hold[0]
+		_async_unsink_have_col = _stage_hold[1]
+		_async_applied_r = _stage_hold[2]
+		_async_applied_band = _stage_hold[3]
 	# REVISION 5 Stage A (FP_ENV_DEMAND_DISC): frozen for the worker's "have" test. ORBIT keeps its existing law
 	# unchanged (no near field to bound the envelope demand against off-surface), so force it off there.
 	_async_demand_on = CubeSphere.FP_ENV_DEMAND_DISC and not _shell_orbit()
@@ -2375,11 +2503,16 @@ func _dispatch_async_rebuild() -> void:
 	# COSMOS FARRING-SWAP-DIET P2 (FP_FARRING_SECTORS): freeze the sector partition + per-facet signatures + the dirty
 	# sector set for THIS build (main thread, after every freeze above — the signatures read the same frozen snapshots
 	# the worker will). Off ⇒ `_async_sectored` false, dicts empty, the shipped whole-mesh path verbatim.
-	_async_sectored = CubeSphere.FP_FARRING_SECTORS
+	_async_sectored = sectored_on
 	_async_sector_parts = {}
 	_async_sector_arrays = {}
 	if _async_sectored:
-		_sectors_compute_dirty()
+		_sectors_compute_dirty(stage_on)
+		# COSMOS DE-ORBIT SHELL STAGING (FP_SHELL_STAGE_REEMIT §3.2/§4.1): budget the dirty set across worker cycles. The
+		# priority axis is the emit cull axis (`_cull_params()[0]`). Off ⇒ _stage_filter_dirty early-returns (byte-identical).
+		if stage_on:
+			var _sax: Array = _cull_params()[0]
+			_stage_filter_dirty(Vector3(_sax[0], _sax[1], _sax[2]), stage_on)
 	_async_arrays = []
 	_pending = false                 # consumed — a fresh crossing sets it again and is served after this build lands
 	_async_building = true
@@ -2584,6 +2717,15 @@ func _poll_async_rebuild() -> void:
 		_async_warm_only = false
 	elif _async_sectored:
 		_swap_in_sectors()   # P2: swap ONLY the dirty sectors; clean sector meshes stay resident
+		# FP_SHELL_STAGE_REEMIT §4.3: while a staged run has deferred sectors, re-arm _pending (SRC_STAGE) so the next
+		# idle frame dispatches the next slice; when the run drains (nothing deferred), release the input hold. Gated on
+		# `_stage_active` — false unless staging engaged ⇒ byte-identical off.
+		if _stage_active:
+			if _stage_deferred_n > 0:
+				_arm_pending(SRC_STAGE)
+			else:
+				_stage_active = false
+				_stage_hold = []
 	else:
 		_swap_in_arrays(_async_arrays, _async_fids)
 	_async_task_id = -1
@@ -3621,6 +3763,12 @@ func shell_telemetry() -> Dictionary:
 		"sh_h": snappedf(_dbg_h, 0.1),
 		"sh_scale": snappedf(_dbg_scale, 0.0001),
 	}
+	# FP_SHELL_STAGE_REEMIT §E11: the staged-drain sensor — is a run active, how many sectors still queued, and how many
+	# facets the last staged slice emitted (≤ budget bound). Off ⇒ the keys are never added ⇒ byte-identical telemetry.
+	if CubeSphere.FP_SHELL_STAGE_REEMIT:
+		out["sh_stage_on"] = 1 if _stage_active else 0
+		out["sh_stage_q"] = _stage_deferred_n
+		out["sh_stage_emit"] = _stage_last_emit_facets
 	# FP_FT_SHELL_BAND A/B readback: merge the far-tree zone state (ft_zone 0=S/1=B/2=O, ft_cards/ft_mesh shown, ft_off,
 	# ft_h) so a live climb reads WHICH zone the tier computed at each altitude — confound-free (no visual/biome ambiguity).
 	# Empty dict with the flag off ⇒ no keys added ⇒ byte-identical telemetry.

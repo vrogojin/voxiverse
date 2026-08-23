@@ -350,6 +350,21 @@ const FP_FARRING_BULK_EMIT := false
 ## FLAT 6042/0).
 const FP_FARRING_SECTORS := false
 
+## COSMOS DE-ORBIT SHELL STAGING (docs/COSMOS-DEORBIT-SHELL-STAGING-DESIGN.md) — stage the release-knee
+## re-emit avalanche. At the S1 anchor-release knee the near re-grow dirties ALL 24 far-ring sectors in one
+## dispatch (unsink + applied ladder + slot waves), so FP_FARRING_SECTORS re-emits the whole ~930-facet /
+## ~1.07M-prim cap in ONE worker build — the dlmalloc convoy busy-waits the browser main thread ~2.4 s (the
+## dominant de-orbit stall). When true, a dirty burst > SHELL_STAGE_TRIGGER facets is released over multiple
+## worker cycles at ≤ SHELL_STAGE_FACETS facets per dispatch, nearest-to-camera sectors first, from ONE held
+## input snapshot (no cross-sector sunk/slot mismatch), converging to the IDENTICAL final shell in ≈ 0.3 s.
+## Deferred sectors keep drawing their resident meshes (never a hole); never-built sectors are never deferred.
+## Requires FP_FARRING_SECTORS + FP_FARRING_ASYNC_REBUILD. Default OFF → every dirty sector emits in the same
+## dispatch exactly as today (byte-identical, FLAT 6042/0). Gate: src/tools/verify_shell_staging.gd.
+const FP_SHELL_STAGE_REEMIT := false
+const SHELL_STAGE_FACETS := 112     # per-dispatch dirty-facet budget (~2 typical knee sectors; §3.1)
+const SHELL_STAGE_TRIGGER := 168    # stage only when dirty facets exceed this (1.5× budget — small dirt stays 1-frame)
+const SHELL_STAGE_MAX_MS := 2500    # stage-run failsafe: past this wall-clock, emit the remainder unbudgeted
+
 ## COSMOS far-ring full coverage (docs/COSMOS-FARRING-COVERAGE-DESIGN.md) — the see-through-gap fix. The shipped far
 ## ring EXCLUDES the active facet + the live-pool neighbours (`_excluded`), so beyond the ~128-block near-blocky disk on
 ## those facets there is no far quad at all and the camera sees straight through to the opposite inner side of the globe

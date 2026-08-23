@@ -62,8 +62,8 @@ func _initialize() -> void:
 		and FFR.SRC_NB_RESINK == 8 and FFR.SRC_NB_NOTEMIT == 9 and FFR.SRC_UNSINK == 10
 		and FFR.SRC_LADDER_SHRINK == 11 and FFR.SRC_LADDER_GROW == 12 and FFR.SRC_CULL_FLUSH == 13
 		and FFR.SRC_CULL_APPLY == 14 and FFR.SRC_SLOTS == 15 and FFR.SRC_RELIEF == 16 and FFR.SRC_FORCE == 17
-		and FFR.SRC_COUNT == 18,
-		"fixture: SRC_* enum order matches the design's fixed sh_pending_src layout (0..17)")
+		and FFR.SRC_STAGE == 18 and FFR.SRC_COUNT == 19,
+		"fixture: SRC_* enum order matches the design's fixed sh_pending_src layout (0..18)")
 
 	var fid := 0
 	if on:
@@ -110,7 +110,7 @@ func _gate_sensor_and_partition(fid: int) -> void:
 		if src_final[tag] != 1:
 			all_ones = false
 	_ok(order_ok, "G-APC-8: each tag bumps exactly its own sensor slot")
-	_ok(all_ones, "G-APC-8: after driving all 18 tags once, sh_pending_src is all-ones (fixed order)")
+	_ok(all_ones, "G-APC-8: after driving all %d tags once, sh_pending_src is all-ones (fixed order)" % FFR.SRC_COUNT)
 	_ok(immediate_ok, "G-APC-2: SAFETY tags arm _pending same-frame; LUXURY tags park (no _pending)")
 	_ok(bool(ring.get("_pending_luxury")), "G-APC-2: a LUXURY arm sets _pending_luxury")
 	ring.free()

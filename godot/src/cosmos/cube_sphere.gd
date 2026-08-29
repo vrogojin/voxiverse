@@ -365,6 +365,27 @@ const SHELL_STAGE_FACETS := 112     # per-dispatch dirty-facet budget (~2 typica
 const SHELL_STAGE_TRIGGER := 168    # stage only when dirty facets exceed this (1.5× budget — small dirt stays 1-frame)
 const SHELL_STAGE_MAX_MS := 2500    # stage-run failsafe: past this wall-clock, emit the remainder unbudgeted
 
+## COSMOS DE-ORBIT SHELL PRE-WARM (docs/COSMOS-DEORBIT-SHELL-PREWARM-DESIGN.md) — build the far-ring
+## shell's sector residency DURING the descent, ahead of the S1 anchor-release knee (~609), instead of
+## opening it from the collapsed orbit state in ONE 927-facet/1.07M-prim worker build (the dlmalloc
+## convoy's 2662 ms knee frame — the class-0 growth burst FP_SHELL_STAGE_REEMIT correctly exempts).
+## While off-surface + analytically descending (radial-Δ Schmitt latch, NOT _fall_vy_ema) inside
+## [SHELL_PWD_ALT_LO, SHELL_PWD_ALT_HI], the cap snapshot is refreshed on a pace and each dispatch is
+## staged with class-0 growth budget-ELIGIBLE (voluntary emit ⇒ deferral is not a hole), ≤
+## SHELL_STAGE_FACETS facets/dispatch, chaining on the shipped SRC_STAGE rail. By the knee the sectors
+## are resident+current, so the release dirty set is a small class-1 replacement. Never engages at
+## steady orbit (latch needs sustained −10 b/s radial), on foot (_shell_orbit() false), or on a climb.
+## Requires FP_SHELL_CAMERA_SET + FP_FARRING_SECTORS + FP_FARRING_ASYNC_REBUILD + FP_SHELL_STAGE_REEMIT.
+## Default OFF → the shell collapses at orbit and rebuilds at the knee exactly as today (byte-identical,
+## FLAT 6042/0). Gate: src/tools/verify_shell_prewarm.gd.
+const FP_SHELL_PREWARM_DESCENT := false
+const SHELL_PWD_ALT_HI := 1300.0    # engage ceiling (blocks): ≥ 2× the knee, ≥ 1.1 s of band at 570 b/s
+const SHELL_PWD_ALT_LO := 650.0     # engage floor: just above the 608.7 knee — below it the knee machinery owns
+const SHELL_PWD_SAMPLE_MS := 250    # descent-latch sampling cadence (Δh/Δt per sample, Schmitt via reentry_descent_step)
+const SHELL_PWD_SNAP_MS := 500      # min wall-ms between pre-warm-forced cap snapshots (the pacing bound)
+const SHELL_PWD_DRIFT_DEG := 2.0    # force a snapshot only when the axis swept ≥ this since the last one…
+const SHELL_PWD_DTH_DEG := 1.0      # …or θ_h moved ≥ this (else the pacer stays silent — no-op ticks are free)
+
 ## COSMOS far-ring full coverage (docs/COSMOS-FARRING-COVERAGE-DESIGN.md) — the see-through-gap fix. The shipped far
 ## ring EXCLUDES the active facet + the live-pool neighbours (`_excluded`), so beyond the ~128-block near-blocky disk on
 ## those facets there is no far quad at all and the camera sees straight through to the opposite inner side of the globe

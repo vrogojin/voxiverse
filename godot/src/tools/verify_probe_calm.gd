@@ -62,8 +62,8 @@ func _initialize() -> void:
 		and FFR.SRC_NB_RESINK == 8 and FFR.SRC_NB_NOTEMIT == 9 and FFR.SRC_UNSINK == 10
 		and FFR.SRC_LADDER_SHRINK == 11 and FFR.SRC_LADDER_GROW == 12 and FFR.SRC_CULL_FLUSH == 13
 		and FFR.SRC_CULL_APPLY == 14 and FFR.SRC_SLOTS == 15 and FFR.SRC_RELIEF == 16 and FFR.SRC_FORCE == 17
-		and FFR.SRC_STAGE == 18 and FFR.SRC_COUNT == 19,
-		"fixture: SRC_* enum order matches the design's fixed sh_pending_src layout (0..18)")
+		and FFR.SRC_STAGE == 18 and FFR.SRC_PREWARM == 19 and FFR.SRC_COUNT == 20,
+		"fixture: SRC_* enum order matches the design's fixed sh_pending_src layout (0..19)")
 
 	var fid := 0
 	if on:

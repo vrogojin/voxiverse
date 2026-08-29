@@ -310,6 +310,16 @@ var _stage_hold: Array = []                # held [unsink_col, have_col, applied
 var _stage_deferred_n := 0                 # sectors deferred by the LAST staged dispatch (0 ⇒ run drains)
 var _stage_last_emit_facets := 0           # facets actually selected for the LAST staged dispatch (telemetry)
 var _sector_sunk_built: Array = []         # sector -> _sectors_sunk_state() it was last built against (flag-on only)
+# COSMOS DE-ORBIT SHELL PRE-WARM (FP_SHELL_PREWARM_DESCENT, doc in cube_sphere.gd): descent pre-warm
+# state. ALL of it is zero/never touched with the flag off (byte-identical).
+var _pwd_active := false          # engage predicate result (§3.2) — read by the snapshot pacer + dispatch freeze
+var _pwd_descending := false      # analytic radial-Δ Schmitt latch (reentry_descent_step — NOT _fall_vy_ema)
+var _pwd_calm := 0                # calm-sample count for the latch release
+var _pwd_prev_h := 0.0            # last sampled analytic altitude
+var _pwd_prev_ms := -1            # wall-clock of the last sample (−1 = no baseline yet)
+var _pwd_snap_due := false        # rising-edge seed: force the first paced snapshot immediately
+var _pwd_snap_count := 0          # forced-snapshot count (telemetry sh_pwd_snaps)
+var _async_prewarm := false       # _pwd_active FROZEN at dispatch (worker-cycle-coherent staging mode)
 # COSMOS-PERF L1 (§3.1): pre-TRIANGULATED per-facet caches for FP_FARRING_FAST_REBUILD. Built lazily from the grid
 # caches above (only when the fast path or the equivalence gate runs → zero cost/memory with the flag off). Each holds
 # the facet's 32 tris EXPANDED to 96 vertices in the EXACT order/winding _emit_cached emits — so the fast rebuild is a
@@ -364,7 +374,8 @@ const SRC_SLOTS := 15          # :4371 band/close-up slot pushes (SAFETY)
 const SRC_RELIEF := 16         # :5222 _drain_relief_dirty (LUXURY — dead unless FP_RELIEF_REEMIT)
 const SRC_FORCE := 17          # force_rebuild() synchronous path (reserved; no _pending arm)
 const SRC_STAGE := 18          # staged re-emit continuation (FP_SHELL_STAGE_REEMIT — SAFETY, drains the run)
-const SRC_COUNT := 19
+const SRC_PREWARM := 19        # descent pre-warm paced snapshot (FP_SHELL_PREWARM_DESCENT — SAFETY)
+const SRC_COUNT := 20
 var _pending_src := PackedInt32Array()   # per-source arm counts (sensor); sized SRC_COUNT in setup() ONLY under the flag
 var _pending_luxury := false             # a LUXURY arm is parked, waiting on the credit/settle rail (_process consumes)
 var _calm_last_lux_arm_ms := 0           # ticks of the last luxury arm (settle clock)
@@ -1224,6 +1235,7 @@ func apply_camera_set(cam: Vector3) -> void:
 	var d := rel.length()
 	var h := d - FacetAtlas.R_BLOCKS
 	_offsurface = h > CubeSphere.OFFSURFACE_Y         # S2 prewarm arming (drives the dwell in _prewarm_step)
+	_pwd_tick(h)      # COSMOS DE-ORBIT SHELL PRE-WARM: descent latch + engage predicate (no-op unless FP_SHELL_PREWARM_DESCENT)
 	_dbg_d = d
 	_dbg_h = h
 	if not CubeSphere.FP_SHELL_CAMERA_SET:
@@ -1284,8 +1296,20 @@ func shell_set_camera_abs(dir: Array, d: float, floored: bool, surf_cap_override
 	if reemit and CubeSphere.FP_SHELL_CLIMB_NO_CHURN and floored and floored == _emit_floored_last \
 			and is_equal_approx(new_cos, _emit_cos) and drift <= deg_to_rad(CubeSphere.SHELL_SLACK_DEG - 2.0):
 		reemit = false                                        # identical floored cap + no axis sweep → the rebuild would emit the SAME set (churn)
-	if reemit:
-		_shell_snapshot(dir, new_cos, theta_h, floored)
+	# COSMOS DE-ORBIT SHELL PRE-WARM: while the descent pre-warm is engaged, force a PACED snapshot so the
+	# wanted set tracks the live axis/θ_h down the descent instead of decaying into the knee's one-shot
+	# class-0 avalanche (doc in cube_sphere.gd). Bounded: ≥ SHELL_PWD_SNAP_MS apart AND only when the cap
+	# actually moved (drift/Δθ_h thresholds) — or the engage rising edge. Off / not engaged ⇒ `reemit`
+	# stands exactly as computed above (byte-identical).
+	var pwd_snap := false
+	if CubeSphere.FP_SHELL_PREWARM_DESCENT and _pwd_active and not reemit:
+		pwd_snap = shell_prewarm_snap_due(_pwd_snap_due,
+				Time.get_ticks_msec() - _last_snapshot_ms, drift, dtheta)
+	if reemit or pwd_snap:
+		if pwd_snap:
+			_pwd_snap_due = false
+			_pwd_snap_count += 1
+		_shell_snapshot(dir, new_cos, theta_h, floored, SRC_PREWARM if pwd_snap else SRC_CAM)
 		_last_snapshot_ms = Time.get_ticks_msec()
 
 ## COSMOS-PERF FALL-COLLAPSE FIX A2 (FP_SHELL_FALL_HOLD) — the re-emit-trigger decision, split out PURE + static so
@@ -1306,15 +1330,24 @@ static func shell_fall_should_reemit(hold: bool, floor_changed: bool, dtheta: fl
 		return true                                          # visible cap OUTGREW the held cap (a climb) — re-emit to avoid limb holes
 	return swept and elapsed_ms >= CubeSphere.SHELL_FALL_REEMIT_MS
 
+## COSMOS DE-ORBIT SHELL PRE-WARM: should an engaged pre-warm force a snapshot this frame? Pure.
+static func shell_prewarm_snap_due(rising: bool, elapsed_ms: int, drift: float, dtheta: float) -> bool:
+	if rising:
+		return true
+	if elapsed_ms < CubeSphere.SHELL_PWD_SNAP_MS:
+		return false
+	return drift >= deg_to_rad(CubeSphere.SHELL_PWD_DRIFT_DEG) \
+		or absf(dtheta) >= deg_to_rad(CubeSphere.SHELL_PWD_DTH_DEG)
+
 ## COSMOS-ORBITAL-SHELL S1 (§3): commit a new emit axis/cap and schedule the deferred re-emit (the warm + async
 ## build + single swap are the shipped pipeline; only _pending + the axis/cap snapshot change here).
-func _shell_snapshot(dir: Array, cap_cos: float, theta_h: float, floored: bool) -> void:
+func _shell_snapshot(dir: Array, cap_cos: float, theta_h: float, floored: bool, src := SRC_CAM) -> void:
 	_emit_axis = dir
 	_emit_cos = cap_cos
 	_emit_dir_last = dir
 	_emit_thetah_last = theta_h
 	_emit_floored_last = floored
-	_arm_pending(SRC_CAM)
+	_arm_pending(src)
 	_snapshot_count += 1                                       # FIX A2 diagnostic: a scheduled re-emit (flat during a held fall)
 
 ## COSMOS-ORBITAL-SHELL S2 (§4): the one-shot whole-planet coarse-cache warm. After SHELL_PREWARM_DWELL_S sustained
@@ -1353,6 +1386,30 @@ func _prewarm_step(dt: float) -> void:
 		_prewarm_cursor += 1
 		if Time.get_ticks_usec() - t0 > budget_us:
 			return                            # budget spent — resume next frame
+
+## COSMOS DE-ORBIT SHELL PRE-WARM (FP_SHELL_PREWARM_DESCENT, doc in cube_sphere.gd): the per-frame descent latch +
+## engage predicate. Called from apply_camera_set every frame WorldManager drives it, BEFORE shell_set_camera_abs, so
+## a rising edge seeds this same frame's paced snapshot (E6). The latch is the freeze-independent analytic radial-Δ
+## Schmitt (reentry_descent_step — NOT _fall_vy_ema), sampled on a SHELL_PWD_SAMPLE_MS wall cadence. `on` is the
+## codebase gate-forcing param (default = the compiled flag) so the headless gate drives the REAL law with no sed.
+## Off / not composing (STAGE_REEMIT+SECTORS) ⇒ early return, all _pwd_* stay at their zero initializers (byte-identical).
+func _pwd_tick(h: float, on := CubeSphere.FP_SHELL_PREWARM_DESCENT) -> void:
+	if not (on and CubeSphere.FP_SHELL_STAGE_REEMIT and CubeSphere.FP_FARRING_SECTORS):
+		return
+	var now := Time.get_ticks_msec()
+	if _pwd_prev_ms < 0:
+		_pwd_prev_h = h; _pwd_prev_ms = now
+		return
+	if now - _pwd_prev_ms >= CubeSphere.SHELL_PWD_SAMPLE_MS:
+		var dt := float(now - _pwd_prev_ms) / 1000.0
+		var r: Array = CubeSphere.reentry_descent_step((h - _pwd_prev_h) / dt, _pwd_descending, _pwd_calm)
+		_pwd_descending = r[0]; _pwd_calm = r[1]
+		_pwd_prev_h = h; _pwd_prev_ms = now
+	var want := _cam_set and _shell_orbit() and _pwd_descending \
+			and h >= CubeSphere.SHELL_PWD_ALT_LO and h <= CubeSphere.SHELL_PWD_ALT_HI
+	if want and not _pwd_active:
+		_pwd_snap_due = true          # rising edge: seed the first snapshot immediately (stale residency)
+	_pwd_active = want
 
 ## COSMOS FP-FIXED-FRAME re-anchor (§3): slide the absolute ring mesh by −A in lockstep with PlanetRoot + the
 ## ActiveFrame so the whole rendered planet stays continuous through a floating-origin shift. The offset survives a
@@ -2284,10 +2341,20 @@ func _stage_filter_dirty(axis: Vector3, stage_on := CubeSphere.FP_SHELL_STAGE_RE
 	# dispatch; class 1 = deferrable replacement-only → budgetable.
 	var deferrable_dirty_facets := 0
 	var class1: Array = []
+	# COSMOS DE-ORBIT SHELL PRE-WARM (FP_SHELL_PREWARM_DESCENT): during an ENGAGED pre-warm dispatch the
+	# emit is VOLUNTARY (no regime forced it — the resident cap + FALL_HOLD's +12° margin + the under-layers
+	# still cover every visible pixel), so deferring class-0 GROWTH is not a hole: it merely delays geometry
+	# that, today, would not appear until the knee at all. Class 0 therefore joins the budget/trigger —
+	# UNLESS the whole-cap `_mi` mesh still holds surfaces (a resident sync build): its swap-time clear
+	# (`_swap_in_sectors` :2397) would drop coverage a deferred sector doesn't yet replace, so that (rare,
+	# post-force_rebuild) state keeps the shipped class-0 exemption for the dispatch. Off / not engaged ⇒
+	# the shipped partition verbatim (byte-identical — including at the knee with pre-warm disengaged).
+	var pwd_growth_ok: bool = _async_prewarm \
+			and not (_mi != null and _mi.mesh != null and (_mi.mesh as ArrayMesh).get_surface_count() > 0)
 	for s in _async_sector_dirty.keys():
 		var built_current: bool = (s < _sector_built_epoch.size()) and (_sector_built_epoch[s] == _sector_epoch)
-		if not built_current or bool(newmem.get(s, false)):
-			continue     # class 0 — stays in the dirty set unconditionally
+		if (not built_current or bool(newmem.get(s, false))) and not pwd_growth_ok:
+			continue     # class 0 — stays in the dirty set unconditionally (forced-re-emit correctness)
 		deferrable_dirty_facets += int(facets.get(s, 0))
 		class1.append([float(prio.get(s, -1.0)), s])
 	# trigger: stage only when a run is in progress OR the deferrable burst exceeds the trigger.
@@ -2504,6 +2571,7 @@ func _dispatch_async_rebuild(sectored_on := CubeSphere.FP_FARRING_SECTORS, stage
 	# sector set for THIS build (main thread, after every freeze above — the signatures read the same frozen snapshots
 	# the worker will). Off ⇒ `_async_sectored` false, dicts empty, the shipped whole-mesh path verbatim.
 	_async_sectored = sectored_on
+	_async_prewarm = CubeSphere.FP_SHELL_PREWARM_DESCENT and _pwd_active   # frozen: this cycle's staging mode
 	_async_sector_parts = {}
 	_async_sector_arrays = {}
 	if _async_sectored:
@@ -3769,6 +3837,12 @@ func shell_telemetry() -> Dictionary:
 		out["sh_stage_on"] = 1 if _stage_active else 0
 		out["sh_stage_q"] = _stage_deferred_n
 		out["sh_stage_emit"] = _stage_last_emit_facets
+	# COSMOS DE-ORBIT SHELL PRE-WARM (FP_SHELL_PREWARM_DESCENT §E9): descent pre-warm readback. Off ⇒ keys
+	# never added ⇒ byte-identical telemetry consumers.
+	if CubeSphere.FP_SHELL_PREWARM_DESCENT:
+		out["sh_prewarm_on"] = 1 if _pwd_active else 0    # the task-required readback
+		out["sh_pwd_desc"] = 1 if _pwd_descending else 0
+		out["sh_pwd_snaps"] = _pwd_snap_count
 	# FP_FT_SHELL_BAND A/B readback: merge the far-tree zone state (ft_zone 0=S/1=B/2=O, ft_cards/ft_mesh shown, ft_off,
 	# ft_h) so a live climb reads WHICH zone the tier computed at each altitude — confound-free (no visual/biome ambiguity).
 	# Empty dict with the flag off ⇒ no keys added ⇒ byte-identical telemetry.

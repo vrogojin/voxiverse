@@ -5,6 +5,14 @@ extends SceneTree
 ## smoothing included, via the pure-CPU SurfaceTool.create_from_arrays round trip). Flag-INDEPENDENT (drives the twin
 ## emit functions directly on real facet caches, like verify_blocky_farring). Byte-off (flag false) is covered by
 ## verify_feature (FLAT 6042/0). Exits 0 all-pass, 1 on any failure.
+##
+## COSMOS DE-ORBIT SLICE SMOOTHING (docs/COSMOS-DEORBIT-SLICE-SMOOTHING-DESIGN.md): also proves G-FR-ACCUM
+## (FP_FARRING_EMIT_ACCUM — the in-place accumulator emits BYTE-IDENTICAL committed surfaces to the parts path; forced
+## via the `accum` emit param, flag-independent) and G-FR-FINE (FP_SHELL_SECTOR_FINE — the partition scales with the
+## compiled `_sector_split()`: exhaustive fid→one-sector, (K/split)² membership bound, cross-sector seam weld).
+## RUN needs FACETED; ALSO run once with FP_SHELL_SECTOR_FINE sedded on to exercise the 96-sector (split-4) partition:
+##   sed -i 's/const FACETED := false/const FACETED := true/;s/const FP_SHELL_SECTOR_FINE := false/const FP_SHELL_SECTOR_FINE := true/' godot/src/cosmos/cube_sphere.gd
+##   docker/engine/bin/godot.linuxbsd.editor.x86_64 --headless --path godot --import   # then run the script; REVERT + re-import after.
 
 var _pass := 0
 var _fail := 0
@@ -34,6 +42,16 @@ func _blocky_bulk(ring: FacetFarRing, fids: Array, sunk: Dictionary, tex: bool) 
 		var cells: int = CubeSphere.BACKSTOP_CELLS if sunk.get(fid, false) else ring.CELLS
 		ring._emit_blocky_bulk(parts, pos, col, cells, cells + 1, fid, tex)
 	return ring._bulk_assemble(parts)
+
+## Path C for the same set: the ACCUMULATOR twin (in-place base-offset fill) + _accum_finalize.
+func _blocky_accum(ring: FacetFarRing, fids: Array, sunk: Dictionary, tex: bool) -> Array:
+	var acc: Array = [PackedVector3Array(), PackedColorArray(), PackedVector2Array(), PackedVector2Array()]
+	for fid in fids:
+		var pos: PackedVector3Array = ring._bpos_cache[fid] if sunk.get(fid, false) else ring._pos_cache[fid]
+		var col: PackedColorArray = ring._bcol_cache[fid] if sunk.get(fid, false) else ring._col_cache[fid]
+		var cells: int = CubeSphere.BACKSTOP_CELLS if sunk.get(fid, false) else ring.CELLS
+		ring._emit_blocky_bulk(acc, pos, col, cells, cells + 1, fid, tex, true)
+	return ring._accum_finalize(acc)
 
 ## Max per-component normal deviation between two committed arrays (both must have normals).
 func _normal_dev(a: Array, b: Array) -> float:
@@ -105,6 +123,117 @@ func _initialize() -> void:
 	var e := ring._bulk_assemble([])
 	var ev: PackedVector3Array = e[Mesh.ARRAY_VERTEX]
 	_ok(e.size() == Mesh.ARRAY_MAX and ev.size() == 0, "D empty parts: ARRAY_MAX-shaped, 0 verts (guard-equivalent)")
+
+	# ==== G-FR-ACCUM (FP_FARRING_EMIT_ACCUM): the per-sector accumulator (base-offset in-place fill + _accum_finalize)
+	# produces the BYTE-IDENTICAL committed surface as the parts path (_emit_*_bulk + _bulk_assemble). Flag-INDEPENDENT
+	# — the emit twins take `accum` as a forced param, so both paths run in ONE process (the G-FR-BULK equality, one flag
+	# deeper). This is one of the two correctness lynchpins of the slice-smoothing PR. ====
+
+	# GA: blocky tex-off — parts vs accumulator, whole-set (incl. cross-facet normals via the identical finalize tail).
+	var ga_parts := _blocky_bulk(ring, fids, sunk, false)
+	var ga_accum := _blocky_accum(ring, fids, sunk, false)
+	_ok(ga_parts == ga_accum, "GA accum blocky tex-off: committed arrays BYTE-IDENTICAL to parts (%d verts)"
+		% (ga_parts[Mesh.ARRAY_VERTEX] as PackedVector3Array).size())
+	_ok(_normal_dev(ga_parts, ga_accum) <= 1.0e-9, "GA accum blocky tex-off: normals bit-equal (dev %.12f)" % _normal_dev(ga_parts, ga_accum))
+
+	# GB: blocky tex-on — the uv/uv2 accumulator slots.
+	var gb_parts := _blocky_bulk(ring, fids, sunk, true)
+	var gb_accum := _blocky_accum(ring, fids, sunk, true)
+	_ok(gb_parts == gb_accum, "GB accum blocky tex-on: committed arrays BYTE-IDENTICAL to parts (%d verts)"
+		% (gb_parts[Mesh.ARRAY_VERTEX] as PackedVector3Array).size())
+	_ok((gb_accum[Mesh.ARRAY_TEX_UV] as PackedVector2Array).size() > 0, "GB accum blocky tex-on: UVs present")
+
+	# GC: the SMOOTH path through _emit_cached itself — parts (bulk arg) vs accumulator (bulk arg + accum=true), mixed
+	# coarse+sunk. Proves the `accum` param threads through _emit_cached → _emit_smooth_bulk unchanged for the served config.
+	var gc_parts: Array = []
+	for fid in fids:
+		ring._emit_cached(null, fid, sunk.get(fid, false), true, CubeSphere.FP_FARRING_UNCOVERED_TRUE, gc_parts)
+	var gc_a := ring._bulk_assemble(gc_parts)
+	var gc_acc: Array = [PackedVector3Array(), PackedColorArray(), PackedVector2Array(), PackedVector2Array()]
+	for fid in fids:
+		ring._emit_cached(null, fid, sunk.get(fid, false), true, CubeSphere.FP_FARRING_UNCOVERED_TRUE, gc_acc, true)
+	var gc_b := ring._accum_finalize(gc_acc)
+	_ok(gc_a == gc_b, "GC accum smooth via _emit_cached (mixed coarse+sunk): committed arrays BYTE-IDENTICAL (%d verts)"
+		% (gc_a[Mesh.ARRAY_VERTEX] as PackedVector3Array).size())
+	_ok(_normal_dev(gc_a, gc_b) <= 1.0e-9, "GC accum smooth: normals bit-equal (dev %.12f)" % _normal_dev(gc_a, gc_b))
+
+	# GD: empty accumulator finalize — null AND an all-empty quad must both yield the same ARRAY_MAX-shaped, 0-vert block
+	# as _bulk_assemble([]) (the _swap_in_arrays size-guard equivalence, one path deeper).
+	var gd_null := ring._accum_finalize(null)
+	var gd_empty := ring._accum_finalize([PackedVector3Array(), PackedColorArray(), PackedVector2Array(), PackedVector2Array()])
+	var gdnv: PackedVector3Array = gd_null[Mesh.ARRAY_VERTEX]
+	var gdev: PackedVector3Array = gd_empty[Mesh.ARRAY_VERTEX]
+	_ok(gd_null.size() == Mesh.ARRAY_MAX and gdnv.size() == 0 and gd_empty.size() == Mesh.ARRAY_MAX and gdev.size() == 0,
+		"GD accum finalize null/empty: both ARRAY_MAX-shaped, 0 verts (guard-equivalent to _bulk_assemble([]))")
+
+	# ==== G-FR-FINE (FP_SHELL_SECTOR_FINE): the partition scales to the compiled split (2 → 24 sectors ≤144 fids each;
+	# 4 → 96 sectors ≤36 each). Run this gate ALSO with FP_SHELL_SECTOR_FINE sedded on to exercise the 96 partition. ====
+	var sp: int = ring._sector_split()
+	var nsF: int = ring._sector_count()
+	var per_face_max := (FacetAtlas.K / sp) * (FacetAtlas.K / sp)   # (K/sp)² — the max sector membership by arithmetic
+	_ok(nsF == 6 * sp * sp, "G-FR-FINE: _sector_count == 6·split² (split=%d ⇒ %d sectors)" % [sp, nsF])
+	# exhaustive partition: every fid → exactly one sector in [0, ns); per-sector membership; max == (K/sp)² (no ragged/fat edge).
+	var member := {}
+	var bad_fine := 0
+	for fid in range(FacetAtlas.K * FacetAtlas.K * 6):
+		var s: int = ring._sector_of(fid)
+		if s < 0 or s >= nsF or ring._sector_of(fid) != s:
+			bad_fine += 1
+		member[s] = int(member.get(s, 0)) + 1
+	var max_member := 0
+	var min_member := 1 << 30
+	for s in member.keys():
+		max_member = maxi(max_member, int(member[s]))
+		min_member = mini(min_member, int(member[s]))
+	_ok(bad_fine == 0, "G-FR-FINE: exhaustive fid→exactly-one-sector in [0,%d), pure (bad=%d)" % [nsF, bad_fine])
+	_ok(max_member == per_face_max and max_member <= per_face_max,
+		"G-FR-FINE: max sector membership == (K/%d)² == %d (≤ the per-slice bound; no clamp-induced fat edge)" % [sp, per_face_max])
+	_ok(member.size() == nsF and min_member == per_face_max,
+		"G-FR-FINE: the partition is EXACT — all %d sectors populated with %d fids each (K divides split)" % [nsF, per_face_max])
+
+	# G-FR-FINE seam continuity (the OTHER correctness lynchpin, mechanises §5.2 the way the far ring actually welds):
+	# the far-ring facets ABUT (they do not share bitwise vertices — a per-facet grid), so the seam guarantee is that the
+	# sector partition is GEOMETRY-INVARIANT — a facet emits the identical vertices no matter which sector collects it, so
+	# more sectors introduce NO new gap/overlap/duplicate. An adjacent facet pair straddling the FIRST sector boundary of
+	# the compiled split lands in DIFFERENT sectors; driving the REAL sectored worker+swap on JUST that pair and comparing
+	# the 2-sector union to the single-cap emit proves the sector boundary between two touching facets welds exactly.
+	var k := FacetAtlas.K
+	var half := int(k / sp)
+	var bb := 3
+	var f1 := (0 * k + (half - 1)) * k + bb
+	var f2 := (0 * k + half) * k + bb
+	var sf1: int = ring._sector_of(f1)
+	var sf2: int = ring._sector_of(f2)
+	_ok(sf1 != sf2, "G-FR-FINE seam: adjacent facets %d/%d straddle a sector border at split %d (sectors %d≠%d)" % [f1, f2, sp, sf1, sf2])
+	var sring := FacetFarRing.new()
+	sring._mi = MeshInstance3D.new()
+	sring.add_child(sring._mi)
+	sring._ensure_cached(f1)
+	sring._ensure_cached(f2)
+	sring._async_fids = PackedInt32Array([f1, f2])
+	sring._async_backstop = {}
+	sring._async_mid = {}
+	sring._async_v2_resident = {}
+	sring._async_env_warm = false
+	sring._async_chord_only = false
+	sring._async_warm_only = false
+	sring._async_sectored = true
+	sring._async_sector_parts = {}
+	sring._async_sector_arrays = {}
+	sring._sectors_compute_dirty()
+	var seam_dirty: int = (sring._async_sector_dirty as Dictionary).size()
+	sring._async_build_worker()
+	sring._swap_in_sectors()
+	var seam_uni: Array = sring.mesh_arrays()
+	var seam_ref_st := SurfaceTool.new()
+	seam_ref_st.begin(Mesh.PRIMITIVE_TRIANGLES)
+	for f in [f1, f2]:
+		sring._emit_cached(seam_ref_st, f, false)
+	seam_ref_st.generate_normals()
+	var seam_ref := _mesh_roundtrip(seam_ref_st.commit_to_arrays())
+	_ok(seam_dirty == 2 and not seam_uni.is_empty() and _pc_multiset(seam_uni) == _pc_multiset(seam_ref),
+		"G-FR-FINE seam: the cross-sector pair splits into %d sectors and its union == the single-cap emit — no gap/overlap/dup at the border (weld holds at split %d)" % [seam_dirty, sp])
+	sring.free()
 
 	# ==== P2 (FP_FARRING_SECTORS / G-FR-SECT) ====
 

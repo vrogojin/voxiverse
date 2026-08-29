@@ -350,6 +350,22 @@ const FP_FARRING_BULK_EMIT := false
 ## FLAT 6042/0).
 const FP_FARRING_SECTORS := false
 
+## COSMOS DE-ORBIT SLICE SMOOTHING P2 (docs/COSMOS-DEORBIT-SLICE-SMOOTHING-DESIGN.md §4, FP_FARRING_EMIT_ACCUM) —
+## the emit-allocation diet. The shipped P3 bulk path (FP_FARRING_BULK_EMIT) allocates ~6–8 heap objects PER FACET
+## (fresh tp/tc/tu/tu2 packed quads + wrapper Array + parts.append), all retained until `_bulk_assemble` runs a full
+## SECOND copy of the sector surface (append_array merge) before the create_from_arrays → generate_normals →
+## commit_to_arrays tail — ~10³ array allocs + one duplicate copy per dirty-sector build, all under the ONE wasm
+## dlmalloc lock the browser main thread convoys on. When true (requires FP_FARRING_BULK_EMIT + FP_FARRING_SECTORS),
+## the per-sector sink becomes an ACCUMULATOR quad written in place: the emit COUNT pass yields the exact vertex count,
+## the accumulator packed arrays grow once (CowData power-of-two alloc buckets ⇒ ~log₂ reallocs per sector, not one
+## per facet), and the fill writes at base-offset — the per-facet scratch quads AND the whole `_bulk_assemble` merge
+## pass disappear. `_accum_finalize` runs the IDENTICAL create_from_arrays → generate_normals → commit_to_arrays tail
+## on the identical vertex list (same facet iteration order, same per-facet fill order), so the committed surface is
+## BYTE-EQUAL to the parts path (verify_farring_emit / G-FR-ACCUM proves it). Worker-thread-local (single-writer under
+## `_async_building`); no new shared state. Default OFF → the sink stays the parts Array, `_bulk_assemble` runs
+## verbatim (byte-identical, FLAT 6042/0).
+const FP_FARRING_EMIT_ACCUM := false
+
 ## COSMOS DE-ORBIT SHELL STAGING (docs/COSMOS-DEORBIT-SHELL-STAGING-DESIGN.md) — stage the release-knee
 ## re-emit avalanche. At the S1 anchor-release knee the near re-grow dirties ALL 24 far-ring sectors in one
 ## dispatch (unsink + applied ladder + slot waves), so FP_FARRING_SECTORS re-emits the whole ~930-facet /
@@ -385,6 +401,21 @@ const SHELL_PWD_SAMPLE_MS := 250    # descent-latch sampling cadence (Δh/Δt pe
 const SHELL_PWD_SNAP_MS := 500      # min wall-ms between pre-warm-forced cap snapshots (the pacing bound)
 const SHELL_PWD_DRIFT_DEG := 2.0    # force a snapshot only when the axis swept ≥ this since the last one…
 const SHELL_PWD_DTH_DEG := 1.0      # …or θ_h moved ≥ this (else the pacer stays silent — no-op ticks are free)
+
+## COSMOS DE-ORBIT SLICE SMOOTHING (docs/COSMOS-DEORBIT-SLICE-SMOOTHING-DESIGN.md) — bound the staged shell slice.
+## FP_FARRING_SECTORS' 2×2 face-quadrant sector (≤ (K/2)²=144 fids) is the ATOMIC swap unit, so every staged slice
+## carries 130–144 facets and convoys the wasm dlmalloc lock 284–1041 ms/frame down the descent. When true, the
+## partition refines to 4×4 (96 sectors, ≤ 36 fids each), the staging budget/trigger/failsafe scale to match (one
+## sector per dispatch), and a pre-warm-voluntary run past the wall-clock cap keeps chaining budgeted slices instead
+## of dumping the remainder unbudgeted (voluntary emit ⇒ deferral is never a hole). Same welded-cache seam law, same
+## per-sector machinery (all arrays sized by _sector_count()). Requires FP_FARRING_SECTORS (+ STAGE_REEMIT/
+## PREWARM_DESCENT for the descent path). Default OFF → the shipped 24-sector partition + 112/168/2500 staging consts
+## verbatim (byte-identical, FLAT 6042/0).
+const FP_SHELL_SECTOR_FINE := false
+const SHELL_SECTOR_SPLIT_FINE := 4    # 4×4 per face → 96 sectors, ≤ (24/4)²=36 fids each
+const SHELL_STAGE_FACETS_FINE := 40   # per-dispatch budget: one full fine sector + headroom
+const SHELL_STAGE_TRIGGER_FINE := 48  # 1.2× budget (the 1.5× slack was the 144-fid atom's)
+const SHELL_STAGE_MAX_MS_FINE := 7000 # 2500 × (112/40) — forced-run failsafe only (see §3.2)
 
 ## COSMOS far-ring full coverage (docs/COSMOS-FARRING-COVERAGE-DESIGN.md) — the see-through-gap fix. The shipped far
 ## ring EXCLUDES the active facet + the live-pool neighbours (`_excluded`), so beyond the ~128-block near-blocky disk on
@@ -1286,6 +1317,16 @@ const FP_STREAM_TICK_ONCE := false      # §4: run the streaming orchestration t
 ## FLAT 6042/0). Gate: verify_fast_load.gd (G-FL-PACE).
 const FP_SMOOTH_V2_PACE := false
 const SMOOTH_V2_COMMIT_MS := 500        # min ms between FacetSmoothV2 commits (mirrors ORBIT_RELIEF_COMMIT_MS)
+
+## COSMOS DE-ORBIT SLICE SMOOTHING P3 (docs/COSMOS-DEORBIT-SLICE-SMOOTHING-DESIGN.md §7, FP_SV2_SHELL_YIELD) — keep the
+## FacetSmoothV2 whole-surface ArrayMesh apply (~72 ms observed on descent frames) off the frames a staged shell slice
+## is landing (150 ms slice + 72 ms collision would breach the 200 ms target). When true, `step()`'s third
+## `shell_yield` arg — true at the far-ring call site while a staged run is active (`_stage_active` or an in-flight
+## sectored async build) — defers ONLY the main-thread commit/merge-dispatch AFTER reap/evict/dispatch have run (tile
+## workers never stall); `_dirty` accumulates exactly as the FP_SMOOTH_V2_PACE law already guarantees and one later
+## commit folds every ready tile. The staged run is bounded (≤ SHELL_STAGE_MAX_MS_FINE forced / prewarm-band voluntary),
+## so the deferral is bounded. Off ⇒ the arg is false at the only call site ⇒ byte-identical (FLAT 6042/0).
+const FP_SV2_SHELL_YIELD := false
 
 ## FP_SMOOTH_V2_ASYNC_MERGE (docs/COSMOS-FAST-LOAD-DESIGN.md Phase 2, §2.1.3) — move `FacetSmoothV2.merge_tiles` (the
 ## ~630k-index concat/remap, the whole main-thread commit cost) OFF the main thread. `merge_tiles` is a PURE static

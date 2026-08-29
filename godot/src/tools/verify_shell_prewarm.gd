@@ -19,6 +19,12 @@ extends SceneTree
 ##   docker/engine/bin/godot.linuxbsd.editor.x86_64 --headless --path godot --script res://src/tools/verify_shell_prewarm.gd
 ##   then REVERT the sed + re-import. Exits 0 all-pass / 1 on any failure. FP_SHELL_PREWARM_DESCENT stays DEFAULT-FALSE.
 ##
+## COSMOS DE-ORBIT SLICE SMOOTHING (docs/COSMOS-DEORBIT-SLICE-SMOOTHING-DESIGN.md §6): the budget/trigger are
+## flag-resolved (_budget/_trigger), so the paced growth drain covers BOTH the shipped 24-sector prewarm AND the fine
+## 96-sector prewarm (≤40/dispatch, class-0 growth budgeted, residency converges). RUN a SECOND time with
+## FP_SHELL_SECTOR_FINE ALSO sedded on to exercise the fine drain (append to the sed above):
+##   ...;s/const FP_SHELL_SECTOR_FINE := false/const FP_SHELL_SECTOR_FINE := true/
+##
 ## Sub-gates: G-PWD-ENGAGE, G-PWD-PACE, G-PWD-BUDGET (load-bearing — FAILS on the shipped class-0 exemption), G-PWD-RESIDENT,
 ## G-PWD-KNEE, G-PWD-NOHOLE, G-PWD-CALM, G-PWD-BYTEOFF.
 
@@ -39,6 +45,13 @@ func _ok(c: bool, m: String) -> void:
 		_fail += 1
 		print("  FAIL: ", m)
 
+## FP_SHELL_SECTOR_FINE (docs/COSMOS-DEORBIT-SLICE-SMOOTHING-DESIGN.md §3.2): budget/trigger scale with the compiled flag
+## exactly as `_stage_filter_dirty` resolves them — the gate asserts against the SAME effective values (≤40/dispatch fine).
+func _budget() -> int:
+	return CubeSphere.SHELL_STAGE_FACETS_FINE if CubeSphere.FP_SHELL_SECTOR_FINE else CubeSphere.SHELL_STAGE_FACETS
+func _trigger() -> int:
+	return CubeSphere.SHELL_STAGE_TRIGGER_FINE if CubeSphere.FP_SHELL_SECTOR_FINE else CubeSphere.SHELL_STAGE_TRIGGER
+
 func _initialize() -> void:
 	print("=== verify_shell_prewarm (COSMOS DE-ORBIT SHELL PRE-WARM — FP_SHELL_PREWARM_DESCENT) ===")
 	if not CubeSphere.FACETED:
@@ -55,7 +68,7 @@ func _initialize() -> void:
 	print("  atlas: k=%d, R=%.0f, active=%d ; ALT[%.0f,%.0f] SAMPLE=%d SNAP=%d DRIFT=%.1f DTH=%.1f ; TRIGGER=%d BUDGET=%d ; FULL_COVER=%s PREWARM=%s SRC_PREWARM=%d SRC_COUNT=%d" % [
 		FA.K, _R, _active, CubeSphere.SHELL_PWD_ALT_LO, CubeSphere.SHELL_PWD_ALT_HI, CubeSphere.SHELL_PWD_SAMPLE_MS,
 		CubeSphere.SHELL_PWD_SNAP_MS, CubeSphere.SHELL_PWD_DRIFT_DEG, CubeSphere.SHELL_PWD_DTH_DEG,
-		CubeSphere.SHELL_STAGE_TRIGGER, CubeSphere.SHELL_STAGE_FACETS, str(CubeSphere.FP_FARRING_FULL_COVER),
+		_trigger(), _budget(), str(CubeSphere.FP_FARRING_FULL_COVER),
 		str(CubeSphere.FP_SHELL_PREWARM_DESCENT), FFR.SRC_PREWARM, FFR.SRC_COUNT])
 
 	_gate_engage()
@@ -256,13 +269,13 @@ func _gate_budget() -> void:
 	for f in vis:
 		ring.call("_ensure_cached", int(f))          # give every facet cache content (sectors gain members)
 	_empty_mi(ring)                                  # collapsed orbit residency: the cap is sectored, `_mi` empty
-	_ok(vis.size() > CubeSphere.SHELL_STAGE_TRIGGER,
-		"G-PWD-BUDGET: the collapsed-orbit open is a real burst (%d facets > TRIGGER %d)" % [vis.size(), CubeSphere.SHELL_STAGE_TRIGGER])
+	_ok(vis.size() > _trigger(),
+		"G-PWD-BUDGET: the collapsed-orbit open is a real burst (%d facets > TRIGGER %d)" % [vis.size(), _trigger()])
 	var counts := _sector_counts(ring, vis)
 	var max_sector := 0
 	for s in counts.keys():
 		max_sector = maxi(max_sector, int(counts[s]))
-	var hard_bound: int = maxi(CubeSphere.SHELL_STAGE_FACETS, max_sector)
+	var hard_bound: int = maxi(_budget(), max_sector)
 	# pwd_growth_ok requires the whole-cap `_mi` to hold NO surfaces (the sectored-orbit state): assert that precondition.
 	var mi = ring.get("_mi")
 	_ok(mi != null and (mi as MeshInstance3D).mesh != null and ((mi as MeshInstance3D).mesh as ArrayMesh).get_surface_count() == 0,
@@ -279,7 +292,7 @@ func _gate_budget() -> void:
 	_ok(deferred > 0,
 		"G-PWD-BUDGET: the growth burst STAGED (deferred=%d > 0) — class-0 growth was admitted to the budget (FAILS on the shipped exemption)" % deferred)
 	_ok(slice >= 1 and slice <= hard_bound,
-		"G-PWD-BUDGET: the emitted slice ∈ [1, max(BUDGET=%d, largest-sector=%d)=%d] (slice=%d) — growth is bounded, not a 927-facet avalanche" % [CubeSphere.SHELL_STAGE_FACETS, max_sector, hard_bound, slice])
+		"G-PWD-BUDGET: the emitted slice ∈ [1, max(BUDGET=%d, largest-sector=%d)=%d] (slice=%d) — growth is bounded, not a 927-facet avalanche" % [_budget(), max_sector, hard_bound, slice])
 	# cross-check: the slice == the sum of member counts of the sectors still dirty after the filter.
 	var dirty: Dictionary = ring.get("_async_sector_dirty")
 	var sum := 0
@@ -305,11 +318,11 @@ func _gate_resident() -> void:
 	var max_sector := 0
 	for s in counts.keys():
 		max_sector = maxi(max_sector, int(counts[s]))
-	var hard_bound: int = maxi(CubeSphere.SHELL_STAGE_FACETS, max_sector)
+	var hard_bound: int = maxi(_budget(), max_sector)
 	_freeze_prewarm_inputs(ring, vis, {})
 	var sax: Array = ring.call("_cull_params")[0]
 	var axis := Vector3(sax[0], sax[1], sax[2])
-	var cap := 4 * (vis.size() / maxi(1, CubeSphere.SHELL_STAGE_FACETS)) + 16
+	var cap := 4 * (vis.size() / maxi(1, _budget())) + 16
 	var cycles := 0
 	var budget_ok := true
 	var mono_ok := true
@@ -372,7 +385,7 @@ func _gate_knee() -> void:
 	var max_sector := 0
 	for s in counts.keys():
 		max_sector = maxi(max_sector, int(counts[s]))
-	var hard_bound: int = maxi(CubeSphere.SHELL_STAGE_FACETS, max_sector)
+	var hard_bound: int = maxi(_budget(), max_sector)
 	_freeze_prewarm_inputs(ring, fids, backstop)
 	# knee-state A (pre-warm era): a valid unsink column, applied cover still 0 (above the near re-grow).
 	ring.set("_async_unsink_col", Vector3(_R, 0.0, 0.0))
@@ -381,7 +394,7 @@ func _gate_knee() -> void:
 	var sax: Array = ring.call("_cull_params")[0]
 	var axis := Vector3(sax[0], sax[1], sax[2])
 	# drain the pre-warm residency; track the max slice — no dispatch may exceed the budget bound.
-	var cap := 4 * (fids.size() / maxi(1, CubeSphere.SHELL_STAGE_FACETS)) + 16
+	var cap := 4 * (fids.size() / maxi(1, _budget())) + 16
 	var cycles := 0
 	var max_slice := 0
 	while cycles < cap:

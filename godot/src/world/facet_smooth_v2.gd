@@ -687,7 +687,7 @@ func set_active(new_fid: int) -> void:
 ## capped to `SMOOTH_V2_COMMIT_MS` apart (dirty accumulates — the G3 pattern), and (b) its ~630k-index merge runs
 ## off-thread on a snapshot, the main thread paying only the GPU upload at reap. Both self-gate off their flags ⇒
 ## commit-every-reap, synchronous merge on main (byte-identical) when off.
-func step(settled := true, credit_ok := true) -> void:
+func step(settled := true, credit_ok := true, shell_yield := false) -> void:
 	if _sn == 0:
 		return
 	var deferred := CubeSphere.FP_LOAD_DEFER and not settled
@@ -757,6 +757,12 @@ func step(settled := true, credit_ok := true) -> void:
 		_s_task[slot] = WorkerThreadPool.add_task(Callable(self, "_build_worker").bind(slot), true, "smoothv2tile")
 		_dispatch_count += 1
 	if _dirty:
+		# FP_SV2_SHELL_YIELD (docs/COSMOS-DEORBIT-SLICE-SMOOTHING-DESIGN.md §7): a staged shell slice run is active — defer
+		# ONLY the main-thread commit / merge-dispatch (reap/evict/dispatch above already ran, so tile workers never stall).
+		# `_dirty` stays set and the PACE accumulation law folds every ready tile into one later commit; the staged run is
+		# bounded, so the deferral is bounded. Off / no active run ⇒ the arg is false at the only call site ⇒ byte-identical.
+		if shell_yield:
+			return
 		# FP_LOAD_DEFER: the FIRST commit after the settle-freeze lifts waits for the near field to stop starving
 		# (`credit_ok` = stream_credit > 0) so the accumulated backlog can't fire on one frame. Gated on the flag ⇒
 		# off, this is `false` and the commit is unconditional (byte-identical); once one commit lands the gate is spent.

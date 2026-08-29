@@ -18,8 +18,14 @@ extends SceneTree
 ##   docker/engine/bin/godot.linuxbsd.editor.x86_64 --headless --path godot --script res://src/tools/verify_shell_staging.gd
 ##   then REVERT the sed + re-import. Exits 0 all-pass / 1 on any failure.
 ##
+## COSMOS DE-ORBIT SLICE SMOOTHING (docs/COSMOS-DEORBIT-SLICE-SMOOTHING-DESIGN.md): the budget/trigger/failsafe are
+## flag-resolved (_budget/_trigger/_max_ms mirror `_stage_filter_dirty`), so this gate covers BOTH the shipped 24-sector
+## staging AND the fine 96-sector staging. RUN it a SECOND time with FP_SHELL_SECTOR_FINE sedded on to exercise the fine
+## budget (≤40/dispatch), the scaled failsafe cap (7000 ms), and the pre-warm-voluntary NO-DUMP (G-STG-PWD-NODUMP):
+##   sed -i 's/const FACETED := false/const FACETED := true/;s/const FP_FARRING_FULL_COVER := false/const FP_FARRING_FULL_COVER := true/;s/const FP_SHELL_SECTOR_FINE := false/const FP_SHELL_SECTOR_FINE := true/' godot/src/cosmos/cube_sphere.gd
+##
 ## Sub-gates: G-STG-TRIG, G-STG-BUDGET, G-STG-CONVERGE, G-STG-MERGE, G-STG-SUNKPIN, G-STG-NOHOLE, G-STG-HOLD,
-## G-STG-FAILSAFE, G-STG-BYTEOFF.
+## G-STG-FAILSAFE, G-STG-PWD-NODUMP, G-STG-BYTEOFF.
 
 const FA := preload("res://src/cosmos/facet_atlas.gd")
 const TC := preload("res://src/world/terrain_config.gd")
@@ -38,6 +44,15 @@ func _ok(c: bool, m: String) -> void:
 		_fail += 1
 		print("  FAIL: ", m)
 
+## FP_SHELL_SECTOR_FINE (docs/COSMOS-DEORBIT-SLICE-SMOOTHING-DESIGN.md §3.2): the budget/trigger/failsafe scale with the
+## compiled flag exactly as `_stage_filter_dirty` resolves them — the gate asserts against the SAME effective values.
+func _budget() -> int:
+	return CubeSphere.SHELL_STAGE_FACETS_FINE if CubeSphere.FP_SHELL_SECTOR_FINE else CubeSphere.SHELL_STAGE_FACETS
+func _trigger() -> int:
+	return CubeSphere.SHELL_STAGE_TRIGGER_FINE if CubeSphere.FP_SHELL_SECTOR_FINE else CubeSphere.SHELL_STAGE_TRIGGER
+func _max_ms() -> int:
+	return CubeSphere.SHELL_STAGE_MAX_MS_FINE if CubeSphere.FP_SHELL_SECTOR_FINE else CubeSphere.SHELL_STAGE_MAX_MS
+
 func _initialize() -> void:
 	print("=== verify_shell_staging (COSMOS DE-ORBIT SHELL STAGING — FP_SHELL_STAGE_REEMIT) ===")
 	if not CubeSphere.FACETED:
@@ -48,8 +63,8 @@ func _initialize() -> void:
 	_R = FA.R_BLOCKS
 	_active = FA.spawn_facet()
 	TC.set_active_facet(_active)
-	print("  atlas: k=%d, R=%.0f, active=%d, TRIGGER=%d, BUDGET=%d, MAX_MS=%d, FULL_COVER=%s, SECTORS=%s, STAGE=%s" % [
-		FA.K, _R, _active, CubeSphere.SHELL_STAGE_TRIGGER, CubeSphere.SHELL_STAGE_FACETS, CubeSphere.SHELL_STAGE_MAX_MS,
+	print("  atlas: k=%d, R=%.0f, active=%d, TRIGGER=%d, BUDGET=%d, MAX_MS=%d, FINE=%s, FULL_COVER=%s, SECTORS=%s, STAGE=%s" % [
+		FA.K, _R, _active, _trigger(), _budget(), _max_ms(), str(CubeSphere.FP_SHELL_SECTOR_FINE),
 		str(CubeSphere.FP_FARRING_FULL_COVER), str(CubeSphere.FP_FARRING_SECTORS), str(CubeSphere.FP_SHELL_STAGE_REEMIT)])
 
 	_gate_trig()
@@ -58,6 +73,7 @@ func _initialize() -> void:
 	_gate_sunkpin()
 	_gate_hold()
 	_gate_failsafe()
+	_gate_prewarm_nodump()
 	_gate_byteoff()
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
@@ -137,7 +153,7 @@ func _gate_trig() -> void:
 	# (1) small: dirty ONE facet's signature ⇒ one sector dirty (~a few dozen facets < TRIGGER) ⇒ no stage.
 	var ring := _prep_ring(_R + ORBIT_D_ADD)
 	var vis: PackedInt32Array = ring.call("visible_fids")
-	_ok(vis.size() > CubeSphere.SHELL_STAGE_TRIGGER, "G-STG-TRIG: the orbit cap is a real burst (%d facets > TRIGGER %d)" % [vis.size(), CubeSphere.SHELL_STAGE_TRIGGER])
+	_ok(vis.size() > _trigger(), "G-STG-TRIG: the orbit cap is a real burst (%d facets > TRIGGER %d)" % [vis.size(), _trigger()])
 	ring.call("_ensure_backstop_cached", int(vis[0]))     # one facet → one sector dirty
 	_dispatch(ring, true, true)
 	_ok(not bool(ring.get("_stage_active")) and int(ring.get("_stage_deferred_n")) == 0,
@@ -165,7 +181,7 @@ func _gate_budget_converge_nohole() -> void:
 		max_sector = maxi(max_sector, int(counts[s]))
 	var n_total := refvis.size()
 	refr.free()
-	var hard_bound: int = maxi(CubeSphere.SHELL_STAGE_FACETS, max_sector)
+	var hard_bound: int = maxi(_budget(), max_sector)
 
 	# Staged run from the same start state.
 	var ring := _prep_ring(_R + ORBIT_D_ADD)
@@ -175,7 +191,7 @@ func _gate_budget_converge_nohole() -> void:
 	var max_slice := 0
 	var hole_ok := true
 	var resident_ok := true
-	var cap := 2 * (n_total / maxi(1, CubeSphere.SHELL_STAGE_FACETS)) + 8
+	var cap := 2 * (n_total / maxi(1, _budget())) + 8
 	var cycles := 0
 	var drained := false
 	while cycles < cap:
@@ -215,7 +231,7 @@ func _gate_budget_converge_nohole() -> void:
 			break
 	_ok(drained, "G-STG-BUDGET: the staged run DRAINED (nothing deferred on the last cycle) in %d cycles" % cycles)
 	_ok(cycles >= 2, "G-STG-BUDGET: the burst genuinely staged across multiple worker cycles (%d cycles)" % cycles)
-	_ok(budget_ok, "G-STG-BUDGET: every staged slice ∈ [1, max(BUDGET=%d, largest-sector=%d)=%d] (min=%d max=%d)" % [CubeSphere.SHELL_STAGE_FACETS, max_sector, hard_bound, min_slice, max_slice])
+	_ok(budget_ok, "G-STG-BUDGET: every staged slice ∈ [1, max(BUDGET=%d, largest-sector=%d)=%d] (min=%d max=%d)" % [_budget(), max_sector, hard_bound, min_slice, max_slice])
 	_ok(hole_ok, "G-STG-NOHOLE: the drawn union ⊇ the reference emit at EVERY intermediate cycle (sh_emit never drops)")
 	_ok(resident_ok, "G-STG-NOHOLE: every non-dirty built sector kept a non-null resident mesh throughout (deferred sectors keep drawing)")
 	# CONVERGE: the staged final shell is IDENTICAL to the un-staged reference.
@@ -256,7 +272,7 @@ func _gate_merge() -> void:
 	ring.set("_bpos_cache", bpos)
 	_ok(merged_sector >= 0, "G-STG-MERGE: injected new dirt on an already-emitted sector (sector %d)" % merged_sector)
 	# drain to convergence; the merged sector must re-enter the dirty set at least once.
-	var cap := 2 * (n_total / maxi(1, CubeSphere.SHELL_STAGE_FACETS)) + 10
+	var cap := 2 * (n_total / maxi(1, _budget())) + 10
 	var cycles := 0
 	var merged_seen := false
 	var drained := false
@@ -379,7 +395,7 @@ func _gate_hold() -> void:
 	ring.set("_applied_r", 77.0)
 	# subsequent staged dispatches must STILL freeze the stage-start hold, not the mutated live values.
 	var froze_hold := true
-	var cap := 2 * (n_total / maxi(1, CubeSphere.SHELL_STAGE_FACETS)) + 10
+	var cap := 2 * (n_total / maxi(1, _budget())) + 10
 	var cycles := 0
 	while cycles < cap and bool(ring.get("_stage_active")):
 		ring.call("_dispatch_async_rebuild", true, true)
@@ -411,7 +427,7 @@ func _gate_failsafe() -> void:
 	ring.call("_sectors_compute_dirty", true)
 	var full_remaining := int((ring.get("_async_sector_dirty") as Dictionary).size())
 	# inject a stale clock → force the failsafe on the next dispatch.
-	ring.set("_stage_start_ms", Time.get_ticks_msec() - CubeSphere.SHELL_STAGE_MAX_MS - 1)
+	ring.set("_stage_start_ms", Time.get_ticks_msec() - _max_ms() - 1)
 	ring.call("_dispatch_async_rebuild", true, true)
 	var emitted_dirty := int((ring.get("_async_sector_dirty") as Dictionary).size())
 	_ok(emitted_dirty == full_remaining and full_remaining > 0,
@@ -419,6 +435,47 @@ func _gate_failsafe() -> void:
 	_ok(int(ring.get("_stage_deferred_n")) == 0 and not bool(ring.get("_stage_active")),
 		"G-STG-FAILSAFE: the run closed (deferred=0, _stage_active false)")
 	_drain_worker(ring)
+	ring.free()
+
+# ---------------- G-STG-PWD-NODUMP (FP_SHELL_SECTOR_FINE §3.2, the key trap) ----------------
+## The fine failsafe's pre-warm-VOLUNTARY no-dump. A staged run past the (scaled) wall-clock cap: with FP_SHELL_SECTOR_FINE
+## on AND `_async_prewarm` true the run must NOT dump the remainder unbudgeted (that would re-create the avalanche the whole
+## PR removes) — it keeps chaining budgeted slices; with the flag OFF the shipped dump-and-close semantics hold. Driven via
+## the DIRECT `_stage_filter_dirty(axis, true)` with `_async_prewarm` forced true (the verify_shell_prewarm pattern —
+## `_dispatch_async_rebuild` would recompute `_async_prewarm` from the un-sedded FP_SHELL_PREWARM_DESCENT).
+func _gate_prewarm_nodump() -> void:
+	print("  --- G-STG-PWD-NODUMP: a pre-warm-voluntary fine run past MAX_MS_FINE keeps chaining (no dump); off ⇒ shipped dump ---")
+	var ring := _prep_ring(_R + ORBIT_D_ADD)
+	var vis := _burst(ring)
+	ring.set("_async_fids", vis)
+	ring.set("_async_sectored", true)
+	ring.set("_async_prewarm", true)
+	var sax: Array = ring.call("_cull_params")[0]
+	var axis := Vector3(sax[0], sax[1], sax[2])
+	# start a staged run (direct drive).
+	ring.call("_sectors_compute_dirty", true)
+	ring.call("_stage_filter_dirty", axis, true)
+	_ok(bool(ring.get("_stage_active")) and int(ring.get("_stage_deferred_n")) > 0,
+		"G-STG-PWD-NODUMP: a staged run started (active, deferred=%d)" % int(ring.get("_stage_deferred_n")))
+	# inject a stale stage-start clock past the (flag-scaled) failsafe cap.
+	ring.set("_stage_start_ms", Time.get_ticks_msec() - _max_ms() - 1)
+	ring.set("_async_prewarm", true)   # re-assert the frozen voluntary mode (compute-dirty does not touch it, but be explicit)
+	ring.call("_sectors_compute_dirty", true)
+	var full_remaining := int((ring.get("_async_sector_dirty") as Dictionary).size())
+	ring.call("_stage_filter_dirty", axis, true)
+	var emitted := int((ring.get("_async_sector_dirty") as Dictionary).size())
+	if CubeSphere.FP_SHELL_SECTOR_FINE:
+		var counts := _sector_counts(ring, vis)
+		var max_sector := 0
+		for s in counts.keys():
+			max_sector = maxi(max_sector, int(counts[s]))
+		var hard_bound: int = maxi(_budget(), max_sector)
+		_ok(bool(ring.get("_stage_active")) and int(ring.get("_stage_deferred_n")) > 0 and emitted < full_remaining
+				and int(ring.get("_stage_last_emit_facets")) <= hard_bound,
+			"G-STG-PWD-NODUMP (fine): past MAX_MS_FINE the VOLUNTARY run did NOT dump — chained a budgeted slice (emit %d < full %d, active, slice ≤ %d)" % [emitted, full_remaining, hard_bound])
+	else:
+		_ok(not bool(ring.get("_stage_active")) and int(ring.get("_stage_deferred_n")) == 0 and emitted == full_remaining and full_remaining > 0,
+			"G-STG-PWD-NODUMP (off): past MAX_MS the run DUMPED the remainder + closed (shipped semantics, %d sectors)" % emitted)
 	ring.free()
 
 # ---------------- G-STG-BYTEOFF ----------------

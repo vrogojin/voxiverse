@@ -3882,6 +3882,13 @@ func shell_telemetry() -> Dictionary:
 		var fb = _far_trees.shell_band_state()
 		if fb is Dictionary and not (fb as Dictionary).is_empty():
 			out.merge(fb as Dictionary)
+	# COSMOS DE-ORBIT STRUCT STAGING (FP_STRUCT_BAKE_STAGE §3.8): the staged wake-bake drain sensor (st_pend,
+	# st_bk, st_bms, st_passes, st_live) — a live de-orbit reads the drain draining nearest-first over ~4-8 s
+	# instead of one 3555 ms burst. Off ⇒ {} merged ⇒ byte-identical telemetry (the shell_band_state precedent).
+	if _far_structures != null:
+		var sb = _far_structures.bake_stage_state()
+		if sb is Dictionary and not (sb as Dictionary).is_empty():
+			out.merge(sb as Dictionary)
 	# FP_FAR_TERMINATOR_WELD sun-echo telemetry: each far tier's OWN live shader sun_dir, so a live A/B can confirm
 	# they all track the same Sun (pre-fix: sd_v2 stuck ~(1,0,0) day while others live; post-fix: all match). Off =>
 	# the keys are never added to the dict => byte-identical for any telemetry consumer.

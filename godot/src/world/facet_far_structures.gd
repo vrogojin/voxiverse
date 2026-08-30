@@ -63,6 +63,13 @@ var _last_edits_rev := -1
 var _last_cover_fp := 0
 var _last_step_ms := 0
 
+# FP_STRUCT_BAKE_STAGE drain state (inert off-flag: never set, never read on the shipped path)
+var _bake_pending := false                    # un-baked in-band records remain — re-dispatch every frame
+var _last_commit_ms := 0                      # merged-mesh commit cadence anchor (drain frames skip commits)
+var _dbg_stage_passes := 0
+var _dbg_stage_baked_last := 0
+var _dbg_stage_ms_last := 0.0
+
 # telemetry / gate read-back
 var _dbg_rebuild_count := 0
 var _live_structures := 0
@@ -224,7 +231,10 @@ func step(settled := true, credit_ok := true, cam_render := Vector3.ZERO) -> voi
 	if not _credit_gate_open(settled, credit_ok):
 		return
 	var now := Time.get_ticks_msec()
-	if now - _last_step_ms < CubeSphere.STRUCT_STEP_MS:
+	# FP_STRUCT_BAKE_STAGE: while a staged drain is pending, step EVERY frame (the per-pass time box bounds the
+	# cost); the merged-mesh COMMIT keeps the shipped STRUCT_STEP_MS cadence via _last_commit_ms in _rebuild.
+	var draining := CubeSphere.FP_STRUCT_BAKE_STAGE and _bake_pending
+	if not draining and now - _last_step_ms < CubeSphere.STRUCT_STEP_MS:
 		return
 	_last_step_ms = now
 	var centre := (_ring as FacetFarRing).render_centre()
@@ -265,7 +275,8 @@ func _inputs_changed(cam_abs: Vector3, reg_count: int, rev_sum: int, cover_fp: i
 		or rev_sum != _last_rev_sum \
 		or _current_edits_rev() != _last_edits_rev \
 		or cover_fp != _last_cover_fp \
-		or _cull_pending
+		or _cull_pending \
+		or (CubeSphere.FP_STRUCT_BAKE_STAGE and _bake_pending)
 	if changed:
 		_have_rebuilt = true
 		_last_cam = cam_abs
@@ -288,12 +299,18 @@ func _probe_pass(reg: Array, cam_abs: Vector3) -> int:
 		return 0
 	var r0 := float(TerrainConfig.near_render_radius())
 	var fp := 0
+	var probes := 0
 	for rec in reg:
 		var fid: int = int(rec["fid"])
 		var dist := _structure_dist(rec, cam_abs)
-		if dist < r0 or dist > r0 + CULL_ANNULUS:
+		# FP_STRUCT_NEAR_HOLD: the band floor is no longer probe-free — inside r0 the far model holds until
+		# the near build actually covers it, so it MUST be probed (capped; past the cap ⇒ no cache entry ⇒
+		# UNKNOWABLE ⇒ hold — the safe direction). Off ⇒ the shipped skip verbatim.
+		var below_floor := dist < r0 and (not CubeSphere.FP_STRUCT_NEAR_HOLD or probes >= CubeSphere.STRUCT_HOLD_PROBE_CAP)
+		if below_floor or dist > r0 + CULL_ANNULUS:
 			continue                                   # band floor / beyond near reach — no probe
 		var st := int(_near_query.call(fid, _footprint(rec)))
+		probes += 1
 		_probe_cache[int(rec["root"])] = st
 		var hidden: bool = _cull.has(int(rec["root"])) and bool(_cull[int(rec["root"])]["hidden"])
 		if st == NearPresence.COVERED:
@@ -312,7 +329,25 @@ func _cull_emit(rec: Dictionary, cam_abs: Vector3) -> bool:
 	var dist := _structure_dist(rec, cam_abs)
 	var r0 := float(TerrainConfig.near_render_radius())
 	if dist < r0:
-		return false                                   # band floor: the near field owns the view (no far model)
+		# FP_STRUCT_NEAR_HOLD (live defect: houses vanish during descent): the shipped floor drops the far
+		# model on DISTANCE ALONE while the near build still lags the descent — a renderer-less house. Inside
+		# r0, hide ONLY on an actual COVERED probe (positive = fact ⇒ streak 1, the far-trees law,
+		# facet_far_trees.gd:546); NOT_COVERED while hidden restores after STRUCT_SHOW_STREAK (near unloaded ⇒
+		# far returns); UNKNOWABLE never flips (shared invariant). Off ⇒ the shipped `return false` verbatim.
+		if not CubeSphere.FP_STRUCT_NEAR_HOLD:
+			return false
+		var st0 := int(_probe_cache.get(root, NearPresence.UNKNOWABLE))
+		var cs0: Dictionary = _cull.get(root, {"hidden": false, "cover": 0, "uncover": 0})
+		if st0 == NearPresence.COVERED:
+			cs0["hidden"] = true
+			cs0["cover"] = 0; cs0["uncover"] = 0
+		elif st0 == NearPresence.NOT_COVERED and bool(cs0["hidden"]):
+			cs0["uncover"] = int(cs0["uncover"]) + 1
+			if int(cs0["uncover"]) >= CubeSphere.STRUCT_SHOW_STREAK:
+				cs0["hidden"] = false
+				cs0["uncover"] = 0
+		_cull[root] = cs0
+		return not bool(cs0["hidden"])                 # HOLD: emitted until the near build actually covers it
 	if dist > r0 + CULL_ANNULUS:
 		return true                                    # beyond near reach — emit, no cull
 	var st := int(_probe_cache.get(root, NearPresence.UNKNOWABLE))
@@ -368,6 +403,12 @@ func _rebuild(reg: Array, cam_abs: Vector3) -> void:
 	# nearest-first so the tri cap keeps the closest (most visible) structures
 	var ordered := reg.duplicate()
 	ordered.sort_custom(func(a, b): return _structure_dist(a, cam_abs) < _structure_dist(b, cam_abs))
+	# FP_STRUCT_BAKE_STAGE: drain fresh bakes under the budget FIRST; on a bake-only frame (pending drain,
+	# commit cadence not due) stop here — the resident merged mesh keeps drawing untouched (never a removal).
+	if CubeSphere.FP_STRUCT_BAKE_STAGE:
+		_drain_bakes(ordered, cam_abs)
+		if _bake_pending and Time.get_ticks_msec() - _last_commit_ms < CubeSphere.STRUCT_STEP_MS:
+			return
 	var verts := PackedVector3Array()
 	var colors := PackedColorArray()
 	var tris := 0
@@ -379,6 +420,8 @@ func _rebuild(reg: Array, cam_abs: Vector3) -> void:
 			continue
 		if not _cull_emit(rec, cam_abs):
 			continue
+		if CubeSphere.FP_STRUCT_BAKE_STAGE and not _has_bake(rec):
+			continue        # staged: never-yet-shown house — its addition waits for the drain (removals never wait)
 		var bake := _ensure_bake(rec)
 		if bake.is_empty() or int(bake["tris"]) == 0:
 			continue
@@ -390,6 +433,8 @@ func _rebuild(reg: Array, cam_abs: Vector3) -> void:
 		tris += int(bake["tris"])
 		count += 1
 	_commit_mesh(verts, colors)
+	if CubeSphere.FP_STRUCT_BAKE_STAGE:
+		_last_commit_ms = Time.get_ticks_msec()
 	_live_structures = count
 	_live_tris = tris
 	_capped = capped
@@ -448,6 +493,43 @@ func _ensure_bake(rec: Dictionary) -> Dictionary:
 	_baked[root] = out
 	_baked_bytes += bytes
 	return out
+
+## True iff `rec` has a CURRENT-rev cached bake (i.e. it is, or can instantly be, in the merged mesh).
+func _has_bake(rec: Dictionary) -> bool:
+	var cached: Variant = _baked.get(int(rec["root"]))
+	return cached != null and int((cached as Dictionary)["rev"]) == int(rec["rev"])
+
+## FP_STRUCT_BAKE_STAGE: nearest-first, time-boxed bake drain. Always bakes ≥ STRUCT_BAKE_STAGE_MIN fresh
+## records (guaranteed forward progress ⇒ guaranteed convergence), then stops past STRUCT_BAKE_STAGE_MS.
+## Sets _bake_pending iff un-baked in-band records remain. Byte-cap {} bakes are skipped without re-arming
+## (the shipped NEVER-OOM degrade — they retry next pass at O(1) cost, exactly as today).
+func _drain_bakes(ordered: Array, cam_abs: Vector3) -> void:
+	_dbg_stage_passes += 1
+	var t0 := Time.get_ticks_usec()
+	var fresh := 0
+	_bake_pending = false
+	for rec in ordered:
+		if _structure_dist(rec, cam_abs) > CubeSphere.STRUCT_FAR_MAX:
+			continue
+		if _has_bake(rec):
+			continue
+		if fresh >= CubeSphere.STRUCT_BAKE_STAGE_MIN \
+				and float(Time.get_ticks_usec() - t0) * 0.001 >= CubeSphere.STRUCT_BAKE_STAGE_MS:
+			_bake_pending = true
+			break
+		if _ensure_bake(rec).is_empty():
+			continue
+		fresh += 1
+	_dbg_stage_baked_last = fresh
+	_dbg_stage_ms_last = float(Time.get_ticks_usec() - t0) * 0.001
+
+## Telemetry / gate read-back ({} off-flag — confound-free A/B, the shell_band_state() convention).
+func bake_stage_state() -> Dictionary:
+	if not CubeSphere.FP_STRUCT_BAKE_STAGE:
+		return {}
+	return {"st_pend": _bake_pending, "st_bk": _dbg_stage_baked_last,
+			"st_bms": snappedf(_dbg_stage_ms_last, 0.1), "st_passes": _dbg_stage_passes,
+			"st_live": _live_structures}
 
 func _evict_stale_bakes(reg: Array) -> void:
 	if _baked.is_empty():

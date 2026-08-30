@@ -1263,6 +1263,23 @@ const STRUCT_SHOW_STREAK := 2                # §7.3 consecutive NOT_COVERED pro
 ## Off ⇒ the shipped binary suspend + off-surface early-return, byte-identical. Needs FP_STRUCT_FAR. Gate: G-ST-SHELL.
 const FP_STRUCT_SHELL_BAND := false          # far structures render in the off-surface shell band [OFFSURFACE_Y, FT_SHELL_HIDE_ALT)
 
+## FP_STRUCT_NEAR_HOLD + FP_STRUCT_BAKE_STAGE (docs/COSMOS-DEORBIT-STRUCT-STAGING-DESIGN.md) — the de-orbit
+## village handoff, two composing fixes. (1) HOLD: the shipped cull drops a far house model UNCONDITIONALLY at
+## dist < near_render_radius() with NO NearPresence probe, so a descending player sees houses VANISH until the
+## lagging near build arrives (live-confirmed). Inside r0 the far model now HOLDS until the near build actually
+## probes COVERED (positive = fact ⇒ hide immediately, the far-trees streak-1 law; NOT_COVERED while hidden
+## restores after STRUCT_SHOW_STREAK; UNKNOWABLE never flips). (2) STAGE: the zone-B wake at FT_SHELL_HIDE_ALT
+## first-bakes EVERY GEN house in the STRUCT_FAR_MAX band in ONE frame (measured 3555 ms at alt ~598) — the
+## bake now drains nearest-first, ≥ STAGE_MIN houses and ≤ STAGE_MS ms per pass, every frame while pending;
+## the merged-mesh commit keeps the shipped STRUCT_STEP_MS cadence. Staging only delays the ADDITION of a
+## never-yet-shown house — it NEVER removes a shown one. Both default OFF ⇒ byte-identical (FLAT 6042/0).
+## Need FP_STRUCT_FAR. Gates: G-ST-HOLD / G-ST-STAGE (src/tools/verify_structures.gd).
+const FP_STRUCT_NEAR_HOLD := false           # far model held inside r0 until the near build probes COVERED (no hole)
+const FP_STRUCT_BAKE_STAGE := false          # staged wake-bake drain (no single-frame village bake burst)
+const STRUCT_BAKE_STAGE_MS := 8.0            # per-pass bake time box (ms) ≈ half a 60 Hz frame
+const STRUCT_BAKE_STAGE_MIN := 2             # min fresh bakes per pass — guaranteed forward progress
+const STRUCT_HOLD_PROBE_CAP := 96            # max inside-r0 probes per pass (past ⇒ UNKNOWABLE ⇒ hold; safe degrade)
+
 ## FP_DEM_DEFER (docs/COSMOS-STREAM-PARALLEL-DESIGN.md Phase A — the fresh-reload fix) — the whole-planet coarse
 ## DEM (`FP_GLOBAL_RELIEF_DATA` / `GlobalReliefData.step`) is frame-budget GATED but the admitted unit is UNBOUNDED
 ## on the main thread (an O(3456) allocating `_next_unbaked` scan + a `bake_smooth_tile` + a 1089-node hillshade =

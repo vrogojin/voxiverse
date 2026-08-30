@@ -240,6 +240,11 @@ const FP_GEN_POOL_PREWARM := 0
 ## (Lever 2 — the VoxelBuffer object recycler, FP_GEN_SMALLOBJ_POOL — is HELD for Build #2 pending the
 ## probe's verdict; see docs/COSMOS-GEN-CONVOY-DESIGN.md §5.)
 const FP_GEN_ALLOC_PROBE := false
+## FP_GEN_LOCK_PROBE (COSMOS GEN-CONVOY §6 lock-wait extension) enables the main-thread engine-lock
+## acquire-WAIT probe: times how long the main thread busy-spins acquiring the VoxelData map RWLock and the
+## task-runner mutexes while the workers flood generation. Surfaces wf_lock_rwlock_ms / wf_lock_mutex_ms.
+## Same compile requirement as FP_GEN_ALLOC_PROBE (WEB_ALLOC_PROBE=yes); otherwise inert. Default false.
+const FP_GEN_LOCK_PROBE := false
 
 ## COSMOS CLIMATE-BIOMES B1 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §6/§7) — the Whittaker temperature×moisture
 ## biome classifier. When true, TerrainConfig._biome swaps its shipped first-match chain for a

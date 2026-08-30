@@ -695,6 +695,14 @@ func _capture_worst_frame_snapshot() -> Dictionary:
 		# cumulative main-thread ms spent draining completed gen/mesh tasks. §2.6 observability-hole closer.
 		if probe.has("dequeue_ms"):
 			snap["wf_dequeue_ms"] = snappedf(float(probe.get("dequeue_ms", 0.0)), 0.01)
+		# COSMOS GEN-CONVOY §6 lock-wait: cumulative main-thread engine-lock acquire-wait (ms) + counts.
+		# lock_rwlock ≈ the VoxelData map RWLock; lock_mutex ≈ the task-runner mutexes during a gen flood.
+		# Present only when the lock probe was compiled in (WEB_ALLOC_PROBE=yes) AND FP_GEN_LOCK_PROBE on.
+		if probe.has("lock_rwlock_ms"):
+			snap["wf_lock_rwlock_ms"] = snappedf(float(probe.get("lock_rwlock_ms", 0.0)), 0.01)
+			snap["wf_lock_mutex_ms"] = snappedf(float(probe.get("lock_mutex_ms", 0.0)), 0.01)
+			snap["wf_lock_rwlock_n"] = int(probe.get("lock_rwlock_n", 0))
+			snap["wf_lock_mutex_n"] = int(probe.get("lock_mutex_n", 0))
 	# render/physics/scene load AT the worst frame (same monitor calls the emit path makes, read at the correct instant).
 	snap["wf_phys_ms"] = snappedf(Performance.get_monitor(Performance.TIME_PHYSICS_PROCESS) * 1000.0, 0.01)
 	snap["wf_draws"] = int(Performance.get_monitor(Performance.RENDER_TOTAL_DRAW_CALLS_IN_FRAME))

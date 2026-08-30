@@ -4129,6 +4129,7 @@ func _make_cpp_generator(src_gen: Object) -> Object:
 	cfg["gen_profs_tls"] = CubeSphere.FP_GEN_PROFS_TLS           # COSMOS GEN-CONVOY §4.B lever 1: thread_local profs reuse
 	cfg["gen_pool_prewarm"] = CubeSphere.FP_GEN_POOL_PREWARM     # COSMOS GEN-CONVOY §4.B lever 3: 8 KiB channel pre-warm count
 	cfg["gen_alloc_probe"] = CubeSphere.FP_GEN_ALLOC_PROBE       # COSMOS GEN-CONVOY §6: enable core alloc-lock stall probe
+	cfg["gen_lock_probe"] = CubeSphere.FP_GEN_LOCK_PROBE         # COSMOS GEN-CONVOY §6 lock-wait: enable main-thread lock-wait probe
 	# (lever 2 gen_smallobj_pool / FP_GEN_SMALLOBJ_POOL held for Build #2 — see COSMOS-GEN-CONVOY-DESIGN §5)
 	cfg["model_count"] = src_gen.get("model_count")
 	cfg["waterlog"] = src_gen.get("waterlog")

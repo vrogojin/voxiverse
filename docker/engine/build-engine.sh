@@ -155,6 +155,36 @@ fi
 # shellcheck disable=SC1091
 source /emsdk/emsdk_env.sh >/dev/null 2>&1 || true
 
+# COSMOS-PERF-ENGINE-DEEP §3 (mimalloc-FIT): the P6 mimalloc heap veto (+422 MB) was MISATTRIBUTED to
+# per-thread segments × WEB_PTHREAD_POOL. The REAL driver is mimalloc's 32-bit `arena_reserve` default =
+# 128 MiB PER ARENA GROWTH STEP: on wasm it sits on emmalloc/sbrk where reserve == committed real
+# wasmMemory and decommit is a no-op, so every arena step permanently grows the linear heap. Capping it
+# lets mimalloc's proven −23% worst-frame win fit the +120 MB NEVER-OOM ceiling. Guarded: hard-fail if the
+# exact literal isn't present exactly once (an emsdk-bump canary). Only touches the build when mimalloc is
+# selected; the cached libmimalloc*.a is purged so embuilder recompiles from the capped source. Revert knob:
+# WEB_MALLOC=dlmalloc (this block is skipped entirely).
+if [ "${WEB_MALLOC}" = "mimalloc" ]; then
+  MI_OPT=/emsdk/upstream/emscripten/system/lib/mimalloc/src/options.c
+  MI_RES_KIB="${WEB_MIMALLOC_ARENA_RESERVE_KIB:-16384}"
+  mi_n=$(grep -c '128L \* 1024L' "$MI_OPT" 2>/dev/null || echo 0)
+  if [ "$mi_n" != "1" ]; then
+    echo "FATAL: mimalloc options.c 32-bit arena_reserve literal '128L * 1024L' count=$mi_n (expected 1) — emsdk/mimalloc changed; refusing the arena-reserve FIT sed" >&2
+    exit 1
+  fi
+  sed -i "s/128L \* 1024L/${MI_RES_KIB}L/" "$MI_OPT"
+  echo "==> mimalloc-FIT: capped arena_reserve 128 MiB -> ${MI_RES_KIB} KiB (COSMOS-PERF-ENGINE-DEEP §3)"
+  # Purge cached libmimalloc so embuilder recompiles from the sed'd source. NOTE: `source emsdk_env.sh`
+  # (line 156) UNSETS EM_CACHE, so we cannot reference it here under `set -u`; use the two deterministic
+  # cache roots directly (persistent bind-mount + the image default) so whichever emcc actually consults
+  # is force-rebuilt. options.c is baked in the image (pristine per --rm run), so the sed is single-shot.
+  find /work/emcache /emsdk/upstream/emscripten/cache -name 'libmimalloc*.a' -delete 2>/dev/null || true
+  # Force a fresh LINK: libmimalloc.a is a system lib INVISIBLE to scons's content hash, so a warm tree
+  # (git clean -fdq keeps ignored build outputs) would just re-zip the stale .wasm from a previous arena
+  # value. Deleting the web link outputs makes scons relink from the surviving .o + the rebuilt libmimalloc
+  # (~2 min), guaranteeing the capped arena is actually compiled in. Cheap vs a full recompile; mimalloc-only.
+  rm -f /work/godot/bin/godot.web.template_*.wasm32.* 2>/dev/null || true
+fi
+
 MODULE_IN_WEB="unknown"
 
 build_web_templates() {

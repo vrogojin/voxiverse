@@ -302,6 +302,24 @@ var _async_sector_dirty: Dictionary = {}   # frozen at dispatch: sector -> true 
 var _async_fid_sector: Dictionary = {}     # frozen at dispatch: fid -> sector, for every fid in _async_fids
 var _async_sector_parts: Dictionary = {}   # worker-owned: sector -> P3 bulk parts collector
 var _async_sector_arrays: Dictionary = {}  # worker output: sector -> committed surface arrays (read by the swap)
+# COSMOS DE-ORBIT SHELL STAGING (FP_SHELL_STAGE_REEMIT, doc in cube_sphere.gd): stage-run state. ALL of it
+# is zero/never touched with the flag off (byte-identical).
+var _stage_active := false                 # a staged run is in progress (holds the frozen-input snapshot)
+var _stage_start_ms := 0                   # wall-clock at run start (SHELL_STAGE_MAX_MS failsafe)
+var _stage_hold: Array = []                # held [unsink_col, have_col, applied_r, applied_band] for the run
+var _stage_deferred_n := 0                 # sectors deferred by the LAST staged dispatch (0 ⇒ run drains)
+var _stage_last_emit_facets := 0           # facets actually selected for the LAST staged dispatch (telemetry)
+var _sector_sunk_built: Array = []         # sector -> _sectors_sunk_state() it was last built against (flag-on only)
+# COSMOS DE-ORBIT SHELL PRE-WARM (FP_SHELL_PREWARM_DESCENT, doc in cube_sphere.gd): descent pre-warm
+# state. ALL of it is zero/never touched with the flag off (byte-identical).
+var _pwd_active := false          # engage predicate result (§3.2) — read by the snapshot pacer + dispatch freeze
+var _pwd_descending := false      # analytic radial-Δ Schmitt latch (reentry_descent_step — NOT _fall_vy_ema)
+var _pwd_calm := 0                # calm-sample count for the latch release
+var _pwd_prev_h := 0.0            # last sampled analytic altitude
+var _pwd_prev_ms := -1            # wall-clock of the last sample (−1 = no baseline yet)
+var _pwd_snap_due := false        # rising-edge seed: force the first paced snapshot immediately
+var _pwd_snap_count := 0          # forced-snapshot count (telemetry sh_pwd_snaps)
+var _async_prewarm := false       # _pwd_active FROZEN at dispatch (worker-cycle-coherent staging mode)
 # COSMOS-PERF L1 (§3.1): pre-TRIANGULATED per-facet caches for FP_FARRING_FAST_REBUILD. Built lazily from the grid
 # caches above (only when the fast path or the equivalence gate runs → zero cost/memory with the flag off). Each holds
 # the facet's 32 tris EXPANDED to 96 vertices in the EXACT order/winding _emit_cached emits — so the fast rebuild is a
@@ -355,7 +373,9 @@ const SRC_CULL_APPLY := 14     # :2702 cull APPLY (LUXURY — dead, cull not dep
 const SRC_SLOTS := 15          # :4371 band/close-up slot pushes (SAFETY)
 const SRC_RELIEF := 16         # :5222 _drain_relief_dirty (LUXURY — dead unless FP_RELIEF_REEMIT)
 const SRC_FORCE := 17          # force_rebuild() synchronous path (reserved; no _pending arm)
-const SRC_COUNT := 18
+const SRC_STAGE := 18          # staged re-emit continuation (FP_SHELL_STAGE_REEMIT — SAFETY, drains the run)
+const SRC_PREWARM := 19        # descent pre-warm paced snapshot (FP_SHELL_PREWARM_DESCENT — SAFETY)
+const SRC_COUNT := 20
 var _pending_src := PackedInt32Array()   # per-source arm counts (sensor); sized SRC_COUNT in setup() ONLY under the flag
 var _pending_luxury := false             # a LUXURY arm is parked, waiting on the credit/settle rail (_process consumes)
 var _calm_last_lux_arm_ms := 0           # ticks of the last luxury arm (settle clock)
@@ -1215,6 +1235,7 @@ func apply_camera_set(cam: Vector3) -> void:
 	var d := rel.length()
 	var h := d - FacetAtlas.R_BLOCKS
 	_offsurface = h > CubeSphere.OFFSURFACE_Y         # S2 prewarm arming (drives the dwell in _prewarm_step)
+	_pwd_tick(h)      # COSMOS DE-ORBIT SHELL PRE-WARM: descent latch + engage predicate (no-op unless FP_SHELL_PREWARM_DESCENT)
 	_dbg_d = d
 	_dbg_h = h
 	if not CubeSphere.FP_SHELL_CAMERA_SET:
@@ -1275,8 +1296,20 @@ func shell_set_camera_abs(dir: Array, d: float, floored: bool, surf_cap_override
 	if reemit and CubeSphere.FP_SHELL_CLIMB_NO_CHURN and floored and floored == _emit_floored_last \
 			and is_equal_approx(new_cos, _emit_cos) and drift <= deg_to_rad(CubeSphere.SHELL_SLACK_DEG - 2.0):
 		reemit = false                                        # identical floored cap + no axis sweep → the rebuild would emit the SAME set (churn)
-	if reemit:
-		_shell_snapshot(dir, new_cos, theta_h, floored)
+	# COSMOS DE-ORBIT SHELL PRE-WARM: while the descent pre-warm is engaged, force a PACED snapshot so the
+	# wanted set tracks the live axis/θ_h down the descent instead of decaying into the knee's one-shot
+	# class-0 avalanche (doc in cube_sphere.gd). Bounded: ≥ SHELL_PWD_SNAP_MS apart AND only when the cap
+	# actually moved (drift/Δθ_h thresholds) — or the engage rising edge. Off / not engaged ⇒ `reemit`
+	# stands exactly as computed above (byte-identical).
+	var pwd_snap := false
+	if CubeSphere.FP_SHELL_PREWARM_DESCENT and _pwd_active and not reemit:
+		pwd_snap = shell_prewarm_snap_due(_pwd_snap_due,
+				Time.get_ticks_msec() - _last_snapshot_ms, drift, dtheta)
+	if reemit or pwd_snap:
+		if pwd_snap:
+			_pwd_snap_due = false
+			_pwd_snap_count += 1
+		_shell_snapshot(dir, new_cos, theta_h, floored, SRC_PREWARM if pwd_snap else SRC_CAM)
 		_last_snapshot_ms = Time.get_ticks_msec()
 
 ## COSMOS-PERF FALL-COLLAPSE FIX A2 (FP_SHELL_FALL_HOLD) — the re-emit-trigger decision, split out PURE + static so
@@ -1297,15 +1330,24 @@ static func shell_fall_should_reemit(hold: bool, floor_changed: bool, dtheta: fl
 		return true                                          # visible cap OUTGREW the held cap (a climb) — re-emit to avoid limb holes
 	return swept and elapsed_ms >= CubeSphere.SHELL_FALL_REEMIT_MS
 
+## COSMOS DE-ORBIT SHELL PRE-WARM: should an engaged pre-warm force a snapshot this frame? Pure.
+static func shell_prewarm_snap_due(rising: bool, elapsed_ms: int, drift: float, dtheta: float) -> bool:
+	if rising:
+		return true
+	if elapsed_ms < CubeSphere.SHELL_PWD_SNAP_MS:
+		return false
+	return drift >= deg_to_rad(CubeSphere.SHELL_PWD_DRIFT_DEG) \
+		or absf(dtheta) >= deg_to_rad(CubeSphere.SHELL_PWD_DTH_DEG)
+
 ## COSMOS-ORBITAL-SHELL S1 (§3): commit a new emit axis/cap and schedule the deferred re-emit (the warm + async
 ## build + single swap are the shipped pipeline; only _pending + the axis/cap snapshot change here).
-func _shell_snapshot(dir: Array, cap_cos: float, theta_h: float, floored: bool) -> void:
+func _shell_snapshot(dir: Array, cap_cos: float, theta_h: float, floored: bool, src := SRC_CAM) -> void:
 	_emit_axis = dir
 	_emit_cos = cap_cos
 	_emit_dir_last = dir
 	_emit_thetah_last = theta_h
 	_emit_floored_last = floored
-	_arm_pending(SRC_CAM)
+	_arm_pending(src)
 	_snapshot_count += 1                                       # FIX A2 diagnostic: a scheduled re-emit (flat during a held fall)
 
 ## COSMOS-ORBITAL-SHELL S2 (§4): the one-shot whole-planet coarse-cache warm. After SHELL_PREWARM_DWELL_S sustained
@@ -1344,6 +1386,30 @@ func _prewarm_step(dt: float) -> void:
 		_prewarm_cursor += 1
 		if Time.get_ticks_usec() - t0 > budget_us:
 			return                            # budget spent — resume next frame
+
+## COSMOS DE-ORBIT SHELL PRE-WARM (FP_SHELL_PREWARM_DESCENT, doc in cube_sphere.gd): the per-frame descent latch +
+## engage predicate. Called from apply_camera_set every frame WorldManager drives it, BEFORE shell_set_camera_abs, so
+## a rising edge seeds this same frame's paced snapshot (E6). The latch is the freeze-independent analytic radial-Δ
+## Schmitt (reentry_descent_step — NOT _fall_vy_ema), sampled on a SHELL_PWD_SAMPLE_MS wall cadence. `on` is the
+## codebase gate-forcing param (default = the compiled flag) so the headless gate drives the REAL law with no sed.
+## Off / not composing (STAGE_REEMIT+SECTORS) ⇒ early return, all _pwd_* stay at their zero initializers (byte-identical).
+func _pwd_tick(h: float, on := CubeSphere.FP_SHELL_PREWARM_DESCENT) -> void:
+	if not (on and CubeSphere.FP_SHELL_STAGE_REEMIT and CubeSphere.FP_FARRING_SECTORS):
+		return
+	var now := Time.get_ticks_msec()
+	if _pwd_prev_ms < 0:
+		_pwd_prev_h = h; _pwd_prev_ms = now
+		return
+	if now - _pwd_prev_ms >= CubeSphere.SHELL_PWD_SAMPLE_MS:
+		var dt := float(now - _pwd_prev_ms) / 1000.0
+		var r: Array = CubeSphere.reentry_descent_step((h - _pwd_prev_h) / dt, _pwd_descending, _pwd_calm)
+		_pwd_descending = r[0]; _pwd_calm = r[1]
+		_pwd_prev_h = h; _pwd_prev_ms = now
+	var want := _cam_set and _shell_orbit() and _pwd_descending \
+			and h >= CubeSphere.SHELL_PWD_ALT_LO and h <= CubeSphere.SHELL_PWD_ALT_HI
+	if want and not _pwd_active:
+		_pwd_snap_due = true          # rising edge: seed the first snapshot immediately (stale residency)
+	_pwd_active = want
 
 ## COSMOS FP-FIXED-FRAME re-anchor (§3): slide the absolute ring mesh by −A in lockstep with PlanetRoot + the
 ## ActiveFrame so the whole rendered planet stays continuous through a floating-origin shift. The offset survives a
@@ -1437,7 +1503,10 @@ func _process(_dt: float) -> void:
 	if _smooth_v2 != null:
 		# FP_LOAD_DEFER: pre-settle (`_load_settled` false) step() reaps only — no dispatch/commit (WS1a freeze); post-
 		# settle the FIRST commit waits on `_stream_credit_ok`. Both args are inert with the flag off (step self-gates).
-		_smooth_v2.step(_load_settled, _stream_credit_ok)
+		# FP_SV2_SHELL_YIELD (§7): while a staged shell slice run is active (or a sectored async build is in flight), defer
+		# the V2 whole-surface commit off the slice frame — reap/dispatch still run, `_dirty` accumulates (PACE law). Off ⇒ false.
+		_smooth_v2.step(_load_settled, _stream_credit_ok,
+			CubeSphere.FP_SV2_SHELL_YIELD and (_stage_active or (_async_building and _async_sectored)))
 		# FP_V2_NEARFILL_UNSINK (COSMOS-FAR-HEIGHT §3.1): push the LIVE applied-cover state into the V2 near-fill material
 		# each frame (MAIN) so its vertex-shader zone test tracks the SAME `_applied_r` + band top the backstop's zone-B
 		# uses. `_player_col_abs` is planet-absolute (= the mesh object space); r_of(active) is the band-gate datum proxy.
@@ -2112,8 +2181,14 @@ func _async_enabled() -> bool:
 # ---- COSMOS FARRING-SWAP-DIET P2 (FP_FARRING_SECTORS) — static sector partition + dirty accounting. ----
 # All main-thread-only except where noted; nothing here runs with the flag off.
 
+## FP_SHELL_SECTOR_FINE: the effective per-face split. Off ⇒ the shipped SECTOR_SPLIT (2) — every caller below computes
+## byte-identical sector ids/counts. On ⇒ SHELL_SECTOR_SPLIT_FINE (4 → 96 sectors, ≤ 36 fids each).
+func _sector_split() -> int:
+	return CubeSphere.SHELL_SECTOR_SPLIT_FINE if CubeSphere.FP_SHELL_SECTOR_FINE else SECTOR_SPLIT
+
 func _sector_count() -> int:
-	return 6 * SECTOR_SPLIT * SECTOR_SPLIT
+	var sp := _sector_split()
+	return 6 * sp * sp
 
 ## STATIC face-quadrant sector of `fid` — a pure function of the facet index (same decode as _tex_decode), so
 ## membership NEVER churns with the emit axis / player motion; only cap-rim visibility changes move facets in/out.
@@ -2124,10 +2199,11 @@ func _sector_of(fid: int) -> int:
 	var rem := fid - face * k * k
 	var a := int(rem / k)
 	var b := rem - a * k
-	var half := int(k / SECTOR_SPLIT)
-	var qa := mini(int(a / half), SECTOR_SPLIT - 1)
-	var qb := mini(int(b / half), SECTOR_SPLIT - 1)
-	return (face * SECTOR_SPLIT + qa) * SECTOR_SPLIT + qb
+	var sp := _sector_split()
+	var half := int(k / sp)
+	var qa := mini(int(a / half), sp - 1)
+	var qb := mini(int(b / half), sp - 1)
+	return (face * sp + qa) * sp + qb
 
 ## Size the per-sector record arrays once (idempotent).
 func _sectors_ensure_arrays() -> void:
@@ -2139,6 +2215,8 @@ func _sectors_ensure_arrays() -> void:
 	_sector_drawn.resize(ns)
 	_sector_bstop.resize(ns)
 	_sector_built_epoch.resize(ns)   # zero-filled → never built
+	if CubeSphere.FP_SHELL_STAGE_REEMIT:
+		_sector_sunk_built.resize(ns)   # nulls (never recorded) ⇒ compared as mismatch ⇒ dirty (safe default)
 	for s in range(ns):
 		_sector_sig[s] = {}
 		_sector_drawn[s] = {}
@@ -2198,7 +2276,7 @@ func _sectors_sunk_state() -> Array:
 ## MAIN THREAD, at dispatch (after every freeze step): partition the frozen fid set and mark DIRTY every sector whose
 ## membership or any member signature differs from what its resident mesh was built from (plus the sunk-state rule and
 ## the whole-mesh invalidation epoch). Clean sectors keep their resident meshes — the worker will not re-emit them.
-func _sectors_compute_dirty() -> void:
+func _sectors_compute_dirty(stage_on := CubeSphere.FP_SHELL_STAGE_REEMIT) -> void:
 	_sectors_ensure_arrays()
 	_async_fid_sector.clear()
 	_async_sector_dirty.clear()
@@ -2206,6 +2284,11 @@ func _sectors_compute_dirty() -> void:
 	var cur: Array = []
 	cur.resize(ns)
 	var sunk_changed: bool = _sector_unsink_sig != _sectors_sunk_state()
+	# FP_SHELL_STAGE_REEMIT §4.2b: under partial (staged) swaps the ONE global sunk fingerprint is insufficient — after
+	# the first staged swap it would claim the NEW state for sectors still built against the OLD one, so deferred sunk-only
+	# sectors compare clean and are dropped (the stale-wedge). On ⇒ compare each sector against the sunk-state IT was last
+	# built against (`_sector_sunk_built`). Off ⇒ cur_sunk is never computed/read (byte-identical global compare).
+	var cur_sunk: Array = _sectors_sunk_state() if stage_on else []
 	for fid in _async_fids:
 		var s := _sector_of(fid)
 		_async_fid_sector[fid] = s
@@ -2223,14 +2306,120 @@ func _sectors_compute_dirty() -> void:
 		if rec.size() != c.size():
 			_async_sector_dirty[s] = true
 			continue
+		# FP_SHELL_STAGE_REEMIT §4.2b: per-sector sunk-change test (else the shipped global `sunk_changed` verbatim).
+		var sunk_c := sunk_changed
+		if stage_on:
+			var built = _sector_sunk_built[s] if s < _sector_sunk_built.size() else null
+			sunk_c = (built == null) or (built != cur_sunk)
 		for fid in c:
 			var sg: int = c[fid]
 			if not rec.has(fid) or int(rec[fid]) != sg:
 				_async_sector_dirty[s] = true
 				break
-			if sunk_changed and _sector_sig_sunkish(sg):
+			if sunk_c and _sector_sig_sunkish(sg):
 				_async_sector_dirty[s] = true
 				break
+
+## MAIN THREAD, FP_SHELL_STAGE_REEMIT §3.2/§4.1: budget the just-computed dirty set. Deferrable sectors (a resident
+## current-epoch mesh, NOT gaining a new member) are released nearest-camera-first at ≤ SHELL_STAGE_FACETS facets per
+## dispatch when the deferrable burst exceeds SHELL_STAGE_TRIGGER (or a run is already active); the rest are removed from
+## `_async_sector_dirty` for this build (re-derived dirty next dispatch — nothing lost, §4.1). Never-built / new-member
+## sectors are class-0: always emitted, never deferred (deferring them would be a real hole). The stage-start input hold
+## is captured on run start (§4.2a). Early-returns (no-op) with the flag off or a non-sectored build → byte-identical.
+func _stage_filter_dirty(axis: Vector3, stage_on := CubeSphere.FP_SHELL_STAGE_REEMIT) -> void:
+	if not stage_on or not _async_sectored:
+		return
+	_ensure_centre_pack()
+	if _sector_sunk_built.size() != _sector_count():
+		_sector_sunk_built.resize(_sector_count())   # forced-on gate path (E4 sizes it in production under the flag)
+	# FP_SHELL_SECTOR_FINE (§3.2): the budget/trigger/failsafe scale with the finer 36-fid sector atom. Off ⇒ each
+	# resolves to the shipped 112/168/2500 const ⇒ every branch below is byte-identical.
+	var fine := CubeSphere.FP_SHELL_SECTOR_FINE
+	var b_facets: int = CubeSphere.SHELL_STAGE_FACETS_FINE if fine else CubeSphere.SHELL_STAGE_FACETS
+	var b_trigger: int = CubeSphere.SHELL_STAGE_TRIGGER_FINE if fine else CubeSphere.SHELL_STAGE_TRIGGER
+	var b_max_ms: int = CubeSphere.SHELL_STAGE_MAX_MS_FINE if fine else CubeSphere.SHELL_STAGE_MAX_MS
+	# one pass over the frozen fid set: per dirty sector, facet count, max centre·axis priority, and whether it gains a
+	# member its resident sig record lacks (a growth that must not be deferred).
+	var facets := {}      # s -> int
+	var prio := {}        # s -> float
+	var newmem := {}      # s -> bool
+	for fid in _async_fids:
+		var s: int = _async_fid_sector.get(fid, -1)
+		if s < 0 or not _async_sector_dirty.has(s):
+			continue
+		facets[s] = int(facets.get(s, 0)) + 1
+		var pv: float = _centre_pack[fid].dot(axis) if fid < _centre_pack.size() else -1.0
+		if not prio.has(s) or pv > float(prio[s]):
+			prio[s] = pv
+		if not bool(newmem.get(s, false)) and not (_sector_sig[s] as Dictionary).has(fid):
+			newmem[s] = true
+	# partition: class 0 = not-deferrable (no resident current-epoch mesh) OR gaining a new member → always emit this
+	# dispatch; class 1 = deferrable replacement-only → budgetable.
+	var deferrable_dirty_facets := 0
+	var class1: Array = []
+	# COSMOS DE-ORBIT SHELL PRE-WARM (FP_SHELL_PREWARM_DESCENT): during an ENGAGED pre-warm dispatch the
+	# emit is VOLUNTARY (no regime forced it — the resident cap + FALL_HOLD's +12° margin + the under-layers
+	# still cover every visible pixel), so deferring class-0 GROWTH is not a hole: it merely delays geometry
+	# that, today, would not appear until the knee at all. Class 0 therefore joins the budget/trigger —
+	# UNLESS the whole-cap `_mi` mesh still holds surfaces (a resident sync build): its swap-time clear
+	# (`_swap_in_sectors` :2397) would drop coverage a deferred sector doesn't yet replace, so that (rare,
+	# post-force_rebuild) state keeps the shipped class-0 exemption for the dispatch. Off / not engaged ⇒
+	# the shipped partition verbatim (byte-identical — including at the knee with pre-warm disengaged).
+	var pwd_growth_ok: bool = _async_prewarm \
+			and not (_mi != null and _mi.mesh != null and (_mi.mesh as ArrayMesh).get_surface_count() > 0)
+	for s in _async_sector_dirty.keys():
+		var built_current: bool = (s < _sector_built_epoch.size()) and (_sector_built_epoch[s] == _sector_epoch)
+		if (not built_current or bool(newmem.get(s, false))) and not pwd_growth_ok:
+			continue     # class 0 — stays in the dirty set unconditionally (forced-re-emit correctness)
+		deferrable_dirty_facets += int(facets.get(s, 0))
+		class1.append([float(prio.get(s, -1.0)), s])
+	# trigger: stage only when a run is in progress OR the deferrable burst exceeds the trigger.
+	if not (_stage_active or deferrable_dirty_facets > b_trigger):
+		_stage_deferred_n = 0
+		return
+	# failsafe (§4.4): past the wall-clock cap, emit the full remaining dirty set unbudgeted and close the run.
+	# FP_SHELL_SECTOR_FINE (§3.2): a pre-warm-VOLUNTARY fine run NEVER dumps — the resident cap + FALL_HOLD margin still
+	# cover every pixel, so past the (scaled) cap it just keeps chaining budgeted slices instead of re-creating the
+	# avalanche; the regime-forced (knee, non-prewarm) run keeps the shipped dump semantics at the scaled cap.
+	if _stage_active and Time.get_ticks_msec() - _stage_start_ms > b_max_ms:
+		if not (fine and _async_prewarm):
+			_stage_active = false
+			_stage_hold = []
+			_stage_deferred_n = 0
+			return
+	# order class 1 by DESCENDING priority (sub-camera / screen-centre sector first, coverage advances to the horizon).
+	class1.sort_custom(Callable(self, "_stage_cmp_desc"))
+	# take class-1 sectors while within budget; always take at least one (progress guarantee).
+	var kept := {}
+	var taken := 0
+	for entry in class1:
+		var s: int = entry[1]
+		var fc: int = int(facets.get(s, 0))
+		if kept.is_empty() or taken + fc <= b_facets:
+			kept[s] = true
+			taken += fc
+	# defer the rest — drop them from the dirty set so the worker never builds them this cycle.
+	var deferred := 0
+	for entry in class1:
+		var s: int = entry[1]
+		if not kept.has(s):
+			_async_sector_dirty.erase(s)
+			deferred += 1
+	# the emitted slice = every sector still in the dirty set (kept class-1 + all class-0).
+	var emit_facets := 0
+	for s in _async_sector_dirty.keys():
+		emit_facets += int(facets.get(s, 0))
+	_stage_deferred_n = deferred
+	_stage_last_emit_facets = emit_facets
+	# start the run + capture the stage-start input hold on the FIRST staged dispatch (§4.2a).
+	if deferred > 0 and not _stage_active:
+		_stage_active = true
+		_stage_start_ms = Time.get_ticks_msec()
+		_stage_hold = [_async_unsink_col, _async_unsink_have_col, _async_applied_r, _async_applied_band]
+
+## FP_SHELL_STAGE_REEMIT: sort comparator — descending [prio, sector] (nearest-camera sector first).
+func _stage_cmp_desc(a: Array, b: Array) -> bool:
+	return a[0] > b[0]
 
 ## MAIN THREAD, at swap (worker done — cache state now equals what the worker emitted from): record what each DIRTY
 ## sector's fresh mesh was built from. Factored out of `_swap_in_sectors` so the headless gate drives the identical
@@ -2241,6 +2430,12 @@ func _sectors_record_frozen() -> void:
 		_sector_drawn[s] = {}
 		_sector_bstop[s] = {}
 		_sector_built_epoch[s] = _sector_epoch
+		# FP_SHELL_STAGE_REEMIT §4.2b: record the sunk-state THIS sector's fresh mesh was built against (per-sector, so a
+		# partial staged swap can't claim the new state for sectors still built against the old one). Off / not staging ⇒
+		# never written (byte-identical). `_stage_active` covers the forced-on gate; the global `_sector_unsink_sig` at
+		# the tail of this function stays (the flag-off law's record, harmless flag-on).
+		if (CubeSphere.FP_SHELL_STAGE_REEMIT or _stage_active) and s < _sector_sunk_built.size():
+			_sector_sunk_built[s] = _sectors_sunk_state()
 	for fid in _async_fids:
 		var s: int = _async_fid_sector.get(fid, -1)
 		if not _async_sector_dirty.has(s):
@@ -2268,6 +2463,14 @@ func _sectors_reset() -> void:
 		_sector_sig[s] = {}
 		_sector_drawn[s] = {}
 		_sector_bstop[s] = {}
+	# FP_SHELL_STAGE_REEMIT §4.4: a sync whole-mesh rebuild pre-empts any staged run — clear the per-sector sunk records
+	# and the run state so the next sectored dispatch rebuilds everything from scratch. No-op with the flag off.
+	if CubeSphere.FP_SHELL_STAGE_REEMIT:
+		for s in range(_sector_sunk_built.size()):
+			_sector_sunk_built[s] = null
+		_stage_active = false
+		_stage_deferred_n = 0
+		_stage_hold = []
 	_sector_unsink_sig = []
 
 ## MAIN THREAD: the P2 counterpart of `_swap_in_arrays` — swap ONLY the dirty sectors' freshly built surfaces onto
@@ -2314,9 +2517,12 @@ func _begin_rebuild() -> void:
 ## MAIN THREAD: snapshot the (already-warmed) visible set and hand the whole mesh-DATA build to a worker. The caches the
 ## worker reads are frozen for its lifetime — _process will not warm/dispatch again while _async_building (the gate in
 ## _process), and force_rebuild/set_excluded join first — so the worker only ever READS _pos_cache/_col_cache.
-func _dispatch_async_rebuild() -> void:
+func _dispatch_async_rebuild(sectored_on := CubeSphere.FP_FARRING_SECTORS, stage_on := CubeSphere.FP_SHELL_STAGE_REEMIT) -> void:
 	transform = _placement_xform()   # rigid re-place is cheap + main-thread-only (same as _rebuild_full's first line)
-	_refresh_slot_snapshot()         # COSMOS LOD-TEXTURE Phase 4: freeze the slot map on MAIN before the worker reads it (no-op off)
+	# FP_SHELL_STAGE_REEMIT §4.2a: during a staged run HOLD the slot snapshot (the held _slot_snapshot/_band_slot_snapshot
+	# persist) so every staged sector emits from ONE coherent slot map. Off / not staging ⇒ refresh verbatim (byte-identical).
+	if not (stage_on and _stage_active):
+		_refresh_slot_snapshot()     # COSMOS LOD-TEXTURE Phase 4: freeze the slot map on MAIN before the worker reads it (no-op off)
 	# FP_ENV_WARM_ASYNC: when the worker builds its OWN env caches, hand it the FULL front set (uncached included) so it
 	# can warm a bounded batch and emit them the same cycle. Frozen here so the worker's warm/emit is stable for its run
 	# (main will not touch the caches while _async_building). Off ⇒ the shipped cache-filtered set (byte-identical).
@@ -2337,6 +2543,15 @@ func _dispatch_async_rebuild() -> void:
 	# contract) so the worker's `_blend_uncovered` height-gates against the band that was live at dispatch. (0, 1e9)
 	# with the flag off (never read).
 	_async_applied_band = _applied_band
+	# COSMOS DE-ORBIT SHELL STAGING (FP_SHELL_STAGE_REEMIT §4.2a): during a staged run, OVERRIDE the five continuous
+	# inputs just frozen above with the stage-start hold, so every staged sector emits from ONE coherent snapshot (no
+	# sunk-depth / slot mismatch between a sector emitted at stage 1 and its neighbour at stage 12 — no seam). Off /
+	# not staging ⇒ the live freezes above stand verbatim (byte-identical).
+	if stage_on and _stage_active:
+		_async_unsink_col = _stage_hold[0]
+		_async_unsink_have_col = _stage_hold[1]
+		_async_applied_r = _stage_hold[2]
+		_async_applied_band = _stage_hold[3]
 	# REVISION 5 Stage A (FP_ENV_DEMAND_DISC): frozen for the worker's "have" test. ORBIT keeps its existing law
 	# unchanged (no near field to bound the envelope demand against off-surface), so force it off there.
 	_async_demand_on = CubeSphere.FP_ENV_DEMAND_DISC and not _shell_orbit()
@@ -2375,11 +2590,17 @@ func _dispatch_async_rebuild() -> void:
 	# COSMOS FARRING-SWAP-DIET P2 (FP_FARRING_SECTORS): freeze the sector partition + per-facet signatures + the dirty
 	# sector set for THIS build (main thread, after every freeze above — the signatures read the same frozen snapshots
 	# the worker will). Off ⇒ `_async_sectored` false, dicts empty, the shipped whole-mesh path verbatim.
-	_async_sectored = CubeSphere.FP_FARRING_SECTORS
+	_async_sectored = sectored_on
+	_async_prewarm = CubeSphere.FP_SHELL_PREWARM_DESCENT and _pwd_active   # frozen: this cycle's staging mode
 	_async_sector_parts = {}
 	_async_sector_arrays = {}
 	if _async_sectored:
-		_sectors_compute_dirty()
+		_sectors_compute_dirty(stage_on)
+		# COSMOS DE-ORBIT SHELL STAGING (FP_SHELL_STAGE_REEMIT §3.2/§4.1): budget the dirty set across worker cycles. The
+		# priority axis is the emit cull axis (`_cull_params()[0]`). Off ⇒ _stage_filter_dirty early-returns (byte-identical).
+		if stage_on:
+			var _sax: Array = _cull_params()[0]
+			_stage_filter_dirty(Vector3(_sax[0], _sax[1], _sax[2]), stage_on)
 	_async_arrays = []
 	_pending = false                 # consumed — a fresh crossing sets it again and is served after this build lands
 	_async_building = true
@@ -2542,8 +2763,12 @@ func _async_build_worker() -> void:
 		# P2: assemble ONLY the dirty sectors (each its own surface via the P3 bulk pipeline — byte-equal per G-FR-BULK;
 		# normals smooth per sector). A dirty sector with no emitted member yields the empty-arrays shape → its mesh is
 		# cleared at swap.
+		var accum_on := CubeSphere.FP_FARRING_EMIT_ACCUM   # P2: the per-sector sink is an accumulator quad, finalized in place
 		for s in _async_sector_dirty:
-			_async_sector_arrays[s] = _bulk_assemble(_async_sector_parts.get(s, []))
+			if accum_on:
+				_async_sector_arrays[s] = _accum_finalize(_async_sector_parts.get(s, null))
+			else:
+				_async_sector_arrays[s] = _bulk_assemble(_async_sector_parts.get(s, []))
 	elif bulk != null:
 		_async_arrays = _bulk_assemble(bulk)
 	else:
@@ -2557,18 +2782,26 @@ func _async_build_worker() -> void:
 ## collector. Un-sectored: `bulk` (the P3 whole-cap collector, or null ⇒ the shipped SurfaceTool emit) — verbatim.
 func _worker_emit_one(st: SurfaceTool, fid: int, target: bool, bulk) -> void:
 	var sink = bulk
+	# P2 (FP_FARRING_EMIT_ACCUM): a sectored build's per-sector sink is an ACCUMULATOR quad written in place (base-offset
+	# fill, no per-facet scratch quads). Off ⇒ `accum` stays false and the sink stays the shipped `[]` parts collector.
+	var accum := false
 	if _async_sectored:
 		var s: int = _async_fid_sector.get(fid, -1)
 		if not _async_sector_dirty.has(s):
 			return
 		sink = _async_sector_parts.get(s)
-		if sink == null:
+		if CubeSphere.FP_FARRING_EMIT_ACCUM:
+			accum = true
+			if sink == null:
+				sink = [PackedVector3Array(), PackedColorArray(), PackedVector2Array(), PackedVector2Array()]
+				_async_sector_parts[s] = sink
+		elif sink == null:
 			sink = []
 			_async_sector_parts[s] = sink
 	if target and _bpos_cache.has(fid):
-		_emit_cached(st, fid, true, true, CubeSphere.FP_FARRING_UNCOVERED_TRUE, sink)
+		_emit_cached(st, fid, true, true, CubeSphere.FP_FARRING_UNCOVERED_TRUE, sink, accum)
 	elif _pos_cache.has(fid):
-		_emit_cached(st, fid, false, false, CubeSphere.FP_FARRING_UNCOVERED_TRUE, sink)
+		_emit_cached(st, fid, false, false, CubeSphere.FP_FARRING_UNCOVERED_TRUE, sink, accum)
 
 ## MAIN THREAD: swap a finished off-thread build onto the MeshInstance3D. The double-buffer is implicit — the previous
 ## _mi.mesh stayed assigned (and visible) for the whole worker run; here we replace it with the freshly built one. This
@@ -2584,6 +2817,15 @@ func _poll_async_rebuild() -> void:
 		_async_warm_only = false
 	elif _async_sectored:
 		_swap_in_sectors()   # P2: swap ONLY the dirty sectors; clean sector meshes stay resident
+		# FP_SHELL_STAGE_REEMIT §4.3: while a staged run has deferred sectors, re-arm _pending (SRC_STAGE) so the next
+		# idle frame dispatches the next slice; when the run drains (nothing deferred), release the input hold. Gated on
+		# `_stage_active` — false unless staging engaged ⇒ byte-identical off.
+		if _stage_active:
+			if _stage_deferred_n > 0:
+				_arm_pending(SRC_STAGE)
+			else:
+				_stage_active = false
+				_stage_hold = []
 	else:
 		_swap_in_arrays(_async_arrays, _async_fids)
 	_async_task_id = -1
@@ -3621,6 +3863,18 @@ func shell_telemetry() -> Dictionary:
 		"sh_h": snappedf(_dbg_h, 0.1),
 		"sh_scale": snappedf(_dbg_scale, 0.0001),
 	}
+	# FP_SHELL_STAGE_REEMIT §E11: the staged-drain sensor — is a run active, how many sectors still queued, and how many
+	# facets the last staged slice emitted (≤ budget bound). Off ⇒ the keys are never added ⇒ byte-identical telemetry.
+	if CubeSphere.FP_SHELL_STAGE_REEMIT:
+		out["sh_stage_on"] = 1 if _stage_active else 0
+		out["sh_stage_q"] = _stage_deferred_n
+		out["sh_stage_emit"] = _stage_last_emit_facets
+	# COSMOS DE-ORBIT SHELL PRE-WARM (FP_SHELL_PREWARM_DESCENT §E9): descent pre-warm readback. Off ⇒ keys
+	# never added ⇒ byte-identical telemetry consumers.
+	if CubeSphere.FP_SHELL_PREWARM_DESCENT:
+		out["sh_prewarm_on"] = 1 if _pwd_active else 0    # the task-required readback
+		out["sh_pwd_desc"] = 1 if _pwd_descending else 0
+		out["sh_pwd_snaps"] = _pwd_snap_count
 	# FP_FT_SHELL_BAND A/B readback: merge the far-tree zone state (ft_zone 0=S/1=B/2=O, ft_cards/ft_mesh shown, ft_off,
 	# ft_h) so a live climb reads WHICH zone the tier computed at each altitude — confound-free (no visual/biome ambiguity).
 	# Empty dict with the flag off ⇒ no keys added ⇒ byte-identical telemetry.
@@ -3628,6 +3882,13 @@ func shell_telemetry() -> Dictionary:
 		var fb = _far_trees.shell_band_state()
 		if fb is Dictionary and not (fb as Dictionary).is_empty():
 			out.merge(fb as Dictionary)
+	# COSMOS DE-ORBIT STRUCT STAGING (FP_STRUCT_BAKE_STAGE §3.8): the staged wake-bake drain sensor (st_pend,
+	# st_bk, st_bms, st_passes, st_live) — a live de-orbit reads the drain draining nearest-first over ~4-8 s
+	# instead of one 3555 ms burst. Off ⇒ {} merged ⇒ byte-identical telemetry (the shell_band_state precedent).
+	if _far_structures != null:
+		var sb = _far_structures.bake_stage_state()
+		if sb is Dictionary and not (sb as Dictionary).is_empty():
+			out.merge(sb as Dictionary)
 	# FP_FAR_TERMINATOR_WELD sun-echo telemetry: each far tier's OWN live shader sun_dir, so a live A/B can confirm
 	# they all track the same Sun (pre-fix: sd_v2 stuck ~(1,0,0) day while others live; post-fix: all match). Off =>
 	# the keys are never added to the dict => byte-identical for any telemetry consumer.
@@ -4565,7 +4826,7 @@ func _emit_wall(st: SurfaceTool, da: Vector3, db: Vector3, r0: float, r1: float,
 ## triangle count (same contract as `_emit_blocky`). Thread-safety identical to `_emit_blocky` (reads only the passed
 ## arrays + pure fid decode + the frozen cull state).
 func _emit_blocky_bulk(parts: Array, pos: PackedVector3Array, col: PackedColorArray, cells: int, stride: int,
-		fid: int = -1, tex: bool = false) -> int:
+		fid: int = -1, tex: bool = false, accum: bool = false) -> int:
 	var ncell := cells * cells
 	var top_r := PackedFloat32Array(); top_r.resize(ncell)
 	var dirs := PackedVector3Array(); dirs.resize(stride * stride)
@@ -4609,13 +4870,28 @@ func _emit_blocky_bulk(parts: Array, pos: PackedVector3Array, col: PackedColorAr
 			if gj == 0:
 				n += 2
 	var nv := n * 3
-	var tp := PackedVector3Array(); tp.resize(nv)
-	var tc := PackedColorArray(); tc.resize(nv)
+	# P2 (FP_FARRING_EMIT_ACCUM): fill the sector accumulator IN PLACE at a base offset (no per-facet scratch quads).
+	# Null out each accumulator slot before growing so the local is the SOLE reference — CowData grows without a COW
+	# copy (po2-amortized) — then write back at the end. Off ⇒ fresh nv-sized arrays + parts.append (shipped path).
+	var tp: PackedVector3Array
+	var tc: PackedColorArray
 	var tu := PackedVector2Array()
 	var tu2 := PackedVector2Array()
-	if tex:
-		tu.resize(nv); tu2.resize(nv)
 	var w := 0
+	if accum:
+		tp = parts[0]; parts[0] = PackedVector3Array()
+		tc = parts[1]; parts[1] = PackedColorArray()
+		w = tp.size()
+		tp.resize(w + nv); tc.resize(w + nv)
+		if tex:
+			tu = parts[2]; parts[2] = PackedVector2Array()
+			tu2 = parts[3]; parts[3] = PackedVector2Array()
+			tu.resize(w + nv); tu2.resize(w + nv)
+	else:
+		tp = PackedVector3Array(); tp.resize(nv)
+		tc = PackedColorArray(); tc.resize(nv)
+		if tex:
+			tu.resize(nv); tu2.resize(nv)
 	for gj in range(cells):
 		for gi in range(cells):
 			if cull_dense and is_cell_culled(fid, gj * cells + gi):
@@ -4732,14 +5008,19 @@ func _emit_blocky_bulk(parts: Array, pos: PackedVector3Array, col: PackedColorAr
 					tu2[w] = fuv2; tu2[w + 1] = fuv2; tu2[w + 2] = fuv2
 					tu2[w + 3] = fuv2; tu2[w + 4] = fuv2; tu2[w + 5] = fuv2
 				w += 6
-	parts.append([tp, tc, tu, tu2])
+	if accum:
+		parts[0] = tp; parts[1] = tc
+		if tex:
+			parts[2] = tu; parts[3] = tu2
+	else:
+		parts.append([tp, tc, tu, tu2])
 	return n
 
 ## FP_FARRING_BULK_EMIT (P3): the alloc-diet twin of `_emit_cached`'s SMOOTH welded-grid emit stage — identical
 ## vertices/colors/uvs in the identical i0,i2,i1 / i1,i2,i3 order, preallocated + index-assigned. Appends
 ## `[pos, col, uv, uv2]` to `parts` (uv/uv2 empty when `_tex_on()` is off). Returns the triangle count.
 func _emit_smooth_bulk(parts: Array, pos: PackedVector3Array, col: PackedColorArray, cells: int, stride: int,
-		fid: int) -> int:
+		fid: int, accum: bool = false) -> int:
 	var tex := _tex_on()
 	var t_a := 0
 	var t_b := 0
@@ -4763,13 +5044,26 @@ func _emit_smooth_bulk(parts: Array, pos: PackedVector3Array, col: PackedColorAr
 	else:
 		n = cells * cells * 2
 	var nv := n * 3
-	var tp := PackedVector3Array(); tp.resize(nv)
-	var tc := PackedColorArray(); tc.resize(nv)
+	# P2 (FP_FARRING_EMIT_ACCUM): fill the sector accumulator IN PLACE at a base offset (see `_emit_blocky_bulk`).
+	var tp: PackedVector3Array
+	var tc: PackedColorArray
 	var tu := PackedVector2Array()
 	var tu2 := PackedVector2Array()
-	if tex:
-		tu.resize(nv); tu2.resize(nv)
 	var w := 0
+	if accum:
+		tp = parts[0]; parts[0] = PackedVector3Array()
+		tc = parts[1]; parts[1] = PackedColorArray()
+		w = tp.size()
+		tp.resize(w + nv); tc.resize(w + nv)
+		if tex:
+			tu = parts[2]; parts[2] = PackedVector2Array()
+			tu2 = parts[3]; parts[3] = PackedVector2Array()
+			tu.resize(w + nv); tu2.resize(w + nv)
+	else:
+		tp = PackedVector3Array(); tp.resize(nv)
+		tc = PackedColorArray(); tc.resize(nv)
+		if tex:
+			tu.resize(nv); tu2.resize(nv)
 	for gj in range(cells):
 		for gi in range(cells):
 			if cull_dense and is_cell_culled(fid, gj * cells + gi):
@@ -4794,7 +5088,12 @@ func _emit_smooth_bulk(parts: Array, pos: PackedVector3Array, col: PackedColorAr
 				tu2[w] = fuv2; tu2[w + 1] = fuv2; tu2[w + 2] = fuv2
 				tu2[w + 3] = fuv2; tu2[w + 4] = fuv2; tu2[w + 5] = fuv2
 			w += 6
-	parts.append([tp, tc, tu, tu2])
+	if accum:
+		parts[0] = tp; parts[1] = tc
+		if tex:
+			parts[2] = tu; parts[3] = tu2
+	else:
+		parts.append([tp, tc, tu, tu2])
 	return n
 
 ## FP_FARRING_BULK_EMIT (P3): merge the per-facet bulk parts (append_array = C++ memcpy, same facet order as the
@@ -4830,6 +5129,34 @@ func _bulk_assemble(parts: Array) -> Array:
 	st.generate_normals()
 	return st.commit_to_arrays()
 
+## FP_FARRING_EMIT_ACCUM (P2): finalize a per-sector ACCUMULATOR quad `[pos, col, uv, uv2]` (grown in place by the emit
+## twins, uv/uv2 empty when tex is off) into the committed surface. Runs the IDENTICAL create_from_arrays →
+## generate_normals → commit_to_arrays tail as `_bulk_assemble` on the identical concatenated vertex list (same facet
+## iteration order, same per-facet fill order), so the committed arrays are BYTE-EQUAL to the parts path (G-FR-ACCUM).
+## `null` (a dirty sector that emitted no member) or an empty accumulator ⇒ the same ARRAY_MAX-shaped, 0-vertex block
+## `_bulk_assemble([])` returns (the `_swap_in_arrays` size guard turns both into the same empty ArrayMesh).
+func _accum_finalize(acc) -> Array:
+	var arr := []
+	arr.resize(Mesh.ARRAY_MAX)
+	if acc == null:
+		arr[Mesh.ARRAY_VERTEX] = PackedVector3Array()
+		return arr
+	var pos: PackedVector3Array = acc[0]
+	var col: PackedColorArray = acc[1]
+	var uv: PackedVector2Array = acc[2]
+	var uv2: PackedVector2Array = acc[3]
+	arr[Mesh.ARRAY_VERTEX] = pos
+	arr[Mesh.ARRAY_COLOR] = col
+	if uv.size() > 0:   # tex uniform per build (matches `_bulk_assemble`'s per-part tex gate)
+		arr[Mesh.ARRAY_TEX_UV] = uv
+		arr[Mesh.ARRAY_TEX_UV2] = uv2
+	if pos.size() == 0:
+		return arr
+	var st := SurfaceTool.new()
+	st.create_from_arrays(arr, Mesh.PRIMITIVE_TRIANGLES)
+	st.generate_normals()
+	return st.commit_to_arrays()
+
 ## `from_worker` (REVISION 2 LAW R-D): true when called from `_async_build_worker` (off the main thread). The R-D
 ## reduced interim sink reads `_smooth`/`_excluded`/`_active_fid` — MAIN-THREAD-OWNED state (`_smooth.step()` /
 ## `set_pool_excluded` mutate it while an async build runs concurrently, exactly the hazard `_async_backstop`'s
@@ -4844,7 +5171,7 @@ func _bulk_assemble(parts: Array) -> Array:
 ## untouched, so both modes emit the identical geometry — `_bulk_assemble` later reproduces the identical committed
 ## surface (normals included) via the C++ create_from_arrays → generate_normals round trip (G-FR-BULK).
 func _emit_cached(st: SurfaceTool, fid: int, sunk: bool, from_worker: bool = false,
-		uncovered_true_on := CubeSphere.FP_FARRING_UNCOVERED_TRUE, bulk = null) -> int:
+		uncovered_true_on := CubeSphere.FP_FARRING_UNCOVERED_TRUE, bulk = null, accum := false) -> int:
 	var pos: PackedVector3Array
 	var col: PackedColorArray
 	var cells := CELLS
@@ -4907,8 +5234,8 @@ func _emit_cached(st: SurfaceTool, fid: int, sunk: bool, from_worker: bool = fal
 	# call. null (the default, and always with the flag off) ⇒ the shipped emit below runs verbatim (byte-identical).
 	if bulk != null:
 		if CubeSphere.FP_BLOCKY_FARRING:
-			return _emit_blocky_bulk(bulk, pos, col, cells, stride, fid, CubeSphere.FP_BLOCKY_TEX and _tex_on())
-		return _emit_smooth_bulk(bulk, pos, col, cells, stride, fid)
+			return _emit_blocky_bulk(bulk, pos, col, cells, stride, fid, CubeSphere.FP_BLOCKY_TEX and _tex_on(), accum)
+		return _emit_smooth_bulk(bulk, pos, col, cells, stride, fid, accum)
 	# FP_BLOCKY_FARRING: emit flat-topped blocks instead of the smooth welded grid (same cached pos/col, so no-protrusion
 	# holds — the block top is the corner MIN ≤ the smooth surface). Off ⇒ the shipped smooth emit below (byte-identical).
 	# COSMOS TEXTURED-LOD T1 (§1.2): under FP_BLOCKY_TEX (∧ FP_FACET_TEX ∧ FP_SHELL_ABSOLUTE, i.e. _tex_on()) the blocky

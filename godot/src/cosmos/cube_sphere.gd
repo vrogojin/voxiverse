@@ -350,6 +350,73 @@ const FP_FARRING_BULK_EMIT := false
 ## FLAT 6042/0).
 const FP_FARRING_SECTORS := false
 
+## COSMOS DE-ORBIT SLICE SMOOTHING P2 (docs/COSMOS-DEORBIT-SLICE-SMOOTHING-DESIGN.md §4, FP_FARRING_EMIT_ACCUM) —
+## the emit-allocation diet. The shipped P3 bulk path (FP_FARRING_BULK_EMIT) allocates ~6–8 heap objects PER FACET
+## (fresh tp/tc/tu/tu2 packed quads + wrapper Array + parts.append), all retained until `_bulk_assemble` runs a full
+## SECOND copy of the sector surface (append_array merge) before the create_from_arrays → generate_normals →
+## commit_to_arrays tail — ~10³ array allocs + one duplicate copy per dirty-sector build, all under the ONE wasm
+## dlmalloc lock the browser main thread convoys on. When true (requires FP_FARRING_BULK_EMIT + FP_FARRING_SECTORS),
+## the per-sector sink becomes an ACCUMULATOR quad written in place: the emit COUNT pass yields the exact vertex count,
+## the accumulator packed arrays grow once (CowData power-of-two alloc buckets ⇒ ~log₂ reallocs per sector, not one
+## per facet), and the fill writes at base-offset — the per-facet scratch quads AND the whole `_bulk_assemble` merge
+## pass disappear. `_accum_finalize` runs the IDENTICAL create_from_arrays → generate_normals → commit_to_arrays tail
+## on the identical vertex list (same facet iteration order, same per-facet fill order), so the committed surface is
+## BYTE-EQUAL to the parts path (verify_farring_emit / G-FR-ACCUM proves it). Worker-thread-local (single-writer under
+## `_async_building`); no new shared state. Default OFF → the sink stays the parts Array, `_bulk_assemble` runs
+## verbatim (byte-identical, FLAT 6042/0).
+const FP_FARRING_EMIT_ACCUM := false
+
+## COSMOS DE-ORBIT SHELL STAGING (docs/COSMOS-DEORBIT-SHELL-STAGING-DESIGN.md) — stage the release-knee
+## re-emit avalanche. At the S1 anchor-release knee the near re-grow dirties ALL 24 far-ring sectors in one
+## dispatch (unsink + applied ladder + slot waves), so FP_FARRING_SECTORS re-emits the whole ~930-facet /
+## ~1.07M-prim cap in ONE worker build — the dlmalloc convoy busy-waits the browser main thread ~2.4 s (the
+## dominant de-orbit stall). When true, a dirty burst > SHELL_STAGE_TRIGGER facets is released over multiple
+## worker cycles at ≤ SHELL_STAGE_FACETS facets per dispatch, nearest-to-camera sectors first, from ONE held
+## input snapshot (no cross-sector sunk/slot mismatch), converging to the IDENTICAL final shell in ≈ 0.3 s.
+## Deferred sectors keep drawing their resident meshes (never a hole); never-built sectors are never deferred.
+## Requires FP_FARRING_SECTORS + FP_FARRING_ASYNC_REBUILD. Default OFF → every dirty sector emits in the same
+## dispatch exactly as today (byte-identical, FLAT 6042/0). Gate: src/tools/verify_shell_staging.gd.
+const FP_SHELL_STAGE_REEMIT := false
+const SHELL_STAGE_FACETS := 112     # per-dispatch dirty-facet budget (~2 typical knee sectors; §3.1)
+const SHELL_STAGE_TRIGGER := 168    # stage only when dirty facets exceed this (1.5× budget — small dirt stays 1-frame)
+const SHELL_STAGE_MAX_MS := 2500    # stage-run failsafe: past this wall-clock, emit the remainder unbudgeted
+
+## COSMOS DE-ORBIT SHELL PRE-WARM (docs/COSMOS-DEORBIT-SHELL-PREWARM-DESIGN.md) — build the far-ring
+## shell's sector residency DURING the descent, ahead of the S1 anchor-release knee (~609), instead of
+## opening it from the collapsed orbit state in ONE 927-facet/1.07M-prim worker build (the dlmalloc
+## convoy's 2662 ms knee frame — the class-0 growth burst FP_SHELL_STAGE_REEMIT correctly exempts).
+## While off-surface + analytically descending (radial-Δ Schmitt latch, NOT _fall_vy_ema) inside
+## [SHELL_PWD_ALT_LO, SHELL_PWD_ALT_HI], the cap snapshot is refreshed on a pace and each dispatch is
+## staged with class-0 growth budget-ELIGIBLE (voluntary emit ⇒ deferral is not a hole), ≤
+## SHELL_STAGE_FACETS facets/dispatch, chaining on the shipped SRC_STAGE rail. By the knee the sectors
+## are resident+current, so the release dirty set is a small class-1 replacement. Never engages at
+## steady orbit (latch needs sustained −10 b/s radial), on foot (_shell_orbit() false), or on a climb.
+## Requires FP_SHELL_CAMERA_SET + FP_FARRING_SECTORS + FP_FARRING_ASYNC_REBUILD + FP_SHELL_STAGE_REEMIT.
+## Default OFF → the shell collapses at orbit and rebuilds at the knee exactly as today (byte-identical,
+## FLAT 6042/0). Gate: src/tools/verify_shell_prewarm.gd.
+const FP_SHELL_PREWARM_DESCENT := false
+const SHELL_PWD_ALT_HI := 1300.0    # engage ceiling (blocks): ≥ 2× the knee, ≥ 1.1 s of band at 570 b/s
+const SHELL_PWD_ALT_LO := 650.0     # engage floor: just above the 608.7 knee — below it the knee machinery owns
+const SHELL_PWD_SAMPLE_MS := 250    # descent-latch sampling cadence (Δh/Δt per sample, Schmitt via reentry_descent_step)
+const SHELL_PWD_SNAP_MS := 500      # min wall-ms between pre-warm-forced cap snapshots (the pacing bound)
+const SHELL_PWD_DRIFT_DEG := 2.0    # force a snapshot only when the axis swept ≥ this since the last one…
+const SHELL_PWD_DTH_DEG := 1.0      # …or θ_h moved ≥ this (else the pacer stays silent — no-op ticks are free)
+
+## COSMOS DE-ORBIT SLICE SMOOTHING (docs/COSMOS-DEORBIT-SLICE-SMOOTHING-DESIGN.md) — bound the staged shell slice.
+## FP_FARRING_SECTORS' 2×2 face-quadrant sector (≤ (K/2)²=144 fids) is the ATOMIC swap unit, so every staged slice
+## carries 130–144 facets and convoys the wasm dlmalloc lock 284–1041 ms/frame down the descent. When true, the
+## partition refines to 4×4 (96 sectors, ≤ 36 fids each), the staging budget/trigger/failsafe scale to match (one
+## sector per dispatch), and a pre-warm-voluntary run past the wall-clock cap keeps chaining budgeted slices instead
+## of dumping the remainder unbudgeted (voluntary emit ⇒ deferral is never a hole). Same welded-cache seam law, same
+## per-sector machinery (all arrays sized by _sector_count()). Requires FP_FARRING_SECTORS (+ STAGE_REEMIT/
+## PREWARM_DESCENT for the descent path). Default OFF → the shipped 24-sector partition + 112/168/2500 staging consts
+## verbatim (byte-identical, FLAT 6042/0).
+const FP_SHELL_SECTOR_FINE := false
+const SHELL_SECTOR_SPLIT_FINE := 4    # 4×4 per face → 96 sectors, ≤ (24/4)²=36 fids each
+const SHELL_STAGE_FACETS_FINE := 40   # per-dispatch budget: one full fine sector + headroom
+const SHELL_STAGE_TRIGGER_FINE := 48  # 1.2× budget (the 1.5× slack was the 144-fid atom's)
+const SHELL_STAGE_MAX_MS_FINE := 7000 # 2500 × (112/40) — forced-run failsafe only (see §3.2)
+
 ## COSMOS far-ring full coverage (docs/COSMOS-FARRING-COVERAGE-DESIGN.md) — the see-through-gap fix. The shipped far
 ## ring EXCLUDES the active facet + the live-pool neighbours (`_excluded`), so beyond the ~128-block near-blocky disk on
 ## those facets there is no far quad at all and the camera sees straight through to the opposite inner side of the globe
@@ -1196,6 +1263,23 @@ const STRUCT_SHOW_STREAK := 2                # §7.3 consecutive NOT_COVERED pro
 ## Off ⇒ the shipped binary suspend + off-surface early-return, byte-identical. Needs FP_STRUCT_FAR. Gate: G-ST-SHELL.
 const FP_STRUCT_SHELL_BAND := false          # far structures render in the off-surface shell band [OFFSURFACE_Y, FT_SHELL_HIDE_ALT)
 
+## FP_STRUCT_NEAR_HOLD + FP_STRUCT_BAKE_STAGE (docs/COSMOS-DEORBIT-STRUCT-STAGING-DESIGN.md) — the de-orbit
+## village handoff, two composing fixes. (1) HOLD: the shipped cull drops a far house model UNCONDITIONALLY at
+## dist < near_render_radius() with NO NearPresence probe, so a descending player sees houses VANISH until the
+## lagging near build arrives (live-confirmed). Inside r0 the far model now HOLDS until the near build actually
+## probes COVERED (positive = fact ⇒ hide immediately, the far-trees streak-1 law; NOT_COVERED while hidden
+## restores after STRUCT_SHOW_STREAK; UNKNOWABLE never flips). (2) STAGE: the zone-B wake at FT_SHELL_HIDE_ALT
+## first-bakes EVERY GEN house in the STRUCT_FAR_MAX band in ONE frame (measured 3555 ms at alt ~598) — the
+## bake now drains nearest-first, ≥ STAGE_MIN houses and ≤ STAGE_MS ms per pass, every frame while pending;
+## the merged-mesh commit keeps the shipped STRUCT_STEP_MS cadence. Staging only delays the ADDITION of a
+## never-yet-shown house — it NEVER removes a shown one. Both default OFF ⇒ byte-identical (FLAT 6042/0).
+## Need FP_STRUCT_FAR. Gates: G-ST-HOLD / G-ST-STAGE (src/tools/verify_structures.gd).
+const FP_STRUCT_NEAR_HOLD := false           # far model held inside r0 until the near build probes COVERED (no hole)
+const FP_STRUCT_BAKE_STAGE := false          # staged wake-bake drain (no single-frame village bake burst)
+const STRUCT_BAKE_STAGE_MS := 8.0            # per-pass bake time box (ms) ≈ half a 60 Hz frame
+const STRUCT_BAKE_STAGE_MIN := 2             # min fresh bakes per pass — guaranteed forward progress
+const STRUCT_HOLD_PROBE_CAP := 96            # max inside-r0 probes per pass (past ⇒ UNKNOWABLE ⇒ hold; safe degrade)
+
 ## FP_DEM_DEFER (docs/COSMOS-STREAM-PARALLEL-DESIGN.md Phase A — the fresh-reload fix) — the whole-planet coarse
 ## DEM (`FP_GLOBAL_RELIEF_DATA` / `GlobalReliefData.step`) is frame-budget GATED but the admitted unit is UNBOUNDED
 ## on the main thread (an O(3456) allocating `_next_unbaked` scan + a `bake_smooth_tile` + a 1089-node hillshade =
@@ -1250,6 +1334,16 @@ const FP_STREAM_TICK_ONCE := false      # §4: run the streaming orchestration t
 ## FLAT 6042/0). Gate: verify_fast_load.gd (G-FL-PACE).
 const FP_SMOOTH_V2_PACE := false
 const SMOOTH_V2_COMMIT_MS := 500        # min ms between FacetSmoothV2 commits (mirrors ORBIT_RELIEF_COMMIT_MS)
+
+## COSMOS DE-ORBIT SLICE SMOOTHING P3 (docs/COSMOS-DEORBIT-SLICE-SMOOTHING-DESIGN.md §7, FP_SV2_SHELL_YIELD) — keep the
+## FacetSmoothV2 whole-surface ArrayMesh apply (~72 ms observed on descent frames) off the frames a staged shell slice
+## is landing (150 ms slice + 72 ms collision would breach the 200 ms target). When true, `step()`'s third
+## `shell_yield` arg — true at the far-ring call site while a staged run is active (`_stage_active` or an in-flight
+## sectored async build) — defers ONLY the main-thread commit/merge-dispatch AFTER reap/evict/dispatch have run (tile
+## workers never stall); `_dirty` accumulates exactly as the FP_SMOOTH_V2_PACE law already guarantees and one later
+## commit folds every ready tile. The staged run is bounded (≤ SHELL_STAGE_MAX_MS_FINE forced / prewarm-band voluntary),
+## so the deferral is bounded. Off ⇒ the arg is false at the only call site ⇒ byte-identical (FLAT 6042/0).
+const FP_SV2_SHELL_YIELD := false
 
 ## FP_SMOOTH_V2_ASYNC_MERGE (docs/COSMOS-FAST-LOAD-DESIGN.md Phase 2, §2.1.3) — move `FacetSmoothV2.merge_tiles` (the
 ## ~630k-index concat/remap, the whole main-thread commit cost) OFF the main thread. `merge_tiles` is a PURE static
@@ -2785,29 +2879,55 @@ static func approach_view_distance(d: float, full: float, lo: float) -> float:
 ## or descent rate (that was cc2ee78's miss, §4): growth is admitted only while the backlog has drained below
 ## REENTRY_GEN_BACKLOG_MAX, and then by at most REENTRY_GROW_STEP blocks per debounced anchor write, so no single
 ## gate-open write can emit more than one shell's worth of tasks. Shrink (ascent release) always passes untouched.
-## Review fix (adversarial review of c673e35): the gate is only CONSULTED by the wiring while `falling_fast`
-## (world_manager.gd _apply_approach_anchor, the same signal §3.2 uses) — the GLOBAL VoxelEngine generation backlog
-## is routinely 1.5-2.8k during ordinary grounded/walking play (§1) even though nothing is flooding, so an
-## unconditional gate would wedge a still-growing near view below full 128 indefinitely once landed (a silent
-## walk-stall the fps/vox_gen/hole A/B cannot see) and, with no reset on the last-written state, is a latent
-## hard-wedge risk if anything else sustains a high backlog while stationary. Restricting the CALL to the airborne
-## fast-descent regime — the only regime the 6-7k flood occurs in — closes both while leaving the pure law (the
-## real backstop: the backlog cap + step clamp below) untouched. Default OFF ⇒ reentry_admit_view returns want_vd
-## verbatim (byte-identical; FLAT stays 6042/0).
+## C-lite arming (docs/COSMOS-FALL-CLITE-DESIGN.md — arming REV 2). The rev-1 arming (only consult the gate while
+## `falling_fast` = _fall_vy_ema < -ENV_FALL_HOLD_VY) was MEASURED-DEAD: _fall_vy_ema's sole update rejects any
+## sample with per-tick 3-D speed ≥ VEL_PREDICT_SPEED_CLAMP (40 b/s), and a de-orbit runs 100-570 b/s across the
+## ENTIRE flood band, so falling_fast is stale-false exactly where the flood fires (live A/B: 1-of-4 fluke bind, 3
+## flooded ≥ baseline). C-lite arms on a freeze-INDEPENDENT descent latch (reentry_descent_step, from Δ of the
+## analytic radial altitude — no EMA, no speed clamp, no regime gate) AND restructures the law: growth is ALWAYS
+## step-clamped under the flag (kills the touchdown jump-to-full cliff), and the backlog HOLD applies ONLY while
+## descent-armed (the wiring also requires h > REENTRY_DESCENT_MIN_ALT=128 > 112 max terrain, so a grounded player
+## is STRUCTURALLY unwedgeable — retires the walk-stall risk without any regime signal). Default OFF ⇒
+## reentry_admit_view returns want_vd verbatim (byte-identical; FLAT stays 6042/0).
 const FP_REENTRY_BACKLOG_GATE := false
+const REENTRY_GATE_REV := 2            # arming revision (pck-dump self-description; rev 1 = dead falling_fast)
 const REENTRY_GEN_BACKLOG_MAX := 256   # max VoxelEngine tasks.generation admitting further view growth
 const REENTRY_GROW_STEP := 8           # max viewer view_distance growth (blocks) per debounced anchor write
+const REENTRY_DESCENT_VY_ON := 10.0    # engage latch: per-write radial rate ≤ −this (b/s); > any grounded rate
+const REENTRY_DESCENT_VY_OFF := 5.0    # release threshold (Schmitt band with VY_ON; no apoapsis/hover flap)
+const REENTRY_DESCENT_CALM_N := 3      # consecutive calm writes (~0.3 s) to release the latch
+const REENTRY_DESCENT_MIN_ALT := 128.0 # backlog-block only above this radial alt (> 112 max terrain ⇒ grounded
+                                       # backlog-wedge is structurally impossible)
+const REENTRY_DESCENT_VY_CLAMP := 2000.0 # reject a per-write rate above this as teleport/pause, not motion
 
-## Pure law (gate-testable): the next viewer view_distance given the last written one, the anchor law's want, and
-## the live generation backlog. Shrink always passes (ascent release unchanged). Growth admitted only while the
-## engine pool has drained below the cap, and then by at most REENTRY_GROW_STEP per write — so one gate-open write
-## can never emit a giant annulus.
-static func reentry_admit_view(last_vd: int, want_vd: int, gen_backlog: int) -> int:
+## Pure law v2 (gate-testable): the next viewer view_distance given the last written one, the anchor law's want, the
+## live generation backlog, and whether the descent latch is armed. Shrink/first-write pass verbatim. Growth is
+## ALWAYS step-clamped under the flag (≤ +REENTRY_GROW_STEP per write — closes the touchdown jump-to-full flood);
+## the backlog HOLD applies only when descent-armed AND the pool is saturated. A missed descent (false negative)
+## degrades to step-clamped growth (still ≤ one small annulus/write vs 6-7k); a spurious arm can HOLD nothing on
+## the ground because the wiring folds h > REENTRY_DESCENT_MIN_ALT into `descending`.
+static func reentry_admit_view(last_vd: int, want_vd: int, gen_backlog: int, descending: bool) -> int:
 	if not FP_REENTRY_BACKLOG_GATE or last_vd < 0 or want_vd <= last_vd:
 		return want_vd
-	if gen_backlog > REENTRY_GEN_BACKLOG_MAX:
+	if descending and gen_backlog > REENTRY_GEN_BACKLOG_MAX:
 		return last_vd
 	return mini(want_vd, last_vd + REENTRY_GROW_STEP)
+
+## C-lite (docs/COSMOS-FALL-CLITE-DESIGN.md §2/§3.3): one descent-latch step. Pure static so verify scripts drive it
+## headless with inline loops. Returns [descending: bool, calm_writes: int]. vy_w = Δ(radial altitude)/Δt per
+## debounced anchor write; engage on a single write ≤ −VY_ON, release after CALM_N sustained writes ≥ −VY_OFF, the
+## dead zone (−VY_ON, −VY_OFF) holds the latch (hysteresis), |vy_w| > VY_CLAMP = teleport/pause (keep latch, resample).
+static func reentry_descent_step(vy_w: float, descending: bool, calm_writes: int) -> Array:
+	if absf(vy_w) > REENTRY_DESCENT_VY_CLAMP:
+		return [descending, calm_writes]
+	if vy_w <= -REENTRY_DESCENT_VY_ON:
+		return [true, 0]
+	if vy_w >= -REENTRY_DESCENT_VY_OFF:
+		calm_writes += 1
+		if calm_writes >= REENTRY_DESCENT_CALM_N:
+			return [false, calm_writes]
+		return [descending, calm_writes]
+	return [descending, calm_writes]
 
 ## COSMOS FALL-MESH-STALL (§3.2 — FP_REENTRY_REGROW_DEFER). Everything the S1 re-growth law generates at alt
 ## 900→460 is issued against the PRE-restore facet designation (barely visible — the release ramp's own sub-τ
@@ -2823,12 +2943,12 @@ const REENTRY_REGROW_DEFER_ALT := 460.0  # radial alt above which a FAST descent
 const REENTRY_HOLD_VIEW := 64.0          # the held near view — LAND_RAMP_HOLD_BLOCKS' proven landing disc
                                          # (far-ring chords cover 64-128, hole=0 proven)
 
-## Pure law: clamp the anchor's wanted view to the landing disc while plunging fast above the defer altitude.
-## `falling_fast` = _fall_vy_ema < -ENV_FALL_HOLD_VY (the FP_ENV_FALL_HOLD / FP_LAND_RAMP_HOLD shared
-## position-based signal, world_manager.gd:1283-1296). Slow descents (vy < 20 b/s) never trigger it — they don't
-## flood either.
-static func reentry_hold_view(want_vd: float, alt: float, falling_fast: bool) -> float:
-	if not FP_REENTRY_REGROW_DEFER or not falling_fast or alt <= REENTRY_REGROW_DEFER_ALT:
+## Pure law: clamp the anchor's wanted view to the landing disc while descent-armed above the defer altitude.
+## `descending` = the C-lite freeze-independent descent latch (_reentry_descending, from Δ radial altitude — see
+## reentry_descent_step / COSMOS-FALL-CLITE §2), NOT the measured-dead _fall_vy_ema speed-clamped EMA. Ascent never
+## holds (latch false); slow descents that don't flood re-grow normally once below the defer altitude.
+static func reentry_hold_view(want_vd: float, alt: float, descending: bool) -> float:
+	if not FP_REENTRY_REGROW_DEFER or not descending or alt <= REENTRY_REGROW_DEFER_ALT:
 		return want_vd
 	return minf(want_vd, REENTRY_HOLD_VIEW)
 

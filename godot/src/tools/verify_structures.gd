@@ -65,6 +65,13 @@ func _initialize() -> void:
 	# [OFFSURFACE_Y, FT_SHELL_HIDE_ALT), co-timed with the far trees (both keyed on FT_SHELL_*_ALT).
 	_gate_shell()
 
+	# COSMOS DE-ORBIT STRUCT STAGING (docs/COSMOS-DEORBIT-STRUCT-STAGING-DESIGN.md): the de-orbit village handoff.
+	# G-ST-HOLD = the hold-until-covered band floor (FP_STRUCT_NEAR_HOLD — the live "houses vanish" hole fix);
+	# G-ST-STAGE = the staged wake-bake drain (FP_STRUCT_BAKE_STAGE — the 3555 ms single-frame burst fix). Both
+	# flag-aware (shipped law asserted OFF, the new law ON — the G-ST-GUARD/SHELL convention).
+	_gate_hold()
+	_gate_stage()
+
 	print("=== VERIFY structures: ", _pass, " passed, ", _fail, " failed ===")
 	quit(1 if _fail > 0 else 0)
 
@@ -738,3 +745,263 @@ func _gate_shell() -> void:
 		_ok(not tier.mi_visible(), "G-ST-SHELL(off): off-surface still hidden at h=650 (byte-identical)")
 		_ok(tier._shell_material == null and tier.shell_band_state().is_empty(),
 			"G-ST-SHELL(off): no shell material + empty telemetry (byte-identical off)")
+
+# =====================================================================================================================
+# G-ST-HOLD (FP_STRUCT_NEAR_HOLD — docs/COSMOS-DEORBIT-STRUCT-STAGING-DESIGN.md §3.5/§6) — the hold-until-covered band
+# floor: the CONFIRMED LIVE DEFECT was that the shipped cull dropped a far house model on DISTANCE ALONE inside
+# near_render_radius() while the near voxel build still lagged the descent — a renderer-less "vanished" house. The
+# fix HOLDS the far model inside r0 until the near build actually probes COVERED (positive = fact ⇒ hide in ONE pass,
+# the far-trees streak-1 law; NOT_COVERED-while-hidden restores after STRUCT_SHOW_STREAK; UNKNOWABLE never flips).
+# Flag-aware: OFF ⇒ the shipped `dist<r0 ⇒ return false` verbatim; ON ⇒ the hold law. Drives the REAL step/cull path
+# (_probe_pass + _cull_emit + the duck-typed NearPresence Callable chain), never a runtime-dead shadow.
+# =====================================================================================================================
+func _gate_hold() -> void:
+	var on := CubeSphere.FP_STRUCT_NEAR_HOLD
+	var r0 := float(TerrainConfig.near_render_radius())
+	# a synthetic in-band record; camera placed INSIDE the band floor (dist == r0 − 20).
+	var rec := {"root": 11, "fid": 0, "bmin": Vector3i(10, 40, 10), "bmax": Vector3i(16, 46, 16), "rev": 1}
+	var centre := FS.new()._structure_centre(rec)
+	var cam := centre - centre.normalized() * (r0 - 20.0)
+	_ok(FS.new()._structure_dist(rec, cam) < r0, "G-ST-HOLD: the test camera is inside near_render_radius (the band floor)")
+
+	if not on:
+		# BYTE-OFF: the shipped floor drops the far model on distance alone — the probe cache is not even consulted.
+		var toff = FS.new()
+		toff._probe_cache[11] = NearPresence.UNKNOWABLE
+		_ok(not toff._cull_emit(rec, cam),
+			"G-ST-HOLD(off): inside r0 ⇒ far model dropped (shipped band floor, byte-identical)")
+		toff._probe_cache[11] = NearPresence.COVERED
+		_ok(not toff._cull_emit(rec, cam),
+			"G-ST-HOLD(off): inside r0 ⇒ dropped regardless of the probe (no hole-fix off-flag)")
+		return
+
+	# ON: HOLD-until-COVERED.
+	# (a) UNKNOWABLE ⇒ HELD (the near build hasn't answered — the far model persists, no hole).
+	var t1 = FS.new()
+	t1._probe_cache[11] = NearPresence.UNKNOWABLE
+	_ok(t1._cull_emit(rec, cam), "G-ST-HOLD(on): UNKNOWABLE inside r0 ⇒ far model HELD (no renderer-less hole)")
+	# (b) NOT_COVERED while shown ⇒ still HELD (near says 'not meshed here yet').
+	t1._probe_cache[11] = NearPresence.NOT_COVERED
+	_ok(t1._cull_emit(rec, cam), "G-ST-HOLD(on): NOT_COVERED inside r0 (shown) ⇒ still HELD (near not arrived)")
+	# (c) SWAP ORDERING — the no-hole lynchpin: walking UNKNOWABLE→NOT_COVERED→COVERED, the far model is EMITTED at
+	#     every step strictly BEFORE the COVERED step, and hidden exactly AT it (streak-1). No frame between
+	#     "far hidden" and "near present".
+	var t2 = FS.new()
+	var seq: Array = []
+	for st in [NearPresence.UNKNOWABLE, NearPresence.NOT_COVERED, NearPresence.COVERED]:
+		t2._probe_cache[11] = st
+		seq.append(t2._cull_emit(rec, cam))
+	_ok(seq[0] and seq[1] and not seq[2],
+		"G-ST-HOLD(on): swap order — far EMITTED through UNKNOWABLE/NOT_COVERED, HIDDEN immediately at COVERED (streak-1, no hole)")
+	# (d) COVERED hides in ONE pass (streak-1) on a fresh tier — the double-draw window inside r0 is ≤ one pass.
+	var t3 = FS.new()
+	t3._probe_cache[11] = NearPresence.COVERED
+	_ok(not t3._cull_emit(rec, cam), "G-ST-HOLD(on): COVERED ⇒ HIDDEN in one pass (streak-1, kills the inside-r0 double-draw)")
+	# (e) UNKNOWABLE never flips the hidden state (the shared invariant, hidden side).
+	t3._probe_cache[11] = NearPresence.UNKNOWABLE
+	_ok(not t3._cull_emit(rec, cam), "G-ST-HOLD(on): UNKNOWABLE after a COVERED-hide ⇒ stays hidden (never flips)")
+	# (f) restore is STREAKED: after a COVERED-hide, NOT_COVERED restores only after STRUCT_SHOW_STREAK (a flickering
+	#     probe never strobes the far model).
+	var restored_at := -1
+	for i in range(CubeSphere.STRUCT_SHOW_STREAK + 2):
+		t3._probe_cache[11] = NearPresence.NOT_COVERED
+		if t3._cull_emit(rec, cam):
+			restored_at = i
+			break
+	_ok(restored_at == CubeSphere.STRUCT_SHOW_STREAK - 1,
+		"G-ST-HOLD(on): NOT_COVERED restores the far model after STRUCT_SHOW_STREAK (streaked, no strobe)")
+
+	# (g) PROBE-CAP degrade — the REAL _probe_pass path: with more inside-r0 records than STRUCT_HOLD_PROBE_CAP, only
+	#     the cap is probed; records past it get NO cache entry ⇒ _cull_emit reads UNKNOWABLE ⇒ HELD (never dropped).
+	var tcap = FS.new()
+	tcap.set_near_query(func(_fid: int, _box: AABB) -> int: return NearPresence.COVERED)
+	var reg_cap: Array = []
+	var ncap := CubeSphere.STRUCT_HOLD_PROBE_CAP + 8
+	for k in range(ncap):
+		reg_cap.append({"root": 5000 + k, "fid": 0, "bmin": Vector3i(10, 40, 10), "bmax": Vector3i(16, 46, 16), "rev": 1})
+	var ccap := tcap._structure_centre(reg_cap[0])
+	var cam_cap := ccap - ccap.normalized() * (r0 - 20.0)
+	tcap._probe_pass(reg_cap, cam_cap)
+	_ok(tcap._probe_cache.size() == CubeSphere.STRUCT_HOLD_PROBE_CAP,
+		"G-ST-HOLD(on): inside-r0 probes CAPPED at STRUCT_HOLD_PROBE_CAP (bounded per-pass cost)")
+	var late: Dictionary = reg_cap[ncap - 1]
+	_ok(not tcap._probe_cache.has(int(late["root"])) and tcap._cull_emit(late, cam_cap),
+		"G-ST-HOLD(on): a record PAST the probe cap is HELD (UNKNOWABLE ⇒ emitted, never dropped — safe degrade)")
+
+	# (h) REAL NearPresence CALLABLE CHAIN — wire _near_query exactly as world_manager does (NearPresence.covered bound
+	#     to a duck-typed stub world), drive _probe_pass, and flip the stub's meshed answer. Proves the whole chain
+	#     (step → _probe_pass → _near_query → NearPresence → world.skin_near_meshed), not just a hand-set cache entry.
+	var t4 = FS.new()
+	var fw := FakeWorld.new()
+	fw.band = Vector2(-64.0, 130.0)
+	fw.meshed = false
+	t4.set_near_query(func(fid: int, box: AABB) -> int: return NearPresence.covered(fw, fid, box))
+	t4._probe_pass([rec], cam)
+	_ok(int(t4._probe_cache.get(11, NearPresence.UNKNOWABLE)) == NearPresence.NOT_COVERED and t4._cull_emit(rec, cam),
+		"G-ST-HOLD(on): real NearPresence chain — near NOT meshed ⇒ NOT_COVERED ⇒ far HELD inside r0")
+	fw.meshed = true
+	t4._probe_pass([rec], cam)
+	_ok(int(t4._probe_cache.get(11, NearPresence.UNKNOWABLE)) == NearPresence.COVERED and not t4._cull_emit(rec, cam),
+		"G-ST-HOLD(on): real NearPresence chain — near meshed ⇒ COVERED ⇒ far hands off (hidden) inside r0")
+
+# =====================================================================================================================
+# G-ST-STAGE (FP_STRUCT_BAKE_STAGE — docs/COSMOS-DEORBIT-STRUCT-STAGING-DESIGN.md §3.6/§6) — the staged wake-bake
+# drain: the zone-B wake first-baked EVERY GEN house in the STRUCT_FAR_MAX band in ONE frame (measured 3555 ms). The
+# fix drains nearest-first under a per-pass budget (≥ STRUCT_BAKE_STAGE_MIN houses, ≤ STRUCT_BAKE_STAGE_MS ms), every
+# frame while pending, committing the merged mesh on the shipped STRUCT_STEP_MS cadence. INVARIANT: staging may only
+# delay the ADDITION of a never-yet-shown house — it NEVER removes a shown one. Flag-aware: OFF ⇒ one _rebuild bakes
+# ALL records, _bake_pending never set (byte-off); ON ⇒ the staged drain, converging to the byte-identical final mesh.
+# Drives the REAL _rebuild/_drain_bakes/_ensure_bake path with an instrumented, deterministically-spinning sampler.
+# =====================================================================================================================
+func _gate_stage() -> void:
+	var on := CubeSphere.FP_STRUCT_BAKE_STAGE
+	var g := _grass()
+	if g <= 0:
+		_ok(false, "G-ST-STAGE: BlockCatalog grass id unavailable")
+		return
+	var r0 := float(TerrainConfig.near_render_radius())
+	# N houses, all in the emit-everything band (dist > r0 + CULL_ANNULUS, < STRUCT_FAR_MAX) so _cull_emit emits every
+	# one regardless of FP_STRUCT_NEAR_HOLD (this gate isolates BAKE_STAGE). Each is a 4×4×4 solid cube (c=1 ⇒ tris>0).
+	var N := 20
+	var reg: Array = []
+	var anchors := {}                                   # bmin → root (the decimator samples bmin first per house)
+	for k in range(N):
+		var bmin := Vector3i(200 + k * 6, 40, 0)
+		var bmax := bmin + Vector3i(3, 3, 3)
+		var root := 1000 + k
+		anchors[bmin] = root
+		reg.append({"root": root, "fid": 0, "bmin": bmin, "bmax": bmax, "rev": 1})
+	var probe := FS.new()
+	var c0 := probe._structure_centre(reg[0])
+	var cam := c0 - c0.normalized() * (r0 + 400.0)
+	# Geometry sanity: every house sits in the unconditional-emit band and all distances are DISTINCT (well-ordered).
+	var dists: Array = []
+	var band_ok := true
+	for rc in reg:
+		var d := probe._structure_dist(rc, cam)
+		if d <= r0 + FS.CULL_ANNULUS or d >= CubeSphere.STRUCT_FAR_MAX:
+			band_ok = false
+		dists.append(d)
+	var distinct := true
+	for i in range(dists.size()):
+		for j in range(i + 1, dists.size()):
+			if is_equal_approx(dists[i], dists[j]):
+				distinct = false
+	_ok(band_ok, "G-ST-STAGE: all %d test houses lie in the unconditional-emit band (r0+CULL_ANNULUS, STRUCT_FAR_MAX)" % N)
+	_ok(distinct, "G-ST-STAGE: all test-house distances are distinct (nearest-first order is well-defined)")
+	# Expected nearest-first root order (the same comparator _rebuild/_drain_bakes use).
+	var expected := reg.duplicate()
+	expected.sort_custom(func(a, b): return probe._structure_dist(a, cam) < probe._structure_dist(b, cam))
+	var expected_roots: Array = []
+	for rc in expected:
+		expected_roots.append(int(rc["root"]))
+
+	# A flag-INDEPENDENT reference for the final merged mesh: N × one house's tris (all houses identical geometry,
+	# no tri cap hit). Both flag states must converge to exactly this — the "identical final mesh" proof.
+	var plain := func(_fid: int, _cell: Vector3i) -> int: return g
+	var per_house_tris := int(SD.bake_lattice(SD.decimate(0, reg[0]["bmin"], reg[0]["bmax"], plain))["tris"])
+	var ref_tris := per_house_tris * N
+	_ok(per_house_tris > 0, "G-ST-STAGE: the reference house bakes to > 0 tris (well-formed fixture)")
+
+	if not on:
+		# BYTE-OFF: one _rebuild bakes ALL in-band records; _bake_pending is never set; the drain never runs.
+		var calls_off := {"n": 0}
+		var samp_off := func(fid: int, cell: Vector3i) -> int:
+			calls_off["n"] += 1
+			return g
+		var toff = FS.new()
+		toff.setup_instance(Node3D.new(), 0)
+		toff.set_sampler(samp_off)
+		toff._rebuild(reg, cam)
+		_ok(toff._baked.size() == N and not toff._bake_pending,
+			"G-ST-STAGE(off): ONE _rebuild bakes ALL %d records, _bake_pending never set (shipped path, byte-identical)" % N)
+		_ok(toff._dbg_stage_passes == 0, "G-ST-STAGE(off): the staged drain never runs (byte-identical)")
+		_ok(toff.live_tris() == ref_tris,
+			"G-ST-STAGE(off): the merged mesh contains every house (live_tris == N × per-house = %d)" % ref_tris)
+		_ok(toff.bake_stage_state().is_empty(), "G-ST-STAGE(off): bake_stage_state() empty (byte-identical telemetry)")
+		return
+
+	# ON — the staged drain. Instrumented sampler: counts calls, records the per-house first-sample order (nearest-
+	# first), and busy-spins ~1.5 ms per house-bake (deterministic wall-time ⇒ the time box triggers, no flake).
+	var calls := {"n": 0}
+	var anchor_order: Array = []
+	var samp := func(fid: int, cell: Vector3i) -> int:
+		calls["n"] += 1
+		if anchors.has(cell):
+			anchor_order.append(int(anchors[cell]))
+			var s0 := Time.get_ticks_usec()
+			while Time.get_ticks_usec() - s0 < 1500:
+				pass
+		return g
+
+	# (a) CADENCE — the bake-only frame: after a first (committing) pass, an immediate second pass with the commit
+	#     cadence not yet due and the drain still pending is BAKE-ONLY (the resident merged mesh is untouched — never
+	#     a removal), yet the drain still advances (_baked grows, _dbg_stage_passes increments).
+	var tc = FS.new()
+	tc.setup_instance(Node3D.new(), 0)
+	tc.set_sampler(samp)
+	tc._rebuild(reg, cam)                               # _last_commit_ms == 0 ⇒ cadence open ⇒ commits partial
+	_ok(tc._bake_pending and tc._baked.size() >= CubeSphere.STRUCT_BAKE_STAGE_MIN and tc._baked.size() < N,
+		"G-ST-STAGE(on): first pass bakes ≥ STRUCT_BAKE_STAGE_MIN and < N, _bake_pending == true (time box fired)")
+	var commit_anchor: int = tc._last_commit_ms
+	var passes_before: int = tc._dbg_stage_passes
+	var baked_before: int = tc._baked.size()
+	tc._rebuild(reg, cam)                               # immediate: cadence NOT due (<STRUCT_STEP_MS) + pending ⇒ bake-only
+	_ok(tc._last_commit_ms == commit_anchor and tc._dbg_stage_passes > passes_before and tc._baked.size() > baked_before,
+		"G-ST-STAGE(on): pending + commit cadence not due ⇒ BAKE-ONLY frame (mesh untouched, drain still advances — never a removal)")
+
+	# (b) CONVERGENCE + NEVER-REMOVE + BUDGET + nearest-first order — drive the drain to completion. Force the commit
+	#     cadence open each pass (deterministic, no wall-clock wait) so live_tris reflects the committed mesh every
+	#     pass; assert it NEVER decreases (a shown house is never removed) and converges to the reference mesh.
+	var tconv = FS.new()
+	tconv.setup_instance(Node3D.new(), 0)
+	tconv.set_sampler(samp)
+	anchor_order.clear()
+	var prev_live := 0
+	var max_pass_ms := 0.0
+	var passes := 0
+	var never_removed := true
+	var monotonic := true
+	while true:
+		tconv._last_commit_ms = 0                       # force cadence open ⇒ this pass assembles + commits
+		tconv._rebuild(reg, cam)
+		passes += 1
+		max_pass_ms = maxf(max_pass_ms, tconv._dbg_stage_ms_last)
+		if tconv.live_tris() < prev_live:
+			monotonic = false                           # the committed mesh shrank ⇒ a shown house was removed
+		# the nearest house (expected_roots[0]) is baked in pass 1 and must remain resident forever after.
+		if passes >= 1 and not tconv._has_bake(reg[_root_index(reg, expected_roots[0])]):
+			never_removed = false
+		prev_live = tconv.live_tris()
+		if not tconv._bake_pending:
+			break
+		if passes > 200:
+			break                                       # safety — convergence is guaranteed, this never trips
+	_ok(passes >= 3, "G-ST-STAGE(on): the drain spans multiple passes (staged, not a single burst) — %d passes" % passes)
+	_ok(tconv._baked.size() == N and not tconv._bake_pending,
+		"G-ST-STAGE(on): the drain CONVERGES — all %d houses baked, _bake_pending == false" % N)
+	_ok(monotonic and never_removed,
+		"G-ST-STAGE(on): NEVER-REMOVE — the committed mesh only grows; the first-shown house stays resident every pass")
+	_ok(tconv.live_tris() == ref_tris,
+		"G-ST-STAGE(on): converged merged mesh is byte-identical to the shipped one (live_tris == N × per-house = %d)" % ref_tris)
+	_ok(anchor_order == expected_roots,
+		"G-ST-STAGE(on): houses bake nearest-first (the drain order == the distance sort — visible houses first)")
+	_ok(max_pass_ms <= CubeSphere.STRUCT_BAKE_STAGE_MS + 6.0,
+		"G-ST-STAGE(on): every pass respects the per-pass time box (worst %.1f ms ≤ STRUCT_BAKE_STAGE_MS + one house)" % max_pass_ms)
+
+	# (c) CACHE ECONOMY — once converged, a further _rebuild re-bakes NOTHING (all _has_bake): the sampler is not
+	#     called again (already-baked houses cost O(1), exactly as the shipped per-rev cache).
+	var calls_at_convergence: int = calls["n"]
+	tconv._last_commit_ms = 0
+	tconv._rebuild(reg, cam)
+	_ok(calls["n"] == calls_at_convergence,
+		"G-ST-STAGE(on): a post-convergence rebuild re-bakes nothing (sampler calls frozen — the (root,rev) cache holds)")
+	_ok(not tconv.bake_stage_state().is_empty(),
+		"G-ST-STAGE(on): bake_stage_state() exposes the drain sensor (st_pend/st_bk/st_bms/st_live) for the live A/B")
+
+## Index of the record with `root` in `reg` (small linear scan — the fixtures are tiny).
+func _root_index(reg: Array, root: int) -> int:
+	for i in range(reg.size()):
+		if int(reg[i]["root"]) == root:
+			return i
+	return 0

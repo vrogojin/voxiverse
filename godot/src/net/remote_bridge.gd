@@ -1018,6 +1018,13 @@ func _merge_rich_state(msg: Dictionary) -> void:
 			var gc = world.call("gen_cache_stats")
 			if gc is Dictionary and not (gc as Dictionary).is_empty():
 				msg.merge(gc as Dictionary)
+		# COSMOS-FALL-CLITE (§5.2f): the re-entry descent-gate readback (rg_rev self-describes the arming revision,
+		# rg_desc the live latch, rg_last_vd the written near view). Empty-dict-guarded — a shipped (reentry-flags-off)
+		# build stamps NO rg_* keys → byte-identical telemetry.
+		if _has_m(world, "reentry_gate_stats"):
+			var rg = world.call("reentry_gate_stats")
+			if rg is Dictionary and not (rg as Dictionary).is_empty():
+				msg.merge(rg as Dictionary)
 		# CROSSING-FASTGEN obs-2 fix (4): the controller setpoint/floor/overload trace, so "adaptive off" vs "on but
 		# genuinely over setpoint" is directly readable alongside the credit. Guarded + empty-dict-guarded so a
 		# flag/render-path combination without a live controller simply omits these (never crashes the bridge).

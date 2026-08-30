@@ -53,6 +53,7 @@ docker run --rm \
   -e VOXEL_REF="${VOXEL_REF}" \
   -e WEB_PTHREAD_POOL="${WEB_PTHREAD_POOL}" \
   -e WEB_MALLOC="${WEB_MALLOC}" \
+  -e WEB_MIMALLOC_ARENA_RESERVE_KIB="${WEB_MIMALLOC_ARENA_RESERVE_KIB:-16384}" \
   -e JOBS="${JOBS}" \
   -e SKIP_LINUX="${SKIP_LINUX:-0}" \
   -e SKIP_WEB="${SKIP_WEB:-0}" \
@@ -61,6 +62,7 @@ docker run --rm \
   -v "${TEMPLATES_DIR}:/out/templates" \
   -v "${BIN_DIR}:/out/bin" \
   -v "${ENGINE_DIR}/patches:/patches:ro" \
+  -v "${ENGINE_DIR}/build-engine.sh:/usr/local/bin/build-engine.sh:ro" \
   "${ENGINE_IMAGE}"
 
 echo

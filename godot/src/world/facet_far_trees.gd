@@ -1062,6 +1062,12 @@ func _rebuild_inputs_changed(cam_abs: Vector3, shell_mode := false, h := 0.0) ->
 	# and re-arm exactly one rebuild on a zone (S↔B) flip. Off / zone S ⇒ the shipped threshold + no zone term (byte-identical).
 	if shell_mode:
 		move_thr = maxf(CubeSphere.FT_DELTA_MOVE_HYST, CubeSphere.FT_SHELL_MOVE_FRAC * h)
+	# FP_FT_WALK_CALM (docs/COSMOS-FARTIER-WALK-DESIGN.md §2.2 Step B, Lever 1): raise the camera re-arm to
+	# FT_CALM_MARGIN·0.5 (16 blk), paired with the FT_CALM_MARGIN band-edge slack in _rebuild_cards/_rebuild_meshes so a
+	# sub-margin walk emits the identical resident set. Superseded-by-max over MOVE_HYST/shell; degrades to the shipped
+	# threshold when a cap was hit last rebuild (nearest-first ordering is then genuinely camera-dependent). Off ⇒ untouched.
+	if CubeSphere.FP_FT_WALK_CALM and not (_capped or _mesh_capped):
+		move_thr = maxf(move_thr, CubeSphere.FT_CALM_MARGIN * 0.5)
 	var changed := (not _have_rebuilt) \
 		or (CubeSphere.FP_FT_SHELL_BAND and shell_mode != _last_rebuild_shell) \
 		or cam_abs.distance_to(_last_rebuild_cam) >= move_thr \

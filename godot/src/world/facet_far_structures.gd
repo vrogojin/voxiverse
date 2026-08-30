@@ -62,6 +62,13 @@ var _last_reg_count := -1
 var _last_edits_rev := -1
 var _last_cover_fp := 0
 var _last_step_ms := 0
+# FP_STRUCT_WALK_CALM (Lever 1): membership band-fingerprint. `_band_fp` is recomputed every _probe_pass (XOR of
+# _root_hash × band-code over every registered structure); `_last_band_fp` is latched at each real rebuild. `_band`
+# keys root -> last-latched band code (0=FLOOR,1=ANNULUS,2=BAND,3=OUT) for the FP_STRUCT_HANDOFF_HYST dead-band.
+# All computed/read only under FP_STRUCT_WALK_CALM ⇒ byte-identical off.
+var _band_fp := 0
+var _last_band_fp := 0
+var _band: Dictionary = {}
 
 # FP_STRUCT_BAKE_STAGE drain state (inert off-flag: never set, never read on the shipped path)
 var _bake_pending := false                    # un-baked in-band records remain — re-dispatch every frame
@@ -269,8 +276,14 @@ func _credit_gate_open(settled: bool, credit_ok: bool) -> bool:
 ## transition (a probe disagrees with the committed visibility — the streak still needs to advance, and a stable
 ## fingerprint would otherwise freeze it short of the threshold). First call always rebuilds.
 func _inputs_changed(cam_abs: Vector3, reg_count: int, rev_sum: int, cover_fp: int) -> bool:
+	# FP_STRUCT_WALK_CALM (Lever 1): replace the raw 2-blk camera re-arm with a membership band-fingerprint. The camera
+	# term survives only when the tri cap was hit last rebuild (_capped) — then nearest-first ORDERING is a genuine camera
+	# term. Off ⇒ `(not false or _capped)` == true ⇒ the shipped `dist >= STRUCT_DELTA_MOVE` disjunct verbatim, and the
+	# band-fp disjunct short-circuits on the const ⇒ byte-identical.
 	var changed := (not _have_rebuilt) \
-		or cam_abs.distance_to(_last_cam) >= STRUCT_DELTA_MOVE \
+		or (cam_abs.distance_to(_last_cam) >= STRUCT_DELTA_MOVE \
+			and (not CubeSphere.FP_STRUCT_WALK_CALM or _capped)) \
+		or (CubeSphere.FP_STRUCT_WALK_CALM and _band_fp != _last_band_fp) \
 		or reg_count != _last_reg_count \
 		or rev_sum != _last_rev_sum \
 		or _current_edits_rev() != _last_edits_rev \
@@ -284,6 +297,7 @@ func _inputs_changed(cam_abs: Vector3, reg_count: int, rev_sum: int, cover_fp: i
 		_last_rev_sum = rev_sum
 		_last_edits_rev = _current_edits_rev()
 		_last_cover_fp = cover_fp
+		_last_band_fp = _band_fp
 	return changed
 
 # --- near-handoff cull (§7.3) ---------------------------------------------------------------------------------------
@@ -300,9 +314,18 @@ func _probe_pass(reg: Array, cam_abs: Vector3) -> int:
 	var r0 := float(TerrainConfig.near_render_radius())
 	var fp := 0
 	var probes := 0
+	# FP_STRUCT_WALK_CALM (Lever 1): recompute the membership band-fingerprint over EVERY registered structure, folded
+	# free into this existing distance loop. Only under the flag (byte-identical off — _band_fp stays 0, never read).
+	if CubeSphere.FP_STRUCT_WALK_CALM:
+		_band_fp = 0
 	for rec in reg:
 		var fid: int = int(rec["fid"])
 		var dist := _structure_dist(rec, cam_abs)
+		if CubeSphere.FP_STRUCT_WALK_CALM:
+			var root_b := int(rec["root"])
+			var code := _band_code(dist, r0, int(_band.get(root_b, -1)))
+			_band[root_b] = code
+			_band_fp ^= _band_mix(_root_hash(root_b), code)
 		# FP_STRUCT_NEAR_HOLD: the band floor is no longer probe-free — inside r0 the far model holds until
 		# the near build actually covers it, so it MUST be probed (capped; past the cap ⇒ no cache entry ⇒
 		# UNKNOWABLE ⇒ hold — the safe direction). Off ⇒ the shipped skip verbatim.
@@ -391,6 +414,39 @@ static func _root_hash(root: int) -> int:
 	var n := (root * 2654435761) & 0x7FFFFFFF
 	n = ((n ^ (n >> 13)) * 1274126177) & 0x7FFFFFFF
 	return n ^ (n >> 16)
+
+## FP_STRUCT_WALK_CALM: mix a per-structure root hash with its band code into a stable, code-sensitive term. XOR-folded
+## over all records ⇒ order-independent (nearest-first ordering is irrelevant) and the fold changes iff SOME structure's
+## band code changed. Only called under the flag.
+static func _band_mix(rh: int, code: int) -> int:
+	var n := (rh ^ ((code + 1) * 2246822519)) & 0x7FFFFFFF
+	n = ((n ^ (n >> 15)) * 2654435761) & 0x7FFFFFFF
+	return n ^ (n >> 13)
+
+## FP_STRUCT_WALK_CALM: classify a structure's camera distance into a band code (0=FLOOR dist<r0, 1=ANNULUS
+## [r0, r0+CULL_ANNULUS], 2=BAND (annulus, STRUCT_FAR_MAX], 3=OUT). Under FP_STRUCT_HANDOFF_HYST (Lever 2c) the edges
+## carry a state-keyed Schmitt dead-band (width STRUCT_HYST_W): a structure keeps `prev` unless the camera crosses the
+## relevant edge by ±STRUCT_HYST_W, so a razor-edge camera can't oscillate the code (and thus the fingerprint). Only
+## called under FP_STRUCT_WALK_CALM.
+func _band_code(dist: float, r0: float, prev: int) -> int:
+	var a := r0                                # FLOOR|ANNULUS edge
+	var b := r0 + CULL_ANNULUS                 # ANNULUS|BAND edge
+	var c := CubeSphere.STRUCT_FAR_MAX         # BAND|OUT edge
+	if CubeSphere.FP_STRUCT_HANDOFF_HYST:
+		var w := CubeSphere.STRUCT_HYST_W
+		# Bias each edge by ±w in the direction that keeps `prev` (Schmitt): a code below an edge only advances past
+		# edge+w, a code at/above only retreats past edge−w. `prev == -1` (unseen) uses the raw edges.
+		if prev == 0:   a += w
+		elif prev == 1: a -= w; b += w
+		elif prev == 2: b -= w; c += w
+		elif prev == 3: c -= w
+	if dist < a:
+		return 0
+	if dist <= b:
+		return 1
+	if dist <= c:
+		return 2
+	return 3
 
 # --- merged-band rebuild --------------------------------------------------------------------------------------------
 
@@ -545,6 +601,7 @@ func _evict_stale_bakes(reg: Array) -> void:
 		_baked_bytes -= int(_baked[root]["bytes"])
 		_baked.erase(root)
 		_cull.erase(root)
+		_band.erase(root)   # FP_STRUCT_WALK_CALM: bound the band-code dict to live structures (no-op key off-flag)
 
 # --- telemetry / ledger ---------------------------------------------------------------------------------------------
 func rebuild_count() -> int: return _dbg_rebuild_count

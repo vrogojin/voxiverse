@@ -693,6 +693,10 @@ func _capture_worst_frame_snapshot() -> Dictionary:
 			snap["wf_st_bms"] = (wm as Dictionary).get("st_bms", 0.0)
 			snap["wf_smooth_v2_commit_ms"] = (wm as Dictionary).get("smooth_v2_commit_ms", 0.0)
 			snap["wf_main_commit_ms"] = (wm as Dictionary).get("main_commit_ms", 0.0)
+			# COSMOS-FARTIER-WALK §5: the far-tier rebuild-RATE counters at the worst frame (cumulative; the A/B
+			# diffs wf_ftr_rb / wf_st_rb across windows to read rebuilds-per-window — the churn baseline the fix targets).
+			snap["wf_ftr_rb"] = (wm as Dictionary).get("ftr_rb", 0)
+			snap["wf_st_rb"] = (wm as Dictionary).get("st_rb", 0)
 	# if FP_FALL_TIMING is ALSO on: the in-progress (not-yet-window-flushed) _ft segment maxima — narrows the fall-segment
 	# correlation from 250 ms to "since last new-worst". Empty (no keys) when fall-timing was never on ⇒ nothing stamped.
 	if CubeSphere.FP_FALL_TIMING and is_instance_valid(player) and _has_m(player, "fall_timing_peek"):

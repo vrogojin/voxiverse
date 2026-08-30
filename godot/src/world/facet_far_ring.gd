@@ -6249,7 +6249,12 @@ func worst_frame_markers() -> Dictionary:
 		if sb is Dictionary:
 			st_bms = float((sb as Dictionary).get("st_bms", 0.0))
 	var sv2: float = (_smooth_v2.commit_ms() if _smooth_v2 != null else 0.0)
-	return {"st_bms": st_bms, "smooth_v2_commit_ms": sv2}
+	# COSMOS-FARTIER-WALK §5: far-tier rebuild-RATE markers — the cumulative full-rebuild / re-commit counters
+	# (non-resetting; the A/B diffs them across windows for rate). These measure the CURRENT churn, so they read
+	# correctly with ALL the walk-fix flags OFF too (that's the baseline). Only reached under FP_WORST_FRAME_ATTR.
+	var ftr_rb: int = (_far_trees.rebuild_count() if _far_trees != null else 0)
+	var st_rb: int = (_far_structures.rebuild_count() if _far_structures != null else 0)
+	return {"st_bms": st_bms, "smooth_v2_commit_ms": sv2, "ftr_rb": ftr_rb, "st_rb": st_rb}
 
 ## docs/COSMOS-ORBIT-RELIEF-MESH-DESIGN.md WS3 (task #99 G3): feed the current Sun direction into G3's OWN
 ## ShaderMaterial (a separate material from V2's/the shell's — see facet_orbit_relief.gd's shader doc) so its

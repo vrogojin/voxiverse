@@ -4091,15 +4091,22 @@ func take_perf_attrib() -> Dictionary:
 func worst_frame_markers() -> Dictionary:
 	var st_bms := 0.0
 	var smooth_v2_commit_ms := 0.0
+	# COSMOS-FARTIER-WALK §5: forward the far-tier rebuild-rate counters (cumulative; the A/B diffs across windows).
+	var ftr_rb := 0
+	var st_rb := 0
 	if _facet_ring != null and _facet_ring.has_method("worst_frame_markers"):
 		var m = _facet_ring.call("worst_frame_markers")
 		if m is Dictionary:
 			st_bms = float((m as Dictionary).get("st_bms", 0.0))
 			smooth_v2_commit_ms = float((m as Dictionary).get("smooth_v2_commit_ms", 0.0))
+			ftr_rb = int((m as Dictionary).get("ftr_rb", 0))
+			st_rb = int((m as Dictionary).get("st_rb", 0))
 	return {
 		"st_bms": snappedf(st_bms, 0.1),
 		"smooth_v2_commit_ms": snappedf(smooth_v2_commit_ms, 0.01),
 		"main_commit_ms": snappedf(_job_lane.peek_main_commit_ms() if _job_lane != null else 0.0, 0.01),
+		"ftr_rb": ftr_rb,
+		"st_rb": st_rb,
 	}
 
 ## path keeps the analytic far field as cover during the drop (full dual-window handoff is M4).

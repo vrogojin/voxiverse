@@ -1100,6 +1100,30 @@ const FP_FT_MOVE_HYST := false               # F2a §4: widen the far-tree rebui
 const FT_DELTA_MOVE_HYST := 12.0             # blocks of camera motion re-arming a far-trees rebuild under FP_FT_MOVE_HYST (6× the shipped 2.0)
 const FT_DELTA_WANTED_MOVE := 64.0           # blocks of camera motion that re-compute the wanted-facet scan
 
+## FP_FT_WALK_CALM (docs/COSMOS-FARTIER-WALK-DESIGN.md §2.2, Lever 1) — the move-churn diet for the far-TREE tier.
+## FP_FT_MOVE_HYST merely widens the camera re-arm threshold to 12 blk (still a camera term); a walk STILL re-arms the
+## full ~50-60 ms rebuild. Under WALK_CALM the rebuild move threshold is raised to FT_CALM_MARGIN·0.5 (16 blk re-arm),
+## superseded-by-max over FP_FT_MOVE_HYST/shell (maxf); it degrades to the shipped threshold when an instance/tri cap was
+## hit last rebuild (nearest-first ORDERING is then genuinely camera-dependent). This alone drops the walking far-tree
+## rebuild rate ~8× vs the shipped 2-blk re-arm (and ~1.3× vs MOVE_HYST@12).
+## DESIGN DEVIATION (reported, safe subset): the design's Step A (migrating the dist-driven fade alpha into a per-frame
+## shader `cam_pos` uniform) and the paired band-edge MEMBERSHIP MARGIN are NOT implemented — the margin is correct ONLY
+## with Step A's per-frame fade (else widened-in trees render at a stale baked alpha / far-over-near). Without Step A,
+## widening the band is unsafe, so ONLY the re-arm threshold is raised: WALK_CALM then behaves like FP_FT_MOVE_HYST with
+## a wider (16 vs 12 blk) window — the SAME ≤16-blk band/alpha staleness class as the live MOVE_HYST, never worse. The
+## pixel-identity-by-construction claim needs Step A; see the design-vs-reality note. Off ⇒ the shipped move threshold
+## verbatim (byte-identical). FT_CALM_MARGIN is retained for a future Step A (the margin width); today only ·0.5 is read.
+const FP_FT_WALK_CALM := false               # Lever 1: 16-blk re-arm (walk = ~8× fewer far-tree rebuilds; membership-margin subset deferred)
+const FT_CALM_MARGIN := 32.0                 # membership margin (blocks); re-arm threshold = margin·0.5 (band-edge slack deferred with Step A)
+
+## FP_FT_NEARCULL_XFADE (docs/COSMOS-FARTIER-WALK-DESIGN.md §3.2, Lever 2a) — DECLARED, not yet implemented (the
+## bidirectional per-frame alpha animator at the near frontier). The const exists so the flag family + gate compile;
+## its body (generalising FP_FT_NEAR_GUARD from destructive hide-only into an alpha animator) is deferred with the
+## shader-migration subset (see the design-vs-reality note). Off ⇒ inert (byte-identical). Needs FP_FT_NEAR_GUARD.
+const FP_FT_NEARCULL_XFADE := false          # Lever 2a: bidirectional per-frame alpha animator (trees) — DECLARED, deferred
+const FT_HYST_W := 8.0                        # Schmitt dead-band width (blocks) on the FT_CULL_MIN / probe_hi branch edges
+const FT_XFADE_STEP := 0.17                   # per-frame alpha step (≈6 frames 0→1)
+
 ## FP_SLOPE_ALL_MATERIALS (docs/COSMOS-SLOPE-MATERIAL-DESIGN.md, task #122) — widen the 45° smooth-slope carve band
 ## from B_MOUNTAINS-only to ALL Earth land biomes except B_BADLANDS. Default false ⇒ the shipped predicate verbatim
 ## (byte-off). NOTE: the const definition was accidentally omitted from commit a223805 (which added every
@@ -1279,6 +1303,32 @@ const FP_STRUCT_BAKE_STAGE := false          # staged wake-bake drain (no single
 const STRUCT_BAKE_STAGE_MS := 8.0            # per-pass bake time box (ms) ≈ half a 60 Hz frame
 const STRUCT_BAKE_STAGE_MIN := 2             # min fresh bakes per pass — guaranteed forward progress
 const STRUCT_HOLD_PROBE_CAP := 96            # max inside-r0 probes per pass (past ⇒ UNKNOWABLE ⇒ hold; safe degrade)
+
+## FP_STRUCT_WALK_CALM (docs/COSMOS-FARTIER-WALK-DESIGN.md §2.1, Lever 1) — the move-churn diet for the far-STRUCTURE
+## tier. The per-structure bakes are world-space (camera-INDEPENDENT geometry); the shipped 2-blk camera re-arm re-
+## concatenates + re-uploads UNCHANGED merged data every ~0.36 s of walk. Under WALK_CALM the camera re-arm is replaced
+## by a band FINGERPRINT (XOR of _root_hash × band-code, folded FREE inside the existing _probe_pass distance loop): a
+## re-commit fires only when at least one structure crossed a band/branch edge (a genuine membership delta). Degrades to
+## the shipped camera re-arm when the tri cap was hit last rebuild (nearest-first ORDERING is then camera-dependent).
+## Off ⇒ the shipped camera-delta disjunct verbatim (byte-identical). Composes with FP_STRUCT_HANDOFF_HYST (dead-band on
+## the band edges so a razor-edge camera can't oscillate the fingerprint). Gate: verify_fartier_walk.gd (G-WC-STRUCT).
+const FP_STRUCT_WALK_CALM := false           # Lever 1: camera-delta re-arm → membership band-fingerprint (walk = zero re-commit)
+
+## FP_STRUCT_HANDOFF_HYST (docs/COSMOS-FARTIER-WALK-DESIGN.md §3.4/§2.1, Lever 2c) — a state-keyed Schmitt dead-band
+## (width STRUCT_HYST_W) on the far-structure distance band edges (r0 / r0+CULL_ANNULUS / STRUCT_FAR_MAX): a structure
+## keeps its latched band-code until the camera crosses the edge by ±STRUCT_HYST_W, so a player wobbling on a boundary
+## can't flap the band classification (and thus can't oscillate the WALK_CALM fingerprint). Independently flippable;
+## consulted only inside the WALK_CALM band-code classifier (no shipped-path read). Off ⇒ raw edge compares (byte-off).
+const FP_STRUCT_HANDOFF_HYST := false        # Lever 2c: Schmitt dead-band on the far-structure r0/annulus/2400 band edges
+const STRUCT_HYST_W := 8.0                    # Schmitt dead-band half-width (blocks) on the far-structure band edges
+
+## FP_STRUCT_XFADE (docs/COSMOS-FARTIER-WALK-DESIGN.md §3.3, Lever 2b) — DECLARED, not yet implemented (the structure
+## dither-alpha channel + credit-independent streak pass + bounded fade commits). The const exists so the flag family +
+## gate compile; its body is deferred with the shader-migration subset (see the design-vs-reality note). Off ⇒ inert
+## (byte-identical). Needs FP_STRUCT_FAR.
+const FP_STRUCT_XFADE := false               # Lever 2b: structures dither-alpha cross-fade handoff — DECLARED, deferred
+const STRUCT_XFADE_STEPS := 4                 # alpha quantisation steps per transition (≤ this many commits per event)
+const STRUCT_XFADE_STEP_MS := 80             # commit cadence while a fade is in flight
 
 ## FP_DEM_DEFER (docs/COSMOS-STREAM-PARALLEL-DESIGN.md Phase A — the fresh-reload fix) — the whole-planet coarse
 ## DEM (`FP_GLOBAL_RELIEF_DATA` / `GlobalReliefData.step`) is frame-budget GATED but the admitted unit is UNBOUNDED

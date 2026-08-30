@@ -1355,7 +1355,7 @@ func update_streaming(player_pos: Vector3) -> void:
 	# inside its flag gate so with FP_VEL_PREDICT off it never runs and _player_speed stays 0 (byte-identical). A
 	# per-update speed above VEL_PREDICT_SPEED_CLAMP is a crossing/flip position discontinuity (a relocation, not
 	# motion) → rejected; otherwise EMA-smoothed so a single frame never swings the promote/commit lead.
-	if CubeSphere.FP_VEL_PREDICT:
+	if CubeSphere.FP_VEL_PREDICT or CubeSphere.FP_WALK_STEP_GATE:
 		var now_usec := Time.get_ticks_usec()
 		if _have_player_pos and _last_stream_usec >= 0:
 			var dt := float(now_usec - _last_stream_usec) / 1.0e6
@@ -1389,6 +1389,13 @@ func update_streaming(player_pos: Vector3) -> void:
 			_facet_ring.set_fall_hold(hold)   # the FACETED far ring (FacetFarRing) — NOT _far (FarTerrain, null in faceted mode)
 		if CubeSphere.FP_LAND_RAMP_HOLD and using_module and _module_world != null and _module_world.has_method("set_fall_hold"):
 			_module_world.set_fall_hold(hold)
+	# FP_WALK_STEP_GATE (docs/COSMOS-GEN-BURST-THROTTLE-DESIGN.md §4): hold the streaming viewer on its committed step
+	# anchor (drain-gated, one data-block axis-step at a time) so a walking crossing's strip admissions serialize
+	# instead of flooding one C++ diff pass. Deliberately in the per-tick SAFETY HEAD (above the FP_STREAM_TICK_ONCE
+	# tail return) so the position hold never lapses on a 2-step frame. Off ⇒ never called (byte-identical).
+	if CubeSphere.FP_WALK_STEP_GATE and using_module and _module_world != null \
+			and _module_world.has_method("walk_gate_update"):
+		_module_world.walk_gate_update(_player_speed, _voxel_gen_backlog())
 	# Latch the latest player position so _process can step the snowfall sim on the main thread. This is
 	# also the gate that keeps the sim inert during the frozen prewarm (this is not called while frozen).
 	_last_player_pos = player_pos

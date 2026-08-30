@@ -2790,6 +2790,31 @@ const INFLIGHT_MIN := 64         # re-open below this F (≈0.2 s) — the hyste
 const INFLIGHT_MAIN_K := 2       # an apply is main-thread-priced: weight tasks.main_thread K× in F
 const APPLY_CHOKE := 24          # feed-forward: full ramp pace at main_q 0, linearly to 0 at main_q ≥ APPLY_CHOKE
 
+## COSMOS-GEN-BURST-THROTTLE (docs/COSMOS-GEN-BURST-THROTTLE-DESIGN.md) — FP_WALK_STEP_GATE: a stepped, drain-gated
+## streaming viewer. Ground-walk jerkiness on web is per-crossing GENERATION BURSTS: every ~3 s the player crosses a
+## 16-voxel data-block boundary and godot_voxel's C++ box-diff enqueues the whole leading strip across all live
+## FP_M1_POOL slots in ONE process pass — wf_vox_gen spikes 1000–2186, and 65–83 % of the resulting worst-frame time
+## is unmetered WASM/browser burst cost (heap-growth copies + 6-thread bandwidth churn). The shipped controller +
+## FP_INFLIGHT_GATE have NO actuator over the box-step (they pace the view RAMP, idle at steady-state walking), so the
+## only lever is to reduce the burst: the viewer node's continuous motion is the one C++-admission input GDScript owns.
+## When true, WorldManager holds the viewer on a committed ANCHOR and advances it toward the player ONE data-block
+## quantum along ONE axis per admitted STEP; a step is admitted only when tasks.generation < WALK_STEP_OPEN and ≥
+## WALK_STEP_MIN_INTERVAL_S has elapsed (feed-forward, same signal family as backlog_gated()), with a forced step once
+## the per-axis lag exceeds WALK_GATE_MAX_LAG (frontier deficit bounded to LAG+QUANTUM ever). Snaps on any
+## discontinuity (> WALK_GATE_SNAP_DIST — crossing/flip re-place, teleport) or non-walking motion (speed >
+## WALK_GATE_MAX_SPEED — fly/fall keep the shipped free-follow viewer, ungated). Physics is analytic (block_id_at /
+## floor_under never read the mesh) so a late strip has zero fall-through risk; the un-meshed rim stays covered by the
+## far-tier backstop (FP_FARRING_CULL_COVERED culls confirmed-meshed only). Default OFF ⇒ walk_gate_update is never
+## called, the viewer is never written and stays the plain player child from attach_viewer (byte-identical admission;
+## FLAT stays 6042/0). Flipped ON at export after the live 3-min ground-walk A/B (§7 sed-at-export pattern).
+const FP_WALK_STEP_GATE := false
+const WALK_STEP_QUANTUM := 16.0        # one godot_voxel data block — the admission unit the C++ box-diff quantizes at
+const WALK_STEP_OPEN := 128            # admit the next step only when tasks.generation is below this (~0.4 s of pipe @300/s)
+const WALK_STEP_MIN_INTERVAL_S := 0.2  # ≥1 render frame of drain between admitted steps even at zero backlog
+const WALK_GATE_MAX_LAG := 24.0        # per-axis force-step bound (voxels): the streamed frontier never trails farther
+const WALK_GATE_SNAP_DIST := 48.0      # beyond this the delta is a crossing/flip/teleport re-place — snap, don't step
+const WALK_GATE_MAX_SPEED := 12.0      # engage only at ground speeds (walk 5.5 / run 9.5); fly/fall keep the shipped viewer
+
 ## INITIAL-LOAD VIEW RAMP (perf/voxiverse-load-profile) — FP_LOAD_RAMP. Symptom: the FIRST cold load slams the near
 ## VoxelTerrain's max_view_distance to the full near radius (near_render_radius(): 256 flat / 128 faceted) in ONE
 ## step at module setup — both on the single-terrain path (module_world.setup → _set_if max_view_distance) AND the

@@ -26,6 +26,14 @@ extends Node3D
 
 var _terrain: Node3D
 var _viewer: Node
+# FP_WALK_STEP_GATE state (docs/COSMOS-GEN-BURST-THROTTLE-DESIGN.md §4). _wg_anchor is the committed streaming position
+# in the viewer's GLOBAL frame (INF = unarmed → first call snaps). All inert off the flag (walk_gate_update is never
+# called, nothing here is ever read or written; _wg_y0 is never assigned — the viewer stays the plain player child).
+var _wg_anchor := Vector3.INF
+var _wg_last_step_ms := -1
+var _wg_y0 := 0.0                 # attach-time A2 local +Y viewer offset (0 when the downward-reach clamp is off)
+var _wg_steps := 0                # gate/PerfHUD read-back: admitted steps
+var _wg_forced := 0               # gate read-back: forced (lag-cap) steps
 var _mesher: Object                     # the VoxelMesherBlocky (kept so restream can rebuild the terrain)
 # COSMOS R1 DEV (DEV_HIDE_NEAR): when true, hide the near render by collapsing the module's own streaming
 # radius to DEV_HIDDEN_VIEW_BLOCKS. Godot node visibility does NOT propagate to godot_voxel's RID mesh-block
@@ -506,6 +514,51 @@ func viewer_view_distance() -> int:
 	return int(_viewer.get("view_distance")) if (_viewer != null and _has_prop(_viewer, "view_distance")) else -1
 func viewer_instance_id() -> int:
 	return _viewer.get_instance_id() if _viewer != null else 0
+
+## FP_WALK_STEP_GATE (docs/COSMOS-GEN-BURST-THROTTLE-DESIGN.md §4.3/§4.5 E4). Hold the ONE global player VoxelViewer on
+## its committed step anchor (viewer GLOBAL frame) and advance it toward the player one 16-voxel data-block quantum along
+## one axis per admitted step, so the C++ box-diff sees the quantized cell change at most once per drain window and each
+## walking-crossing strip serializes instead of flooding one process pass. Snap-follow (numerically identical to the
+## shipped free-follow `player.to_global(0, y0, 0)`) whenever unarmed, non-walking (speed > WALK_GATE_MAX_SPEED — fly/
+## fall ungated), or a discontinuity (crossing/flip re-place, teleport > WALK_GATE_SNAP_DIST); a step is admitted when
+## forced (lag > WALK_GATE_MAX_LAG) OR (backlog < WALK_STEP_OPEN and ≥ WALK_STEP_MIN_INTERVAL_S since the last step).
+## Only ever called under the flag (WorldManager safety head), so with the flag off the viewer is never written.
+func walk_gate_update(speed: float, backlog: int) -> void:
+	var v := _viewer as Node3D
+	if v == null: return
+	var p := v.get_parent() as Node3D
+	if p == null: return
+	var want: Vector3 = p.to_global(Vector3(0.0, _wg_y0, 0.0))     # the shipped free-follow position
+	if _wg_anchor == Vector3.INF or speed > CubeSphere.WALK_GATE_MAX_SPEED \
+			or want.distance_to(_wg_anchor) > CubeSphere.WALK_GATE_SNAP_DIST:
+		_wg_anchor = want                                          # disengaged / discontinuity: snap-follow
+		v.global_position = want
+		return
+	var d := want - _wg_anchor
+	var ax := 0
+	if absf(d.y) > absf(d[ax]): ax = 1
+	if absf(d.z) > absf(d[ax]): ax = 2
+	var lag := absf(d[ax])
+	if lag >= CubeSphere.WALK_STEP_QUANTUM * 0.5:
+		var now := Time.get_ticks_msec()
+		var interval_ok := _wg_last_step_ms < 0 \
+				or now - _wg_last_step_ms >= int(CubeSphere.WALK_STEP_MIN_INTERVAL_S * 1000.0)
+		var forced := lag > CubeSphere.WALK_GATE_MAX_LAG
+		if forced or (interval_ok and backlog < CubeSphere.WALK_STEP_OPEN):
+			_wg_anchor[ax] += signf(d[ax]) * minf(CubeSphere.WALK_STEP_QUANTUM, lag)
+			_wg_last_step_ms = now
+			_wg_steps += 1
+			if forced: _wg_forced += 1
+	v.global_position = _wg_anchor
+
+func walk_gate_lag() -> Vector3:   # verify/PerfHUD introspection: the current want−anchor lag vector (ZERO when unarmed)
+	var v := _viewer as Node3D
+	if v == null or _wg_anchor == Vector3.INF: return Vector3.ZERO
+	var p := v.get_parent() as Node3D
+	return (p.to_global(Vector3(0.0, _wg_y0, 0.0)) - _wg_anchor) if p != null else Vector3.ZERO
+
+func walk_gate_counts() -> Vector2i:   # (admitted steps, forced steps) — verify/PerfHUD read-back
+	return Vector2i(_wg_steps, _wg_forced)
 
 func _ramp_pool_step(delta: float) -> bool:
 	# FP_LAND_RAMP_HOLD: while falling fast, clamp every slot's EFFECTIVE grow target to a small landing disc so the
@@ -3112,6 +3165,11 @@ func attach_viewer(player: Node3D) -> void:
 	if use_clamp:
 		# LOCAL offset (child of the player) → radial +O on the active facet; unaffected by yaw.
 		(_viewer as Node3D).position = Vector3(0.0, params.y, 0.0)
+	# FP_WALK_STEP_GATE: capture the attach-time A2 local +Y offset so walk_gate_update's free-follow position matches
+	# the shipped viewer exactly (y0 = params.y when the downward-reach clamp is on, else 0). Flag-guarded so off-path
+	# state is untouched — _wg_y0 stays its 0.0 init and the viewer is never gate-written.
+	if CubeSphere.FP_WALK_STEP_GATE:
+		_wg_y0 = params.y if use_clamp else 0.0
 
 ## True once every mesh block intersecting the axis-aligned box of half-extents `half` around world
 ## point `center` has been MESHED (its surface applied to the scene, so it renders next frame). Used by

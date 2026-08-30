@@ -1,0 +1,104 @@
+COSMOS GEN-CONVOY §6 — surface the core probe + dequeue-loop timer into VoxelEngine.get_stats(), byte-off.
+
+Folds the weak-linked core probe (godot engine patch 0003) and a main-thread dequeue-apply loop timer into
+the stats Dictionary that remote_bridge.gd reads every frame, under key "alloc_probe" (main_ms/workers_ms/
+main_n/workers_n/dequeue_ms/compiled). The probe accessor is __attribute__((weak)), so this links and runs
+whether or not the core patch is present; when the probe was not compiled in, compiled=false and the alloc
+numbers are omitted (inert / byte-off). Applies on top of godot_voxel patch 0015.
+diff --git a/engine/voxel_engine.h b/engine/voxel_engine.h
+--- a/engine/voxel_engine.h
++++ b/engine/voxel_engine.h
+@@ -357,6 +357,11 @@
+ 	StdString _path;
+ };
+ 
++// COSMOS GEN-CONVOY §6: cumulative wall-time (usec) spent in the main-thread dequeue-apply loop
++// (voxel_engine.cpp process()), surfaced via VoxelEngine.get_stats() as alloc_probe.dequeue_ms so
++// remote_bridge can emit wf_dequeue_ms — closes the §2.6 "is the worst frame apply or alloc-stall?" hole.
++uint64_t get_dequeue_probe_usec();
++
+ } // namespace zylann::voxel
+ 
+ #endif // VOXEL_ENGINE_H
+diff --git a/engine/voxel_engine.cpp b/engine/voxel_engine.cpp
+--- a/engine/voxel_engine.cpp
++++ b/engine/voxel_engine.cpp
+@@ -16,8 +16,19 @@
+ #include "../util/profiling.h"
+ #include "../util/string/format.h"
+ 
++#include <atomic>
++
+ namespace zylann::voxel {
+ 
++// COSMOS GEN-CONVOY §6: dequeue-apply loop timer (see voxel_engine.h). Free-running cumulative counter;
++// remote_bridge differences it over its window. One ticks read per process() call => negligible.
++namespace {
++std::atomic<uint64_t> g_dequeue_probe_usec{ 0 };
++} // namespace
++uint64_t get_dequeue_probe_usec() {
++	return g_dequeue_probe_usec.load(std::memory_order_relaxed);
++}
++
+ VoxelEngine *g_voxel_engine = nullptr;
+ 
+ VoxelEngine &VoxelEngine::get_singleton() {
+@@ -298,10 +309,15 @@
+ 	);
+ 
+ 	// Receive generation and meshing results
++	// COSMOS GEN-CONVOY §6: time this otherwise-unmetered inline dequeue-apply loop -> wf_dequeue_ms.
++	const uint64_t dq_t0 = OS::get_singleton() != nullptr ? OS::get_singleton()->get_ticks_usec() : 0;
+ 	_general_thread_pool.dequeue_completed_tasks([](zylann::IThreadedTask *task) {
+ 		task->apply_result();
+ 		ZN_DELETE(task);
+ 	});
++	if (dq_t0 != 0) {
++		g_dequeue_probe_usec.fetch_add(OS::get_singleton()->get_ticks_usec() - dq_t0, std::memory_order_relaxed);
++	}
+ 
+ 	// Run this after dequeueing threaded tasks, because they can add some to this runner,
+ 	// which could in turn complete right away (we avoid 1-frame delays this way).
+diff --git a/engine/voxel_engine_gd.cpp b/engine/voxel_engine_gd.cpp
+--- a/engine/voxel_engine_gd.cpp
++++ b/engine/voxel_engine_gd.cpp
+@@ -165,9 +165,38 @@
+ 	return d;
+ }
+ 
++// COSMOS GEN-CONVOY §6: weak-linked accessor for the core allocator-lock stall probe, defined in
++// core/os/memory.cpp ONLY when the engine patch's `alloc_probe` scons option is on (-DZN_VOX_ALLOC_PROBE).
++// Declared __attribute__((weak)) so the module links whether or not the core patch is present; the null
++// check below reports compiled=false when the probe was not compiled in (byte-off builds).
++extern "C" __attribute__((weak)) bool zn_vox_alloc_probe_read(
++		double *r_main_ms, double *r_work_ms, uint64_t *r_main_n, uint64_t *r_work_n);
++
+ Dictionary VoxelEngine::get_stats() const {
+ 	ZN_PROFILE_SCOPE();
+-	return to_dict(zylann::voxel::VoxelEngine::get_singleton().get_stats());
++	Dictionary d = to_dict(zylann::voxel::VoxelEngine::get_singleton().get_stats());
++	// COSMOS GEN-CONVOY §6: fold the allocator-lock stall probe + the dequeue-loop timer into the SAME stats
++	// dict remote_bridge already reads, so they co-occur in the FP_WORST_FRAME_ATTR snapshot. remote_bridge
++	// differences the cumulative totals over its 1 Hz window (wf_alloc_main_ms / wf_alloc_workers_ms /
++	// wf_alloc_main_n / wf_alloc_workers_n / wf_dequeue_ms). Absent probe => compiled=false, numbers omitted.
++	Dictionary probe;
++	if (zn_vox_alloc_probe_read != nullptr) {
++		double main_ms = 0.0, work_ms = 0.0;
++		uint64_t main_n = 0, work_n = 0;
++		if (zn_vox_alloc_probe_read(&main_ms, &work_ms, &main_n, &work_n)) {
++			probe["main_ms"] = main_ms;
++			probe["workers_ms"] = work_ms;
++			probe["main_n"] = int64_t(main_n);
++			probe["workers_n"] = int64_t(work_n);
++			probe["compiled"] = true;
++		}
++	}
++	if (probe.is_empty()) {
++		probe["compiled"] = false;
++	}
++	probe["dequeue_ms"] = double(zylann::voxel::get_dequeue_probe_usec()) / 1000.0;
++	d["alloc_probe"] = probe;
++	return d;
+ }
+ 
+ void VoxelEngine::schedule_task(Ref<ZN_ThreadedTask> task) {

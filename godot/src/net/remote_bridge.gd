@@ -680,6 +680,21 @@ func _capture_worst_frame_snapshot() -> Dictionary:
 					names.append(String(n))
 			snap["wf_pool_tasks"] = ",".join(names)
 		snap["wf_std_current"] = int((st.get("memory_pools", {}) as Dictionary).get("std_current", -1))
+		# COSMOS GEN-CONVOY §6: the allocator-lock stall probe (godot engine patch 0003 + voxel patch 0016).
+		# Cumulative main/worker allocator wall-time (ms) + call counts since process start; the analysis
+		# differences successive worst-frame snapshots to get the per-window stall that the "~430 ms
+		# unmetered" spike is made of. wf_alloc_probe_on=false ⇒ the probe wasn't compiled in (byte-off build).
+		var probe: Dictionary = st.get("alloc_probe", {})
+		snap["wf_alloc_probe_on"] = bool(probe.get("compiled", false))
+		if bool(probe.get("compiled", false)):
+			snap["wf_alloc_main_ms"] = snappedf(float(probe.get("main_ms", 0.0)), 0.01)
+			snap["wf_alloc_workers_ms"] = snappedf(float(probe.get("workers_ms", 0.0)), 0.01)
+			snap["wf_alloc_main_n"] = int(probe.get("main_n", 0))
+			snap["wf_alloc_workers_n"] = int(probe.get("workers_n", 0))
+		# Dequeue-apply loop timer is a module counter (always present, independent of the core probe): the
+		# cumulative main-thread ms spent draining completed gen/mesh tasks. §2.6 observability-hole closer.
+		if probe.has("dequeue_ms"):
+			snap["wf_dequeue_ms"] = snappedf(float(probe.get("dequeue_ms", 0.0)), 0.01)
 	# render/physics/scene load AT the worst frame (same monitor calls the emit path makes, read at the correct instant).
 	snap["wf_phys_ms"] = snappedf(Performance.get_monitor(Performance.TIME_PHYSICS_PROCESS) * 1000.0, 0.01)
 	snap["wf_draws"] = int(Performance.get_monitor(Performance.RENDER_TOTAL_DRAW_CALLS_IN_FRAME))

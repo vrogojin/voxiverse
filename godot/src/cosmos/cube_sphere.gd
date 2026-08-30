@@ -223,6 +223,24 @@ const FP_STAMP := false
 ## weakened to make the port pass.
 const FP_CPPGEN := false
 
+## COSMOS GEN-CONVOY (docs/COSMOS-GEN-CONVOY-DESIGN.md §4.B) — Stage-1 per-gen-task alloc-diet, forwarded
+## into the compiled VoxelGeneratorCosmos config in module_world._make_cpp_generator (C++-side only; no
+## effect on the GDScript generator or the FLAT fallback). All default off/0 ⇒ byte-identical worldgen.
+## FP_GEN_PROFS_TLS reuses a thread_local scratch vector for the generator's per-column profile pass
+## (census b1: 1 malloc+free/block off the global dlmalloc lock). FP_GEN_POOL_PREWARM pre-reserves that
+## many 8 KiB VoxelMemoryPool TYPE-channel blocks at setup so the first ground crossing doesn't spill
+## channel allocs to dlmalloc mid-spike (census a3; ~2500 ≈ 20 MB, heap-budgeted). Flip per A/B arm.
+const FP_GEN_PROFS_TLS := false
+const FP_GEN_POOL_PREWARM := 0
+## FP_GEN_ALLOC_PROBE enables the §6 core allocator-lock stall probe accumulation (per-thread alloc
+## wall-time + dequeue timer) so remote_bridge's FP_WORST_FRAME_ATTR snapshot carries wf_alloc_main_ms /
+## wf_alloc_workers_ms / wf_dequeue_ms — turning the "~430 ms unmetered" spike into a measured lock-stall
+## number. NOTE: only has effect when the engine was built with the probe compiled in (versions.env
+## WEB_ALLOC_PROBE=yes, the Stage-1 build); otherwise inert. Default false ⇒ byte-identical. Flip per A/B arm.
+## (Lever 2 — the VoxelBuffer object recycler, FP_GEN_SMALLOBJ_POOL — is HELD for Build #2 pending the
+## probe's verdict; see docs/COSMOS-GEN-CONVOY-DESIGN.md §5.)
+const FP_GEN_ALLOC_PROBE := false
+
 ## COSMOS CLIMATE-BIOMES B1 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §6/§7) — the Whittaker temperature×moisture
 ## biome classifier. When true, TerrainConfig._biome swaps its shipped first-match chain for a
 ## temperature-band × humidity-band table that appends B_SAVANNA / B_JUNGLE, TreeGen grows acacia (savanna),

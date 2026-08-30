@@ -4126,6 +4126,10 @@ func _make_cpp_generator(src_gen: Object) -> Object:
 	cfg["m5c_corner"] = CubeSphere.M5C_CORNER
 	cfg["radial_datum"] = CubeSphere.FP_RADIAL_DATUM     # COSMOS FS2 §3.2
 	cfg["slope_all_biomes"] = CubeSphere.FP_SLOPE_ALL_MATERIALS  # #122: mirror the widened 45° slope band into the C++ generator
+	cfg["gen_profs_tls"] = CubeSphere.FP_GEN_PROFS_TLS           # COSMOS GEN-CONVOY §4.B lever 1: thread_local profs reuse
+	cfg["gen_pool_prewarm"] = CubeSphere.FP_GEN_POOL_PREWARM     # COSMOS GEN-CONVOY §4.B lever 3: 8 KiB channel pre-warm count
+	cfg["gen_alloc_probe"] = CubeSphere.FP_GEN_ALLOC_PROBE       # COSMOS GEN-CONVOY §6: enable core alloc-lock stall probe
+	# (lever 2 gen_smallobj_pool / FP_GEN_SMALLOBJ_POOL held for Build #2 — see COSMOS-GEN-CONVOY-DESIGN §5)
 	cfg["model_count"] = src_gen.get("model_count")
 	cfg["waterlog"] = src_gen.get("waterlog")
 	# TreeGen ids. id_wood/id_leaf are the oak (bootstrap) log/leaf — NOT in material_tables(), so set

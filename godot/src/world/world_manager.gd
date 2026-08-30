@@ -4084,6 +4084,24 @@ func take_perf_attrib() -> Dictionary:
 	_ctrl_us_max = 0
 	return out
 
+## FP_WORST_FRAME_ATTR (docs/COSMOS-GROUND-WALK-PERF-ATTRIBUTION.md §3): the live (NON-resetting) structure/far-tier
+## rebuild markers + the job-lane main-commit accumulator, so RemoteBridge's worst-frame snapshot can co-sample them
+## at the instant the window's worst frame is recognised (vs take_perf_attrib's emit-tick, reset-on-read reading). All
+## leaf reads (a small dict + two floats); flat/fallback path (no ring/lane) ⇒ zeros. Only CALLED behind the flag.
+func worst_frame_markers() -> Dictionary:
+	var st_bms := 0.0
+	var smooth_v2_commit_ms := 0.0
+	if _facet_ring != null and _facet_ring.has_method("worst_frame_markers"):
+		var m = _facet_ring.call("worst_frame_markers")
+		if m is Dictionary:
+			st_bms = float((m as Dictionary).get("st_bms", 0.0))
+			smooth_v2_commit_ms = float((m as Dictionary).get("smooth_v2_commit_ms", 0.0))
+	return {
+		"st_bms": snappedf(st_bms, 0.1),
+		"smooth_v2_commit_ms": snappedf(smooth_v2_commit_ms, 0.01),
+		"main_commit_ms": snappedf(_job_lane.peek_main_commit_ms() if _job_lane != null else 0.0, 0.01),
+	}
+
 ## path keeps the analytic far field as cover during the drop (full dual-window handoff is M4).
 func maybe_flip_home_face(player_pos: Vector3) -> bool:
 	if _chart == null:

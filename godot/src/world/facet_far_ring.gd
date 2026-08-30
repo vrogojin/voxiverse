@@ -6238,6 +6238,19 @@ func set_smooth_v2_sun_dir(sun_dir: Vector3) -> void:
 	if _smooth_v2 != null:
 		_smooth_v2.set_sun_dir(sun_dir)
 
+## FP_WORST_FRAME_ATTR (docs/COSMOS-GROUND-WALK-PERF-ATTRIBUTION.md §3): the far-tier/structure rebuild-in-progress
+## markers reachable on the main thread, read as CHEAP leaf values (a small bake_stage_state dict + one commit_ms
+## float — no visN/cachedN loops) so the worst-frame snapshot can co-sample them without a heavy per-new-worst query.
+## Only ever CALLED behind FP_WORST_FRAME_ATTR; returns 0 for any absent instance.
+func worst_frame_markers() -> Dictionary:
+	var st_bms := 0.0
+	if _far_structures != null:
+		var sb = _far_structures.bake_stage_state()
+		if sb is Dictionary:
+			st_bms = float((sb as Dictionary).get("st_bms", 0.0))
+	var sv2: float = (_smooth_v2.commit_ms() if _smooth_v2 != null else 0.0)
+	return {"st_bms": st_bms, "smooth_v2_commit_ms": sv2}
+
 ## docs/COSMOS-ORBIT-RELIEF-MESH-DESIGN.md WS3 (task #99 G3): feed the current Sun direction into G3's OWN
 ## ShaderMaterial (a separate material from V2's/the shell's — see facet_orbit_relief.gd's shader doc) so its
 ## terminator tracks live time. No-op with no orbit-relief instance ⇒ byte-identical off.

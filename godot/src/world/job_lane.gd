@@ -183,6 +183,11 @@ func take_main_commit_ms() -> float:
 	_main_commit_us = 0
 	return ms
 
+## FP_WORST_FRAME_ATTR read-only PEEK: the same accumulated main-thread commit ms WITHOUT the reset, so the worst-frame
+## snapshot can co-sample it without stealing the value from the window's take_main_commit_ms() at the next emit tick.
+func peek_main_commit_ms() -> float:
+	return float(_main_commit_us) / 1000.0
+
 # --- Gate observables (headless, flag-independent) -----------------------------------------------------
 func pending_count() -> int: return _pending.size()
 func inflight_count() -> int: return _running.size()

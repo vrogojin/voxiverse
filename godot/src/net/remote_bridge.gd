@@ -152,6 +152,10 @@ var _voxel_engine: Object = null    # godot_voxel VoxelEngine singleton (perf_hu
 var _win_acc := 0.0
 var _win_frames := 0
 var _win_worst := 0.0               # slowest frame (s) in the current window (true wall delta)
+# FP_WORST_FRAME_ATTR (docs/COSMOS-GROUND-WALK-PERF-ATTRIBUTION.md §3): the attribution snapshot captured AT the frame
+# that set the current window maximum (overwritten each new worst, cleared every emit). {} whenever the flag is off ⇒
+# NO wf_* key is stamped (byte-identical telemetry). NEVER-OOM: one fixed dict, no growing state.
+var _win_worst_snapshot: Dictionary = {}
 var _win_had_capture := false       # T2f: this window initiated an ambient frame capture (~35 ms readback) — stamp cap=1 so analysis can exclude it
 
 # FP_TELEM_FRAME_DECOMP (§5, #129): observer self-instrumentation. `_telem_interval` is the snapshot period (0.25s, or
@@ -466,6 +470,11 @@ func _process(delta: float) -> void:
 		_last_frame_ms = real_delta * 1000.0
 	if real_delta > _win_worst:
 		_win_worst = real_delta
+		# FP_WORST_FRAME_ATTR §3: snapshot the attribution stats AT the instant this NEW window maximum is recognised
+		# (same frame, not the next telemetry tick) — the co-occurrence the window-aggregate fields could never give.
+		# One dict build per NEW worst (rare, typically once/window); off ⇒ never entered ⇒ byte-identical.
+		if CubeSphere.FP_WORST_FRAME_ATTR:
+			_win_worst_snapshot = _capture_worst_frame_snapshot()
 	if real_delta * 1000.0 > HITCH_MS:
 		_hitches += 1
 	# FP_TELEM_FRAME_DECOMP §5.1: per-window frame-period histogram [<14,14-20,20-25,25-33,33-50,≥50] ms — makes the
@@ -644,6 +653,56 @@ func _wasm_heap_mb() -> float:
 	return b if b < 0.0 else b / 1048576.0
 
 
+## FP_WORST_FRAME_ATTR (docs/COSMOS-GROUND-WALK-PERF-ATTRIBUTION.md §3): build the worst-frame attribution snapshot at
+## the instant a NEW window maximum is recognised (called ONLY from _process behind the flag). Reads already-computed
+## leaf values — one get_stats() dict, the cheap Performance monitors already fetched for the emit path, and the live
+## (non-resetting) structure/far-tier + fall-timing markers — so it never adds a heavy query to the hot path. Every
+## key is `wf_`-prefixed so it can never collide with the window-aggregate fields it sits beside.
+func _capture_worst_frame_snapshot() -> Dictionary:
+	var snap := {}
+	# (a)/(b): the voxel engine's TRUE in-flight task counts + general-pool activity AT this frame (the 250 ms-boundary
+	# vox_*/pool_* fields are a displaced sample; these co-occur with the worst frame — the H-A/H-B convoy discriminator).
+	if _voxel_engine != null and _has_m(_voxel_engine, "get_stats"):
+		var st: Dictionary = _voxel_engine.call("get_stats")
+		var tasks: Dictionary = st.get("tasks", {})
+		var gpool: Dictionary = (st.get("thread_pools", {}) as Dictionary).get("general", {})
+		snap["wf_vox_gen"] = int(tasks.get("generation", 0))
+		snap["wf_vox_mesh"] = int(tasks.get("meshing", 0))
+		snap["wf_vox_main"] = int(tasks.get("main_thread", 0))
+		snap["wf_vox_gpu"] = int(tasks.get("gpu", 0))
+		snap["wf_pool_threads"] = int(gpool.get("thread_count", -1))
+		snap["wf_pool_active"] = int(gpool.get("active_threads", -1))
+		var tn = gpool.get("task_names", null)
+		if tn is PackedStringArray:
+			var names := PackedStringArray()
+			for n in (tn as PackedStringArray):
+				if String(n) != "":
+					names.append(String(n))
+			snap["wf_pool_tasks"] = ",".join(names)
+		snap["wf_std_current"] = int((st.get("memory_pools", {}) as Dictionary).get("std_current", -1))
+	# render/physics/scene load AT the worst frame (same monitor calls the emit path makes, read at the correct instant).
+	snap["wf_phys_ms"] = snappedf(Performance.get_monitor(Performance.TIME_PHYSICS_PROCESS) * 1000.0, 0.01)
+	snap["wf_draws"] = int(Performance.get_monitor(Performance.RENDER_TOTAL_DRAW_CALLS_IN_FRAME))
+	snap["wf_prims"] = int(Performance.get_monitor(Performance.RENDER_TOTAL_PRIMITIVES_IN_FRAME))
+	snap["wf_objects"] = int(Performance.get_monitor(Performance.OBJECT_NODE_COUNT))
+	# (c): the live structure/far-tier rebuild markers (st_bms / smooth_v2_commit_ms / main_commit_ms) as they stand RIGHT
+	# NOW — a much tighter correlation than the 250 ms-later take_perf_attrib snapshot. Guarded for the flat/fallback path.
+	if is_instance_valid(world) and _has_m(world, "worst_frame_markers"):
+		var wm = world.call("worst_frame_markers")
+		if wm is Dictionary:
+			snap["wf_st_bms"] = (wm as Dictionary).get("st_bms", 0.0)
+			snap["wf_smooth_v2_commit_ms"] = (wm as Dictionary).get("smooth_v2_commit_ms", 0.0)
+			snap["wf_main_commit_ms"] = (wm as Dictionary).get("main_commit_ms", 0.0)
+	# if FP_FALL_TIMING is ALSO on: the in-progress (not-yet-window-flushed) _ft segment maxima — narrows the fall-segment
+	# correlation from 250 ms to "since last new-worst". Empty (no keys) when fall-timing was never on ⇒ nothing stamped.
+	if CubeSphere.FP_FALL_TIMING and is_instance_valid(player) and _has_m(player, "fall_timing_peek"):
+		var ftp = player.call("fall_timing_peek")
+		if ftp is Dictionary:
+			for k in (ftp as Dictionary):
+				snap["wf_" + String(k)] = (ftp as Dictionary)[k]
+	return snap
+
+
 func _send_telemetry() -> void:
 	# FP_TELEM_FRAME_DECOMP §5.1: self-time the snapshot's OWN cost (the missing timer — the observer never measured itself).
 	var _dc_t0 := Time.get_ticks_usec() if CubeSphere.FP_TELEM_FRAME_DECOMP else 0
@@ -667,6 +726,10 @@ func _send_telemetry() -> void:
 	_win_acc = 0.0
 	_win_frames = 0
 	_win_worst = 0.0
+	# FP_WORST_FRAME_ATTR §3: latch this window's worst-frame snapshot into a local and clear the member alongside the
+	# _win_worst reset, so the next window starts fresh. Empty {} when the flag is off ⇒ nothing merged below.
+	var _wf := _win_worst_snapshot
+	_win_worst_snapshot = {}
 
 	# MAIN-THREAD BREAKDOWN: latch + reset this window's maxima (ms, 0.01 precision). vt_total is the
 	# headline: compare it against worst_ms for the SAME window. vt_total ≈ worst_ms ⇒ the hitch IS
@@ -825,6 +888,13 @@ func _send_telemetry() -> void:
 		# FP_TELEM_LITE: the echo must report the REAL rate (the LITE default is 1Hz and ?telem=4hz/10hz exist) —
 		# computed from the live interval. Flag-off keeps the shipped 1-or-4 expression (byte-identical).
 		msg["telem_hz"] = (int(round(1.0 / _telem_interval)) if CubeSphere.FP_TELEM_LITE else (1 if _telem_1hz else 4))
+
+	# FP_WORST_FRAME_ATTR §3: fold in the wf_*-prefixed attribution snapshot captured AT this window's worst frame,
+	# alongside the window-aggregate `worst_ms` it explains. Empty {} whenever the flag is off (the snapshot was never
+	# built) ⇒ NO wf_* key is stamped ⇒ byte-identical telemetry. Every key is wf_-prefixed (no collision with the
+	# displaced vox_*/pool_*/draws/prims/phys_ms fields it sits next to).
+	if not _wf.is_empty():
+		msg.merge(_wf)
 
 	# T2f (docs/COSMOS-PERF-POSTPORT-DESIGN.md §3): per-consumer attribution + the capture-window marker. snow_ms/ctrl_ms
 	# are this window's WORST single-frame snowfall-step / controller-tick cost (WorldManager accumulates the max, resets on

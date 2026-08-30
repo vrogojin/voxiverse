@@ -4242,6 +4242,20 @@ const FALL_FREEZE_BAND := 48.0
 ## window. Gate G-FALL-TIMING (verify_fall_timing.gd): byte-off default + the plumbing populates/clears the keys.
 const FP_FALL_TIMING := false
 
+## FP_WORST_FRAME_ATTR (docs/COSMOS-GROUND-WALK-PERF-ATTRIBUTION.md §3) — worst-frame-keyed attribution snapshot.
+## Every attribution field today is either an independently-maxed segment or a telemetry-tick-boundary snapshot; NONE
+## is captured at the instant the window's worst frame is recognised, so the 285 ms unattributed remainder cannot be
+## pinned to (a) a vox_gen/mesh/main burst that just missed the 250 ms sample, (b) the pool_active≈pool_threads
+## dlmalloc-convoy signature, or (c) an all-queues-zero structure/far-tier stall. This flag piggybacks on the exact
+## `_win_worst` comparison RemoteBridge._process already performs (remote_bridge.gd): the frame that sets a NEW window
+## maximum snapshots the attribution-relevant stats RIGHT THEN (get_stats tasks + general pool activity + draws/prims/
+## objects/phys + the live st_bms/smooth_v2_commit_ms/main_commit_ms markers, and — if FP_FALL_TIMING is also on — the
+## in-progress _ft segment maxima), emitted once per window as `wf_*`-prefixed fields. Cost: one dict build per NEW
+## window maximum (rare — typically once/window), reading already-computed leaf values only (no heavy new query on the
+## hot path). Off ⇒ the snapshot is never built and NO wf_* key is stamped (byte-identical telemetry). NEVER-OOM: zero
+## growing state (one fixed dict, overwritten each new worst, cleared every emit). Zero engine rebuild.
+const FP_WORST_FRAME_ATTR := false
+
 ## COSMOS-PERF FALL — THE fall-fps fix. _attitude_ground_contact() (player.gd) calls world.floor_under() EVERY
 ## free-fall frame; at high altitude the near field is ALT_REGIME-frozen so the floor query hits a slow regenerate
 ## path (~86-175 ms/frame — the entire fall collapse, proven by t_att_us telemetry). Dev-fly is smooth because

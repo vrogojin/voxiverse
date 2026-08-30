@@ -2994,3 +2994,9 @@ func fall_timing() -> Dictionary:
 	var out: Dictionary = _ft.duplicate()
 	_ft.clear()
 	return out
+
+## FP_WORST_FRAME_ATTR read-only PEEK: the in-progress (not-yet-window-flushed) per-segment MAX µs, WITHOUT clearing —
+## so the worst-frame snapshot can co-sample _ft mid-window while fall_timing() still drains + resets at the emit tick.
+## Empty {} whenever FP_FALL_TIMING never populated _ft (byte-identical: only ever CALLED behind FP_WORST_FRAME_ATTR).
+func fall_timing_peek() -> Dictionary:
+	return _ft.duplicate() if not _ft.is_empty() else {}

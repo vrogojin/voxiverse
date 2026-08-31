@@ -291,6 +291,18 @@ const FP_NO_NEAR_LOD := false
 ## (design §3-§4, Steps 3-5). Default OFF → near_render_radius() stays the shipped faceted 128 → byte-identical.
 const FP_FULLRES_256 := false
 
+## COSMOS NEAR-RADIUS DIET (village/ground jerkiness — live-confirmed 2026-08-31). The DEV_HIDE_NEAR bisection proved
+## the near voxel field (godot_voxel gen+mesh+main-thread apply across the CURVED_RENDER_RADIUS_BLOCKS=128 disc) is a
+## MAJOR jerkiness source (collapsing it → "much less jerky"). This shrinks the near render radius to
+## NEAR_RADIUS_DIET_BLOCKS so the streamed/meshed near area drops ~(diet/128)² (96→0.56×, 80→0.39×, 64→0.25×); the far
+## tier (blocky far-ring + skin, already resident past the near edge) covers the freed ring. Consulted ONLY via
+## near_render_radius() (the single lever every ramp/anchor/pool cap reads), and analytic physics/collider read
+## TerrainConfig directly (never the mesh), so movement/collision are UNCHANGED — this is a render-cost trade only.
+## Default OFF ⇒ near_render_radius() returns the shipped faceted 128 verbatim; FLAT (not FACETED) hits the 256 branch
+## first, untouched ⇒ byte-identical (FLAT 6042/0). Tunable live: sweep NEAR_RADIUS_DIET_BLOCKS for the smooth/detail knee.
+const FP_NEAR_RADIUS_DIET := false           # shrink the near voxel-field render radius (128 → NEAR_RADIUS_DIET_BLOCKS)
+const NEAR_RADIUS_DIET_BLOCKS := 96          # dieted near radius (blocks); area ∝ r² ⇒ 96 = 0.56× the 128 near work
+
 ## COSMOS-ATLAS (docs/COSMOS-ATLAS-DESIGN.md, Perf L3) — collapse the OPAQUE terrain onto ONE shared atlas material.
 ## Every block id today carries its OWN StandardMaterial3D (block_materials.gd), and VoxelMesherBlocky emits ONE
 ## surface (= one draw call) per distinct material per 32³ mesh block, so materials MULTIPLY the draw count

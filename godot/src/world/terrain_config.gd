@@ -173,6 +173,8 @@ static func near_render_radius() -> int:
 		return RENDER_RADIUS_BLOCKS                       # 256, byte-identical flat
 	if CubeSphere.FP_FULLRES_256:
 		return FULLRES_256_RADIUS_BLOCKS                  # 256 under the widening flag (later pass)
+	if CubeSphere.FP_NEAR_RADIUS_DIET:
+		return CubeSphere.NEAR_RADIUS_DIET_BLOCKS         # near-field cost diet (jerkiness lever) — far tier covers the ring
 	return CURVED_RENDER_RADIUS_BLOCKS                    # 128, shipped faceted
 
 ## The godot_voxel viewer streams a vertically-scaled ellipsoid: the vertical view radius is

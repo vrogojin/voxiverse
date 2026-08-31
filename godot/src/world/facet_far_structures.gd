@@ -481,7 +481,7 @@ func _rebuild(reg: Array, cam_abs: Vector3) -> void:
 		var bake := _ensure_bake(rec)
 		if bake.is_empty() or int(bake["tris"]) == 0:
 			continue
-		if tris + int(bake["tris"]) > CubeSphere.STRUCT_FAR_TRIS_MAX:
+		if tris + int(bake["tris"]) > CubeSphere.struct_far_tris_max():   # FP_STRUCT_COARSE_FAR: 24k under the flag, else 80k
 			capped = true
 			break
 		verts.append_array(bake["verts"])

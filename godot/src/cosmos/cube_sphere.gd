@@ -1306,6 +1306,24 @@ const STRUCT_FAR_MAX := 2400.0              # §7.1 far-structure outer band edg
 const STRUCT_STEP_MS := 250                  # §7.1 min ms between FacetFarStructures rebuilds (rate cap)
 const STRUCT_FAR_TRIS_MAX := 80000          # §8 NEVER-OOM: merged-band triangle cap
 const STRUCT_BYTES_MAX := 8 << 20           # §8 NEVER-OOM: hard 8 MB ceiling (tracker + registry + bakes + meshes)
+
+## FP_STRUCT_COARSE_FAR (far-village render diet — live-confirmed 2026-09-01). The far-village tier adds ~240k prims
+## PINNED at STRUCT_FAR_TRIS_MAX (80k tris), the dominant far-village cost (orbit "villages=jerky, no-villages=fast").
+## STRUCT_TARGET_RES=16 renders houses ≤16 blk at FULL 1:1 voxel res (no decimation). This flag decimates far houses
+## coarser (STRUCT_COARSE_RES) AND lowers the merged-mesh cap (STRUCT_COARSE_TRIS_MAX) proportionally — SAME villages
+## shown (they're smaller, more fit the cap), ~70% fewer village prims. Consulted only via struct_far_target_res() /
+## struct_far_tris_max() (below); analytic physics never touches the far model ⇒ movement unchanged, render-only trade.
+## Off ⇒ 16 / 80000 verbatim ⇒ byte-identical (FLAT 6042/0; villages OFF in FLAT anyway). Needs FP_STRUCT_FAR. Visual:
+## far houses blockier from a distance (tiny on screen at orbit). Gate: verify_structures decim parity holds both res.
+const FP_STRUCT_COARSE_FAR := false          # coarser far-village decimation + lower tri cap (kills the +240k village-prim load)
+const STRUCT_COARSE_RES := 8                 # decimator target res under the flag (16→8 ⇒ ~4× fewer tris/house)
+const STRUCT_COARSE_TRIS_MAX := 24000        # merged-band tri cap under the flag (matches the tri reduction — same villages)
+
+## Effective far-village decimator target res + tri cap (the single read sites; byte-identical off).
+static func struct_far_target_res() -> int:
+	return STRUCT_COARSE_RES if FP_STRUCT_COARSE_FAR else STRUCT_TARGET_RES
+static func struct_far_tris_max() -> int:
+	return STRUCT_COARSE_TRIS_MAX if FP_STRUCT_COARSE_FAR else STRUCT_FAR_TRIS_MAX
 const STRUCT_ORBIT_MIN := 48                 # §7.4 P2: min max-extent (blocks) for the orbit-resident exception
 const STRUCT_HIDE_STREAK := 2                # §7.3 consecutive COVERED probes before hiding the far model
 const STRUCT_SHOW_STREAK := 2                # §7.3 consecutive NOT_COVERED probes before restoring it

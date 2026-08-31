@@ -68,6 +68,31 @@ func _initialize() -> void:
 		total_solid += int(dec["solid_cells"])
 		total_tris += int(lat["tris"])
 		total_cells += (bmax.x - bmin.x + 1) * (bmax.y - bmin.y + 1) * (bmax.z - bmin.z + 1)
+	# MERGE cost (the REAL rebuild hitch): the bakes are CACHED in production (_baked dict), so a rebuild only
+	# CONCATENATES the cached per-house arrays + add_surface_from_arrays. Pre-bake to cache, then time ONLY concat+commit.
+	var cached_v := []
+	var cached_c := []
+	for i in range(n):
+		var rec: Dictionary = recs[i]
+		var lat: Dictionary = SD.bake_lattice(SD.decimate(fid, rec["bmin"], rec["bmax"], samp))
+		cached_v.append(lat["verts"]); cached_c.append(lat["colors"])
+	# time the rebuild: concat + add_surface (repeat x5 for a stable read — this fires EVERY membership change live)
+	var t_merge := 0.0
+	for _rep in range(5):
+		var mverts := PackedVector3Array(); var mcolors := PackedColorArray()
+		var m0 := Time.get_ticks_usec()
+		for i in range(n):
+			mverts.append_array(cached_v[i]); mcolors.append_array(cached_c[i])
+		var mesh := ArrayMesh.new()
+		if not mverts.is_empty():
+			var arr := []; arr.resize(Mesh.ARRAY_MAX)
+			arr[Mesh.ARRAY_VERTEX] = mverts; arr[Mesh.ARRAY_COLOR] = mcolors
+			mesh.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)
+		t_merge += float(Time.get_ticks_usec() - m0) * 0.001
+	t_merge /= 5.0
+	var mvcount := 0
+	for a in cached_v: mvcount += a.size()
+	print("STRUCT_TARGET_RES=", CubeSphere.STRUCT_TARGET_RES, "  merged_verts=", mvcount, " REBUILD(concat+commit)=", snappedf(t_merge, 2), " ms  (x", n, " houses; live scales to the 80k-tri cap)")
 	var tot := t_dec + t_bake + t_world
 	print("fid=", fid, " houses=", n, " cells=", total_cells, " solid=", total_solid, " tris=", total_tris)
 	print("_ensure_bake TOTAL ", snappedf(tot, 1), " ms  (", snappedf(tot / float(n), 2), " /house)")

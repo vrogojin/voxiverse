@@ -112,7 +112,21 @@ static func _is_earth(pcache) -> bool:
 # =====================================================================================================================
 # has_village (§12.4) — body gate FIRST, then salt-201, then the site test (biome / flatness / above-sea). Pure.
 # =====================================================================================================================
+## FP_STRUCT_GATE_MEMO front door — memoize the (vx,vz) village-gate result in the GenCtx (the far-structure bake
+## calls this O(bbox-volume) times for a near-CONSTANT (vx,vz); the value is a pure function of the frozen epoch, so
+## the cache is byte-identical). Off / non-GenCtx pcache ⇒ straight through to _has_village_compute (byte-off).
 static func has_village(vx: int, vz: int, pcache = null) -> bool:
+	if CubeSphere.FP_STRUCT_GATE_MEMO and pcache is TerrainConfig.GenCtx:
+		var vk := Vector2i(vx, vz)
+		var c: Variant = pcache.svmemo.get(vk)
+		if c != null:
+			return c
+		var r := _has_village_compute(vx, vz, pcache)
+		pcache.svmemo[vk] = r
+		return r
+	return _has_village_compute(vx, vz, pcache)
+
+static func _has_village_compute(vx: int, vz: int, pcache = null) -> bool:
 	if not _is_earth(pcache):
 		return false                                   # body gate FIRST (the Moon biome-id alias trap)
 	if _hash01(vx, vz, _SALT_VILLAGE) >= VILLAGE_CHANCE:
@@ -154,7 +168,22 @@ static func _site_biome_ok(b: int) -> bool:
 # live → salt-202 → footprint-corner flatness ≤ STRUCT_FLAT_TOL AND no corner on a firing slope → params from salts
 # 203-209. Everything is a pure position hash, so near / far / physics reproduce the SAME house by construction.
 # =====================================================================================================================
+## FP_STRUCT_GATE_MEMO front door — memoize the (hx,hz) house descriptor in the GenCtx (same rationale as
+## has_village; {} = no-house is cached too). The returned Dictionary is READ-ONLY by every caller (claim_at /
+## _template_block / top_decoration only read it), so sharing the cached reference is safe. Byte-off when the flag
+## is off or pcache is not a GenCtx.
 static func house_info(hx: int, hz: int, pcache = null) -> Dictionary:
+	if CubeSphere.FP_STRUCT_GATE_MEMO and pcache is TerrainConfig.GenCtx:
+		var hk := Vector2i(hx, hz)
+		var c: Variant = pcache.shmemo.get(hk)
+		if c != null:
+			return c
+		var r := _house_info_compute(hx, hz, pcache)
+		pcache.shmemo[hk] = r
+		return r
+	return _house_info_compute(hx, hz, pcache)
+
+static func _house_info_compute(hx: int, hz: int, pcache = null) -> Dictionary:
 	var vx := floori(float(hx) / float(STRUCT_HPV))
 	var vz := floori(float(hz) / float(STRUCT_HPV))
 	if not has_village(vx, vz, pcache):

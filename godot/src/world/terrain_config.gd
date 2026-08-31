@@ -939,6 +939,11 @@ class GenCtx extends RefCounted:
 	# jinv_d4 = −d4(J) mod 4. 0 for a native column at M_win=I → byte-identical. Set per-column by
 	# worker_fold_column (worker) / generated_cell_global (analytic).
 	var jinv_d4: int = 0
+	# COSMOS STRUCTURES (FP_STRUCT_GATE_MEMO): per-fid memo for the far-structure bake gate hashes. svmemo keys
+	# Vector2i(vx,vz) → bool (has_village); shmemo keys Vector2i(hx,hz) → Dictionary (house_info, {} = no house).
+	# Pure functions of the frozen epoch — valid for this ctx's lifetime (cleared with the ctx on a fid change).
+	var svmemo: Dictionary = {}
+	var shmemo: Dictionary = {}
 	func _init(p_face: int = CubeSphere.HOME_FACE, p_facet: int = -1) -> void:
 		face = p_face
 		facet = p_facet

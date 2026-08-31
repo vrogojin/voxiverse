@@ -1327,6 +1327,18 @@ const STRUCT_BAKE_STAGE_MS := 8.0            # per-pass bake time box (ms) ≈ h
 const STRUCT_BAKE_STAGE_MIN := 2             # min fresh bakes per pass — guaranteed forward progress
 const STRUCT_HOLD_PROBE_CAP := 96            # max inside-r0 probes per pass (past ⇒ UNKNOWABLE ⇒ hold; safe degrade)
 
+## FP_STRUCT_GATE_MEMO (village-descent bake diet) — the far-structure bake (StructDecimator.decimate) samples
+## WorldManager.structure_cell_at → StructureGen.claim_at ONCE PER FINE CELL across the whole structure bbox (O(volume)).
+## claim_at's cost is dominated by has_village (a 4×4 column_top cliff stencil + biome + hashes) and house_info (which
+## re-calls has_village + 4 column_top + slope), yet both depend ONLY on (vx,vz)/(hx,hz) — near-CONSTANT within one
+## village's bbox — so they recompute the identical result thousands of times per bake (measured st_bms ≈ 150 ms /pass on
+## descent = ~75 ms per village decimate). This memoizes has_village per (vx,vz) and house_info per (hx,hz) in the GenCtx
+## (the same per-fid ctx already carrying the column_top memo), collapsing the per-cell gate cost to a dict lookup. The
+## memoized values are byte-IDENTICAL to the recomputed ones (both are pure functions of the frozen epoch), so the far
+## model is unchanged — this is pure work elision, not a fidelity trade. Only engages when pcache is a GenCtx AND the flag
+## is on; every other caller (plain-dict / null pcache, FLAT) is untouched ⇒ byte-identical (FLAT 6042/0). Gate: G-ST-MEMO.
+const FP_STRUCT_GATE_MEMO := false           # memoize has_village/house_info per cell-grid in the GenCtx (kills the O(volume) village-bake spike)
+
 ## FP_STRUCT_WALK_CALM (docs/COSMOS-FARTIER-WALK-DESIGN.md §2.1, Lever 1) — the move-churn diet for the far-STRUCTURE
 ## tier. The per-structure bakes are world-space (camera-INDEPENDENT geometry); the shipped 2-blk camera re-arm re-
 ## concatenates + re-uploads UNCHANGED merged data every ~0.36 s of walk. Under WALK_CALM the camera re-arm is replaced

@@ -1324,6 +1324,24 @@ static func struct_far_target_res() -> int:
 	return STRUCT_COARSE_RES if FP_STRUCT_COARSE_FAR else STRUCT_TARGET_RES
 static func struct_far_tris_max() -> int:
 	return STRUCT_COARSE_TRIS_MAX if FP_STRUCT_COARSE_FAR else STRUCT_FAR_TRIS_MAX
+
+## FP_STRUCT_SHADER_LITE / FP_STRUCT_CULL_BACK / FP_STRUCT_VIS_ABTEST (far-building GPU raster diet — Codex cross-review,
+## 2026-09-01, docs/COSMOS-BUILDING-RENDER-PERF-STRUGGLE.md). The far-village jerk at ~alt 500 tracks the FAR-STRUCTURE
+## RENDER, not the bake (stationary st_rb Δ0, merge ~2ms). Two per-fragment/raster wastes found in facet_far_structures.gd:
+##  (a) the zone-B `_SHELL_SHADER` runs a `sin(dot(floor(FRAGCOORD)…))` dither EVERY covered fragment even when
+##      tier_fade==1.0 (h<FT_SHELL_FADE_ALT=520 ⇒ discard can never fire) — pure ALU waste over the whole house footprint,
+##      which is exactly why FP_STRUCT_COARSE_FAR (−70% tris) did NOT cure it (same covered pixels). FP_STRUCT_SHADER_LITE
+##      guards the dither behind `tier_fade < 1.0` ⇒ byte-identical PIXELS (the discard was a no-op at fade 1), just no sin.
+##  (b) BOTH materials `render_mode cull_disabled` ⇒ hardware backface rejection off ⇒ ~2× raster. FP_STRUCT_CULL_BACK
+##      flips them to `cull_back` (closed, outward-wound house cubes). VISUAL-RISK if any face is mis-wound (holes) —
+##      isolated on its own flag to A/B; revert if it holes.
+## FP_STRUCT_VIS_ABTEST is the cheap definitive diagnostic (Codex): blink `_mi.visible` every STRUCT_VIS_ABTEST_PERIOD_MS
+## with the mesh baked + resident — jerk-follows-visibility ⇒ render/GPU-bound (registry/probe/bake all keep running).
+## All three OFF ⇒ shader strings + visibility verbatim ⇒ byte-identical (FLAT 6042/0). Need FP_STRUCT_FAR (+SHELL_BAND for a).
+const FP_STRUCT_SHADER_LITE := false         # skip the shell-shader per-fragment sin() dither when tier_fade>=1 (no-op discard)
+const FP_STRUCT_CULL_BACK := false           # cull_back (not cull_disabled) on both far-structure materials — ~2x less raster
+const FP_STRUCT_VIS_ABTEST := false          # DIAGNOSTIC: blink the far-structure mesh visibility to isolate render vs the rest
+const STRUCT_VIS_ABTEST_PERIOD_MS := 4000    # half-period of the visibility blink (ms) — 4s visible / 4s hidden
 const STRUCT_ORBIT_MIN := 48                 # §7.4 P2: min max-extent (blocks) for the orbit-resident exception
 const STRUCT_HIDE_STREAK := 2                # §7.3 consecutive COVERED probes before hiding the far model
 const STRUCT_SHOW_STREAK := 2                # §7.3 consecutive NOT_COVERED probes before restoring it

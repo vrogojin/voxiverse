@@ -103,7 +103,10 @@ void fragment() {
 "
 
 static func shader_code() -> String:
-	return _HEAD + VoxiLight.shade_glsl() + _TAIL
+	var head := _HEAD
+	if CubeSphere.FP_STRUCT_CULL_BACK:                          # cull_disabled → cull_back (single occurrence in _HEAD)
+		head = head.replace("cull_disabled", "cull_back")
+	return head + VoxiLight.shade_glsl() + _TAIL
 
 static func make_material() -> ShaderMaterial:
 	var sm := ShaderMaterial.new()
@@ -142,7 +145,13 @@ void fragment() {
 static func make_shell_material() -> ShaderMaterial:
 	var sm := ShaderMaterial.new()
 	var sh := Shader.new()
-	sh.code = _SHELL_SHADER
+	var code := _SHELL_SHADER
+	if CubeSphere.FP_STRUCT_CULL_BACK:                          # cull_disabled → cull_back
+		code = code.replace("cull_disabled", "cull_back")
+	if CubeSphere.FP_STRUCT_SHADER_LITE:                        # skip the per-fragment sin() dither when fully opaque (no-op discard)
+		code = code.replace("if (_sd_dither(FRAGCOORD.xy) > tier_fade) discard;",
+			"if (tier_fade < 1.0 && _sd_dither(FRAGCOORD.xy) > tier_fade) discard;")
+	sh.code = code
 	sm.shader = sh
 	sm.set_shader_parameter("tier_fade", 1.0)
 	return sm
@@ -180,6 +189,7 @@ func _apply_shell_visibility(offsurf: bool, h := -1.0) -> int:
 	if not (CubeSphere.FP_STRUCT_SHELL_BAND and h >= 0.0):
 		if _mi != null:
 			_mi.visible = not offsurf
+		_vis_abtest()
 		return -1
 	var zone := 0 if not offsurf else (1 if h < CubeSphere.FT_SHELL_HIDE_ALT else 2)
 	if _mi != null:
@@ -194,7 +204,17 @@ func _apply_shell_visibility(offsurf: bool, h := -1.0) -> int:
 				_shell_material.set_shader_parameter("tier_fade", tf)
 		else:
 			_mi.visible = false                                    # ZONE O: hidden, skin owns the view
+	_vis_abtest()
 	return zone
+
+## FP_STRUCT_VIS_ABTEST (Codex diagnostic): while the mesh WOULD be visible, blink it off for half of each period so a
+## frozen observer can see whether the jerk follows the mesh's on-screen presence (⇒ render/GPU-bound) or persists while
+## it's hidden (⇒ the registry/probe/bake path). Only suppresses an already-visible mesh; never forces one visible. Off ⇒
+## no-op (byte-identical). Bake/registry/probe all keep running — this removes ONLY submission/rasterization.
+func _vis_abtest() -> void:
+	if not CubeSphere.FP_STRUCT_VIS_ABTEST or _mi == null or not _mi.visible:
+		return
+	_mi.visible = (int(Time.get_ticks_msec() / CubeSphere.STRUCT_VIS_ABTEST_PERIOD_MS) % 2) == 0
 
 func set_sun_dir(sun_dir: Vector3) -> void:
 	if _material != null:

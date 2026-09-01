@@ -6254,7 +6254,10 @@ func worst_frame_markers() -> Dictionary:
 	# correctly with ALL the walk-fix flags OFF too (that's the baseline). Only reached under FP_WORST_FRAME_ATTR.
 	var ftr_rb: int = (_far_trees.rebuild_count() if _far_trees != null else 0)
 	var st_rb: int = (_far_structures.rebuild_count() if _far_structures != null else 0)
-	return {"st_bms": st_bms, "smooth_v2_commit_ms": sv2, "ftr_rb": ftr_rb, "st_rb": st_rb}
+	# FP_STRUCT_REG_EPOCH observability: the last far-structure step() prelude cost (µs), measured in ALL flag states
+	# (a cheap leaf int — never allocates) so the un-gated prelude spike over a village is never invisible again.
+	var st_step_us: int = (_far_structures.step_us() if _far_structures != null else 0)
+	return {"st_bms": st_bms, "smooth_v2_commit_ms": sv2, "ftr_rb": ftr_rb, "st_rb": st_rb, "st_step_us": st_step_us}
 
 ## docs/COSMOS-ORBIT-RELIEF-MESH-DESIGN.md WS3 (task #99 G3): feed the current Sun direction into G3's OWN
 ## ShaderMaterial (a separate material from V2's/the shell's — see facet_orbit_relief.gd's shader doc) so its
@@ -6291,6 +6294,13 @@ func set_far_structures_near_query(q: Callable) -> void:
 func set_far_structures_edits_rev_query(q: Callable) -> void:
 	if _far_structures != null:
 		_far_structures.set_edits_rev_query(q)
+
+## FP_STRUCT_REG_EPOCH: forward the O(1) registry-version query (WorldManager.structure_registry_version) so the
+## far-structure prelude re-materializes its snapshot only when the registry actually changed. No-op with no
+## instance; only consumed under the flag (byte-identical off).
+func set_far_structures_version_query(q: Callable) -> void:
+	if _far_structures != null:
+		_far_structures.set_version_query(q)
 
 ## Far-structure telemetry accessor for the gate (null-safe).
 func far_structures() -> Object:

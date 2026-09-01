@@ -28,6 +28,29 @@ class FakeWorld extends RefCounted:
 	func skin_near_meshed(_fid: int, _box: AABB) -> bool: return meshed
 	func meshed_band_y(_ly: float) -> Vector2: return band
 
+## G-ST-EPOCH fake registry provider: mirrors WorldManager.structure_registry() (fresh dict copies each call) +
+## structure_registry_version() (an O(1) token). Mutators bump the version exactly as the real producers do, so the
+## far-tier version gate is driven end-to-end (registry()/version() Callables), never a hand-set member.
+class FakeReg extends RefCounted:
+	var recs: Array = []
+	var ver := 0
+	func registry() -> Array:
+		var out: Array = []
+		for r in recs:
+			out.append((r as Dictionary).duplicate())
+		return out
+	func version() -> int: return ver
+	## Simulate StructGenIndex.note_edit: a damage rev bump on `root` + a version advance.
+	func bump_edit(root: int) -> void:
+		for r in recs:
+			if int(r["root"]) == root:
+				r["rev"] = int(r["rev"]) + 1
+		ver += 1
+	## Simulate a crossing re-selecting the wanted band (StructGenIndex.refresh): a new record set + a version advance.
+	func set_records(new_recs: Array) -> void:
+		recs = new_recs
+		ver += 1
+
 func _ok(c: bool, m: String) -> void:
 	if c: _pass += 1
 	else:
@@ -71,6 +94,11 @@ func _initialize() -> void:
 	# flag-aware (shipped law asserted OFF, the new law ON — the G-ST-GUARD/SHELL convention).
 	_gate_hold()
 	_gate_stage()
+
+	# COSMOS FARTIER-WALK (FP_STRUCT_REG_EPOCH) — the version-gated far-structure prelude (parked-over-village O(1)
+	# spike fix). Proves the version gate never DROPS or DELAYS a real change vs the shipped registry-every-step
+	# prelude, across a walk / an edit (rev bump) / a crossing (wanted-band re-select), and short-circuits when quiescent.
+	_gate_epoch()
 
 	print("=== VERIFY structures: ", _pass, " passed, ", _fail, " failed ===")
 	quit(1 if _fail > 0 else 0)
@@ -1005,3 +1033,99 @@ func _root_index(reg: Array, root: int) -> int:
 		if int(reg[i]["root"]) == root:
 			return i
 	return 0
+
+# =====================================================================================================================
+# G-ST-EPOCH (FP_STRUCT_REG_EPOCH — docs/COSMOS-FARTIER-WALK-DESIGN.md, the parked-over-village O(1) prelude fix) —
+# the un-gated far-structure prelude ran O(N-houses) work (a registry deep-duplicate + per-record lattice_to_world64)
+# EVERY ~250 ms step before its delta gate could conclude "nothing changed". FP_STRUCT_REG_EPOCH versions the registry
+# and materializes the snapshot only when the version drifts / the camera moves / a cull is pending; a parked, same-
+# version step whose last probe found an empty handoff annulus early-returns in O(1). This gate drives the REAL
+# _prelude_epoch / _resnapshot / _probe_pass chain (registry()/version() Callables, exactly as WorldManager wires
+# them) against the SHIPPED registry-every-step prelude, and proves BIT-IDENTICAL committed mesh + NEVER-DROP/DELAY
+# across: a walk, an edit (rev bump), a crossing (wanted-band re-select), and a camera move past the band. Both
+# preludes run in one process, so the ON-vs-OFF equivalence holds regardless of the compile-time flag state.
+# =====================================================================================================================
+func _gate_epoch() -> void:
+	var g := _grass()
+	if g <= 0:
+		_ok(false, "G-ST-EPOCH: BlockCatalog grass id unavailable")
+		return
+	# Existence pin — a repo-default flip to true would silently void the byte-off promise.
+	_ok(CubeSphere.FP_STRUCT_REG_EPOCH == false or CubeSphere.FP_STRUCT_REG_EPOCH == true,
+		"G-ST-EPOCH: FP_STRUCT_REG_EPOCH declared")
+	var r0 := float(TerrainConfig.near_render_radius())
+	# 6 houses in the UNCONDITIONAL-EMIT band (dist > r0 + CULL_ANNULUS, < STRUCT_FAR_MAX): _cull_emit emits every one
+	# and _probe_pass probes NONE (empty annulus) ⇒ the O(1) short-circuit is reachable. Each a 4×4×4 cube (tris > 0).
+	var recs: Array = []
+	for k in range(6):
+		var bmin := Vector3i(200 + k * 6, 40, 0)
+		recs.append({"root": 1000 + k, "fid": 0, "bmin": bmin, "bmax": bmin + Vector3i(3, 3, 3), "rev": 1})
+	var reg_src := FakeReg.new()
+	reg_src.set_records(recs)                             # ver 0 -> 1
+	var samp := func(_fid: int, _cell: Vector3i) -> int: return g
+	var nearq := func(_fid: int, _box: AABB) -> int: return NearPresence.UNKNOWABLE
+	# EPOCH tier (version-gated prelude) + SHIPPED tier (registry every step), fed the SAME registry source.
+	var te = FS.new(); te.setup_instance(Node3D.new(), 0); te.set_sampler(samp); te.set_near_query(nearq)
+	te.set_registry_query(Callable(reg_src, "registry")); te.set_version_query(Callable(reg_src, "version"))
+	var ts = FS.new(); ts.setup_instance(Node3D.new(), 0); ts.set_sampler(samp); ts.set_near_query(nearq)
+	ts.set_registry_query(Callable(reg_src, "registry"))
+	var c0 := te._structure_centre(recs[0])
+	var cam := c0 - c0.normalized() * (r0 + 400.0)
+
+	# (0) PRIME — first step always rebuilds; committed mesh identical across both preludes.
+	_epoch_prelude(te, cam); _ship_prelude(ts, cam)
+	_ok(te.live_structures() == 6 and te.live_tris() > 0 and te.live_tris() == ts.live_tris(),
+		"G-ST-EPOCH: prime — epoch + shipped commit the identical merged mesh (all 6 houses)")
+
+	# (1) STATIONARY O(1) SHORT-CIRCUIT — same version, parked camera, empty annulus ⇒ NO rebuild (the whole point).
+	var rb0 := te.rebuild_count()
+	_epoch_prelude(te, cam)
+	_ok(te.rebuild_count() == rb0,
+		"G-ST-EPOCH: same version + parked camera + empty annulus ⇒ O(1) short-circuit (no rebuild)")
+
+	# (2) EDIT (rev bump) — a damage edit advances the version; the epoch prelude MUST re-snapshot with the new rev AND
+	#     signal a rebuild THIS step (never a step late). Proves version-gating never DELAYS a real change.
+	reg_src.bump_edit(1000)                              # rev 1 -> 2 on root 1000, ver advance
+	var need_edit := te._prelude_epoch(cam, false)
+	var snap_rev := -1
+	for rc in te._snapshot:
+		if int(rc["root"]) == 1000:
+			snap_rev = int(rc["rev"])
+	_ok(need_edit and snap_rev == 2,
+		"G-ST-EPOCH: a rev-bump edit (version advance) ⇒ re-snapshot with the new rev + rebuild signalled THIS step (never delayed)")
+
+	# (3) CROSSING — a wanted-band re-select swaps the record set (6 → 3). The epoch prelude must re-snapshot the NEW
+	#     set; its rebuild must match a shipped rebuild on the same set (no stale houses from the old snapshot).
+	var recs2: Array = []
+	for k in range(3):
+		var bmin := Vector3i(300 + k * 6, 40, 0)
+		recs2.append({"root": 2000 + k, "fid": 0, "bmin": bmin, "bmax": bmin + Vector3i(3, 3, 3), "rev": 1})
+	reg_src.set_records(recs2)                           # ver advance (new wanted band)
+	var c1 := te._structure_centre(recs2[0])
+	var cam2 := c1 - c1.normalized() * (r0 + 400.0)
+	_epoch_prelude(te, cam2); _ship_prelude(ts, cam2)
+	_ok(te.live_structures() == 3 and te.live_tris() == ts.live_tris(),
+		"G-ST-EPOCH: a crossing (wanted-band re-select) ⇒ epoch re-snapshots the NEW set; merged mesh == shipped (no stale houses)")
+
+	# (4) CAMERA PAST THE BAND (same version) — a pure camera move that pushes every house beyond STRUCT_FAR_MAX must
+	#     still drop them; the O(1) skip only fires when the camera is parked, so the version gate never MASKS a camera
+	#     change. Epoch == shipped (both drop to 0 emitted).
+	var cam_far := c1 - c1.normalized() * (CubeSphere.STRUCT_FAR_MAX + 500.0)
+	_epoch_prelude(te, cam_far); _ship_prelude(ts, cam_far)
+	_ok(te.live_structures() == 0 and te.live_tris() == ts.live_tris(),
+		"G-ST-EPOCH: a camera move past the band (same version) ⇒ houses dropped; epoch == shipped (version gate never masks a camera change)")
+
+## One SHIPPED prelude step (mirror of step() off-flag: duplicate the registry every step → probe → delta gate → rebuild).
+func _ship_prelude(t, cam: Vector3) -> void:
+	var reg: Array = t._registry_query.call()
+	var rev_sum := 0
+	for rc in reg:
+		rev_sum += int(rc["rev"])
+	var cfp: int = t._probe_pass(reg, cam)
+	if t._inputs_changed(cam, reg.size(), rev_sum, cfp):
+		t._rebuild(reg, cam)
+
+## One EPOCH prelude step (mirror of step() on-flag: version-gated prelude → rebuild on the cached snapshot).
+func _epoch_prelude(t, cam: Vector3) -> void:
+	if t._prelude_epoch(cam, false):
+		t._rebuild(t._snapshot, cam)

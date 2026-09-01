@@ -1405,6 +1405,24 @@ const FP_STRUCT_WALK_CALM := false           # Lever 1: camera-delta re-arm → 
 const FP_STRUCT_HANDOFF_HYST := false        # Lever 2c: Schmitt dead-band on the far-structure r0/annulus/2400 band edges
 const STRUCT_HYST_W := 8.0                    # Schmitt dead-band half-width (blocks) on the far-structure band edges
 
+## FP_STRUCT_REG_EPOCH (docs/COSMOS-FARTIER-WALK-DESIGN.md — the far-structure stationary-over-village spike) — the
+## far-STRUCTURE prelude ran O(N-houses) main-thread work EVERY ~250 ms step BEFORE its delta gate could conclude
+## "nothing changed": WorldManager.structure_registry() deep-DUPLICATES every GEN record per call, then _probe_pass
+## re-walks all records computing _structure_centre → FacetAtlas.lattice_to_world64 (a fresh 3-Variant Array each) —
+## a ~2 Hz frame spike over a village even when parked. This VERSIONS the registry (WorldManager.structure_registry_
+## version = StructGenIndex.version ⊕ StructureTracker.version): the prelude MATERIALIZES the snapshot (the one
+## registry duplicate + the per-record world centres) ONLY when the version drifts, camera moves ≥ STRUCT_EPOCH_STILL,
+## or a cull is mid-transition; a parked, same-version step whose last probe found an EMPTY handoff annulus early-
+## returns in O(1) (no duplicate, no probe loop). The far-TREE tier already checks cheap gate inputs before any O(N)
+## work (facet_far_trees.gd:802) — this brings the structure tier to parity. NEVER-DROP: the version bumps on EVERY
+## registry mutation (a cluster change, a GEN damage rev, a crossing re-selecting the wanted band), so a real change
+## is caught the same step it lands; the O(1) skip only fires when the version, camera AND annulus are all quiescent.
+## Off ⇒ the shipped prelude verbatim (lines guarded if/else ⇒ byte-identical). Gate: verify_structures.gd (G-ST-
+## EPOCH) + verify_fartier_walk.gd (G-WC-EPOCH). Composes with FP_STRUCT_WALK_CALM (the band-fp is recomputed on every
+## non-short-circuit probe; a sub-STRUCT_EPOCH_STILL camera drift is bounded to < STRUCT_EPOCH_STILL from the last
+## full scan before a resync, so a razor-edge band flip is at most one step / < 0.5 blk stale — self-correcting).
+const FP_STRUCT_REG_EPOCH := false           # version-gate the far-structure prelude (parked-over-village ⇒ O(1) step)
+
 ## FP_STRUCT_XFADE (docs/COSMOS-FARTIER-WALK-DESIGN.md §3.3, Lever 2b) — DECLARED, not yet implemented (the structure
 ## dither-alpha channel + credit-independent streak pass + bounded fade commits). The const exists so the flag family +
 ## gate compile; its body is deferred with the shader-migration subset (see the design-vs-reality note). Off ⇒ inert

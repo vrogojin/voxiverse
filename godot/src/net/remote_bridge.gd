@@ -720,6 +720,9 @@ func _capture_worst_frame_snapshot() -> Dictionary:
 			# diffs wf_ftr_rb / wf_st_rb across windows to read rebuilds-per-window — the churn baseline the fix targets).
 			snap["wf_ftr_rb"] = (wm as Dictionary).get("ftr_rb", 0)
 			snap["wf_st_rb"] = (wm as Dictionary).get("st_rb", 0)
+			# FP_STRUCT_REG_EPOCH: the far-structure step() prelude cost (µs) at the worst frame — the un-gated
+			# registry-duplicate + per-record lattice_to_world64 spike the version-gate targets (present in ALL states).
+			snap["wf_st_step_us"] = (wm as Dictionary).get("st_step_us", 0)
 	# if FP_FALL_TIMING is ALSO on: the in-progress (not-yet-window-flushed) _ft segment maxima — narrows the fall-segment
 	# correlation from 250 ms to "since last new-worst". Empty (no keys) when fall-timing was never on ⇒ nothing stamped.
 	if CubeSphere.FP_FALL_TIMING and is_instance_valid(player) and _has_m(player, "fall_timing_peek"):

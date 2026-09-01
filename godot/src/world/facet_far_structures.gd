@@ -28,6 +28,7 @@ extends RefCounted
 
 const STRUCT_DELTA_MOVE := 2.0                # blocks of camera motion that re-arm a rebuild (FT_DELTA_MIN_MOVE analogue)
 const CULL_ANNULUS := 64.0                    # §7.3 probe band width above near_render_radius() (the near-reach shell)
+const STRUCT_EPOCH_STILL := 0.5              # FP_STRUCT_REG_EPOCH: camera-parked tolerance (blocks) for the O(1) skip
 
 var _ring: Node3D = null
 var _mi: MeshInstance3D = null                # LOD-A merged band mesh (one draw)
@@ -46,6 +47,7 @@ var _registry_query: Callable = Callable()    # () -> Array of structure records
 var _sampler: Callable = Callable()           # (fid, Vector3i) -> placed block id (WorldManager.structure_cell_at)
 var _near_query: Callable = Callable()        # (fid, AABB) -> NearPresence COVERED|NOT_COVERED|UNKNOWABLE
 var _edits_rev_query: Callable = Callable()   # () -> int (WorldManager.edit_count) — a chop re-arms within one step
+var _version_query: Callable = Callable()     # FP_STRUCT_REG_EPOCH: () -> int registry version (WorldManager.structure_registry_version)
 
 # per-structure baked models: root -> {rev, verts:PackedVector3Array (ring-local), colors:PackedColorArray, tris, bytes}
 var _baked: Dictionary = {}
@@ -69,6 +71,20 @@ var _last_step_ms := 0
 var _band_fp := 0
 var _last_band_fp := 0
 var _band: Dictionary = {}
+
+# FP_STRUCT_REG_EPOCH: the version-gated prelude cache (all inert off-flag — never read/written on the shipped path).
+# `_snapshot` holds the ONE per-version registry materialization; `_centres[i]` is _snapshot[i]'s precomputed world
+# centre (so _structure_centre → lattice_to_world64 is NOT re-run per step); `_snap_rev_sum` its rev-sum. `_last_
+# version` latches the last materialized version; `_last_scan_cam` the camera at the last FULL probe (the O(1)-skip
+# datum); `_annulus_empty_last` whether that probe found ZERO structures in the near-handoff annulus (⇒ no cull can
+# arrive while parked). `_dbg_step_us` is the last step() prelude cost (µs) — surfaced in ALL flag states (telemetry).
+var _snapshot: Array = []
+var _centres: PackedVector3Array = PackedVector3Array()
+var _snap_rev_sum := 0
+var _last_version := -0x7fffffff
+var _last_scan_cam := Vector3(NAN, NAN, NAN)
+var _annulus_empty_last := false
+var _dbg_step_us := 0
 
 # FP_STRUCT_BAKE_STAGE drain state (inert off-flag: never set, never read on the shipped path)
 var _bake_pending := false                    # un-baked in-band records remain — re-dispatch every frame
@@ -227,6 +243,10 @@ func set_registry_query(q: Callable) -> void: _registry_query = q
 func set_sampler(q: Callable) -> void: _sampler = q
 func set_near_query(q: Callable) -> void: _near_query = q
 func set_edits_rev_query(q: Callable) -> void: _edits_rev_query = q
+func set_version_query(q: Callable) -> void: _version_query = q   # FP_STRUCT_REG_EPOCH
+
+## FP_STRUCT_REG_EPOCH: last step() prelude cost (µs). Present in all flag states (0 until step() runs) — a leaf int.
+func step_us() -> int: return _dbg_step_us
 
 func _current_edits_rev() -> int:
 	return int(_edits_rev_query.call()) if _edits_rev_query.is_valid() else 0
@@ -264,10 +284,22 @@ func step(settled := true, credit_ok := true, cam_render := Vector3.ZERO) -> voi
 	if not draining and now - _last_step_ms < CubeSphere.STRUCT_STEP_MS:
 		return
 	_last_step_ms = now
+	# FP_STRUCT_REG_EPOCH: self-time the WHOLE prelude (registry materialize + probe pass + delta gate) — present in
+	# ALL flag states so the un-gated spike is never invisible again (a usec read + one int write; no allocation).
+	var _step_t0 := Time.get_ticks_usec()
 	var centre := (_ring as FacetFarRing).render_centre()
 	if _material != null:
 		_material.set_shader_parameter("planet_centre", centre)
 	var cam_abs := _cam_to_absolute(cam_render)
+	if CubeSphere.FP_STRUCT_REG_EPOCH:
+		# Version-gated prelude (far-trees parity, facet_far_trees.gd:802): O(1) when the registry version, camera and
+		# handoff annulus are all quiescent; otherwise the probe pass over the CACHED snapshot with PRECOMPUTED centres.
+		var need := _prelude_epoch(cam_abs, draining)
+		_dbg_step_us = int(Time.get_ticks_usec() - _step_t0)
+		if need:
+			_rebuild(_snapshot, cam_abs)
+		return
+	# --- shipped prelude (byte-identical off — verbatim lines, only the surrounding timer added) --------------------
 	var reg: Array = _registry_query.call() if _registry_query.is_valid() else []
 	# Pure probe pass (§7.3): fill _probe_cache + the change fingerprint + whether any cull is mid-transition. No streak
 	# mutation here (streaks advance only in the real rebuild) so the HIDE/SHOW dwell counts 'consecutive rebuilds'.
@@ -276,7 +308,9 @@ func step(settled := true, credit_ok := true, cam_render := Vector3.ZERO) -> voi
 		rev_sum += int(rec["rev"])
 	var cover_fp := _probe_pass(reg, cam_abs)
 	# Delta gate (the forest-fps law): rebuild only when an input drifted OR a cull transition is pending.
-	if not _inputs_changed(cam_abs, reg.size(), rev_sum, cover_fp):
+	var need_ship := _inputs_changed(cam_abs, reg.size(), rev_sum, cover_fp)
+	_dbg_step_us = int(Time.get_ticks_usec() - _step_t0)
+	if not need_ship:
 		return
 	_rebuild(reg, cam_abs)
 
@@ -284,6 +318,41 @@ func _cam_to_absolute(cam_render: Vector3) -> Vector3:
 	if _ring == null:
 		return cam_render
 	return (_ring as Node3D).global_transform.affine_inverse() * cam_render
+
+## FP_STRUCT_REG_EPOCH: the O(1)-gated prelude (only called under the flag ⇒ shipped prelude byte-identical off).
+## Reads the registry version O(1); RE-MATERIALIZES the cached snapshot (+ precomputed world centres and rev-sum)
+## only when the version drifted (or the version query is unwired — the safe always-refresh degrade). A same-version,
+## camera-parked, no-cull-pending step whose LAST probe found an empty handoff annulus short-circuits in O(1) (no
+## registry duplicate, no probe loop) — the parked-over-village fix. Otherwise it runs the probe pass over the CACHED
+## snapshot with the PRECOMPUTED centres and returns the delta-gate verdict (whether _rebuild must run this step).
+## NEVER-DROP: the version bumps on every registry mutation, so a real change forces a resnapshot + rebuild the same
+## step; the O(1) skip is fenced by version == last, camera < STRUCT_EPOCH_STILL from the last full scan, cull not
+## pending, and annulus empty — every avenue by which the committed set could change is covered.
+func _prelude_epoch(cam_abs: Vector3, draining: bool) -> bool:
+	var has_ver := _version_query.is_valid()
+	var ver := int(_version_query.call()) if has_ver else -1
+	if not has_ver or ver != _last_version:
+		_resnapshot(ver)                                   # a real change (or unknown version) ⇒ re-materialize
+	elif not draining and not _cull_pending and _annulus_empty_last \
+			and cam_abs.distance_to(_last_scan_cam) < STRUCT_EPOCH_STILL:
+		return false                                       # version + camera + annulus quiescent ⇒ O(1) skip
+	var cover_fp := _probe_pass(_snapshot, cam_abs, _centres)
+	_last_scan_cam = cam_abs
+	return _inputs_changed(cam_abs, _snapshot.size(), _snap_rev_sum, cover_fp)
+
+## FP_STRUCT_REG_EPOCH: materialize the registry snapshot for `ver` — the ONE per-version registry duplicate plus the
+## per-record precompute (world centre + rev-sum) the stationary steps reuse. Called only when the version drifted, so
+## the O(N) registry-duplicate + lattice_to_world64 cost is paid once per real change, not every ~250 ms step.
+func _resnapshot(ver: int) -> void:
+	_snapshot = _registry_query.call() if _registry_query.is_valid() else []
+	_snap_rev_sum = 0
+	_centres = PackedVector3Array()
+	_centres.resize(_snapshot.size())
+	for i in range(_snapshot.size()):
+		var rec: Dictionary = _snapshot[i]
+		_snap_rev_sum += int(rec["rev"])
+		_centres[i] = _structure_centre(rec)
+	_last_version = ver
 
 ## FP_STRUCT_NEAR_GUARD §4.2: may the step proceed past the settle/credit gate? The SETTLE gate always holds (no work
 ## during fresh-load pile-up). The credit gate holds too — UNLESS the guard is on, which admits the (rate-capped +
@@ -326,21 +395,27 @@ var _cull_pending := false
 ## Pure pass: probe every in-annulus structure, cache the tri-state, XOR a stable hash over COVERED ones (the change
 ## fingerprint so a mesh landing under a still camera re-arms), and set `_cull_pending` if any probe disagrees with the
 ## committed visibility (so the streak can advance). NEVER mutates streaks. Returns the fingerprint.
-func _probe_pass(reg: Array, cam_abs: Vector3) -> int:
+func _probe_pass(reg: Array, cam_abs: Vector3, centres := PackedVector3Array()) -> int:
 	_probe_cache.clear()
 	_cull_pending = false
+	_annulus_empty_last = true                    # FP_STRUCT_REG_EPOCH: set false below iff a structure is annulus-probed
 	if not _near_query.is_valid():
 		return 0
 	var r0 := float(TerrainConfig.near_render_radius())
 	var fp := 0
 	var probes := 0
+	# FP_STRUCT_REG_EPOCH: use the caller's PRECOMPUTED world centres (from _resnapshot) when they match, so this loop
+	# does NOT re-run _structure_centre → lattice_to_world64 (a fresh 3-Variant Array) per record. Empty/mismatched
+	# centres (every direct-call gate + the shipped step()) ⇒ per-record compute, byte-identical to before.
+	var use_centres := centres.size() == reg.size()
 	# FP_STRUCT_WALK_CALM (Lever 1): recompute the membership band-fingerprint over EVERY registered structure, folded
 	# free into this existing distance loop. Only under the flag (byte-identical off — _band_fp stays 0, never read).
 	if CubeSphere.FP_STRUCT_WALK_CALM:
 		_band_fp = 0
-	for rec in reg:
+	for i in range(reg.size()):
+		var rec: Dictionary = reg[i]
 		var fid: int = int(rec["fid"])
-		var dist := _structure_dist(rec, cam_abs)
+		var dist := (cam_abs.distance_to(centres[i]) if use_centres else _structure_dist(rec, cam_abs))
 		if CubeSphere.FP_STRUCT_WALK_CALM:
 			var root_b := int(rec["root"])
 			var code := _band_code(dist, r0, int(_band.get(root_b, -1)))
@@ -363,6 +438,9 @@ func _probe_pass(reg: Array, cam_abs: Vector3) -> int:
 		elif st == NearPresence.NOT_COVERED:
 			if hidden:
 				_cull_pending = true                   # will restore after the streak
+	# FP_STRUCT_REG_EPOCH: an empty handoff annulus (no structure in [r0, r0+CULL_ANNULUS]) means no near-arrival cull
+	# can fire while the camera is parked ⇒ a same-version stationary step is safe to skip in O(1). Off-flag: unread.
+	_annulus_empty_last = probes == 0
 	return fp
 
 ## Advance the cull streak for `rec` from its cached probe and return whether the far model is currently EMITTED.

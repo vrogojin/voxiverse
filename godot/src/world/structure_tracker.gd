@@ -325,6 +325,12 @@ func rev_sum() -> int:
 		s += int(_reg[root]["rev"])
 	return s
 
+## FP_STRUCT_REG_EPOCH: an O(1) change token for the far tier's version-gated prelude. `_rev_counter` is monotone
+## and bumped on every cluster mutation (make-set/union/note_cell/note_removed/recluster); folding in `_reg.size()`
+## (bounded < STRUCT_REG_MAX) also catches a pure add/remove that keeps the rev-sum. Avoids the O(N) rev_sum() scan.
+func version() -> int:
+	return _rev_counter * 1024 + _reg.size()
+
 func tracked_count() -> int: return _cell_mat.size()
 func registry_count() -> int: return _reg.size()
 func is_saturated() -> bool: return _saturated

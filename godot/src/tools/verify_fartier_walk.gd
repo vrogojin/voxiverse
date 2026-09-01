@@ -21,6 +21,17 @@ const FT := preload("res://src/world/facet_far_trees.gd")
 const FS := preload("res://src/world/facet_far_structures.gd")
 const FA := preload("res://src/cosmos/facet_atlas.gd")
 
+## G-WC-EPOCH registry source: mirrors WorldManager.structure_registry() (fresh dicts) + structure_registry_version().
+class EpochReg extends RefCounted:
+	var recs: Array = []
+	var ver := 0
+	func registry() -> Array:
+		var out: Array = []
+		for r in recs:
+			out.append((r as Dictionary).duplicate())
+		return out
+	func version() -> int: return ver
+
 var _pass := 0
 var _fail := 0
 
@@ -40,6 +51,7 @@ func _initialize() -> void:
 	_gate_struct_fresh()
 	_gate_schmitt()
 	_gate_walk_budget()
+	_gate_epoch_walk()
 	print("=== VERIFY fartier_walk: ", _pass, " passed, ", _fail, " failed ===")
 	quit(1 if _fail > 0 else 0)
 
@@ -245,3 +257,60 @@ func _gate_walk_budget() -> void:
 	else:
 		var expect := int(200.0 / FS.STRUCT_DELTA_MOVE)
 		_ok(recommits >= expect - 5, "G-WC-PERF(off): a 200-blk walk ⇒ ~200/STRUCT_DELTA_MOVE re-commits (=%d, shipped churn control)" % expect)
+
+# =====================================================================================================================
+# G-WC-EPOCH (FP_STRUCT_REG_EPOCH — the parked-over-village O(1) prelude fix) — the version-gated prelude drives the
+# REAL _prelude_epoch / _resnapshot chain with a registry()/version() source wired exactly as WorldManager does. Proves
+# the O(1) short-circuit fires when parked over a village (no re-probe, no re-commit), a damage edit is caught the SAME
+# step (never delayed), and a straight no-crossing walk never drops the merged village. Flag-independent: _prelude_epoch
+# is a pure method (only WIRED into step() under the flag), so this asserts the machinery is correct in both states.
+# =====================================================================================================================
+func _gate_epoch_walk() -> void:
+	_ok(CubeSphere.FP_STRUCT_REG_EPOCH == false or CubeSphere.FP_STRUCT_REG_EPOCH == true, "G-WC-EPOCH: FP_STRUCT_REG_EPOCH declared")
+	var g := BlockCatalog.id_of(&"grass")
+	if g <= 0:
+		_ok(false, "G-WC-EPOCH: grass id unavailable")
+		return
+	var r0 := float(TerrainConfig.near_render_radius())
+	# a small in-band village (unconditional-emit band ⇒ empty handoff annulus ⇒ the O(1) skip is reachable).
+	var recs: Array = []
+	for k in range(5):
+		var bmin := Vector3i(20 + k * 8, 40, 0)
+		recs.append({"root": 3000 + k, "fid": 0, "bmin": bmin, "bmax": bmin + Vector3i(5, 5, 5), "rev": 1})
+	var reg_src := EpochReg.new()
+	reg_src.recs = recs
+	reg_src.ver = 1
+	var nearq := func(_fid: int, _box: AABB) -> int: return NearPresence.UNKNOWABLE
+	var t = FS.new()
+	t.setup_instance(Node3D.new(), 0)
+	t.set_near_query(nearq)
+	t.set_registry_query(Callable(reg_src, "registry"))
+	t.set_version_query(Callable(reg_src, "version"))
+	t.set_sampler(func(_f: int, _c: Vector3i) -> int: return g)
+	var c0 := t._structure_centre(recs[0])
+	var rdir := c0.normalized()
+	var tangent := rdir.cross(Vector3(0, 1, 0)).normalized()
+	if tangent.length() < 0.5:
+		tangent = rdir.cross(Vector3(1, 0, 0)).normalized()
+	var cam := c0 - rdir * (r0 + 600.0)
+	# prime (first step always rebuilds).
+	if t._prelude_epoch(cam, false):
+		t._rebuild(t._snapshot, cam)
+	_ok(t.live_structures() == 5, "G-WC-EPOCH: prime — the village merges (5 houses)")
+	# (1) PARKED — same version, camera unmoved, empty annulus ⇒ O(1) skip (no re-probe, no re-commit).
+	var rb := t.rebuild_count()
+	var did := t._prelude_epoch(cam, false)
+	_ok(not did and t.rebuild_count() == rb, "G-WC-EPOCH: parked over a village (same version) ⇒ O(1) skip (no re-commit)")
+	# (2) EDIT — a damage rev bump advances the version; caught the SAME step (never a version behind).
+	reg_src.recs[0]["rev"] = int(reg_src.recs[0]["rev"]) + 1
+	reg_src.ver += 1
+	_ok(t._prelude_epoch(cam, false), "G-WC-EPOCH: a damage edit (rev + version advance) ⇒ rebuild signalled the same step (never delayed)")
+	# (3) WALK — a 200-block straight no-crossing walk never drops the merged village (5 houses throughout).
+	var stable := true
+	for i in range(200):
+		cam += tangent * 1.0
+		if t._prelude_epoch(cam, false):
+			t._rebuild(t._snapshot, cam)
+		if t.live_structures() != 5:
+			stable = false
+	_ok(stable, "G-WC-EPOCH: a 200-blk no-crossing walk ⇒ the merged village stays complete (5 houses) every step (no drop)")

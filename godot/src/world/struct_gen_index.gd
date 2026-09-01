@@ -22,6 +22,11 @@ var _epoch := 0                     # bumped on crossing (re-selects the wanted 
 var _active_fid := -1
 var _wanted_dirty := true
 
+# FP_STRUCT_REG_EPOCH: a monotone change token bumped on every mutation that could alter what records() returns (a
+# cache (re)fill, a damage-rev bump, a crossing that re-selects the wanted band). The far tier reads version() O(1)
+# and re-materializes its snapshot only when it drifts. Inert off-flag (the counter is written but never read).
+var _version := 0
+
 # telemetry / gate read-back
 var _dbg_enum_count := 0
 
@@ -35,6 +40,7 @@ func refresh(active_fid: int) -> void:
 	_active_fid = active_fid
 	_wanted_dirty = false
 	_wanted = _wanted_facets(active_fid)
+	_version += 1                                  # FP_STRUCT_REG_EPOCH: the wanted band was rebuilt ⇒ records() may differ
 	for fid in _wanted:
 		enumerate_facet(int(fid))
 	_evict_unwanted()
@@ -42,8 +48,13 @@ func refresh(active_fid: int) -> void:
 ## Bump the crossing epoch (WorldManager calls this on a facet crossing). Re-selects the wanted band next refresh.
 func set_active(new_fid: int) -> void:
 	_epoch += 1
+	_version += 1                                  # FP_STRUCT_REG_EPOCH: a crossing re-selects the wanted band next refresh
 	_active_fid = new_fid
 	_wanted_dirty = true
+
+## FP_STRUCT_REG_EPOCH: O(1) change token for the far-tier prelude (bumps on refresh/set_active/note_edit/_store).
+func version() -> int:
+	return _version
 
 ## THE registry query half (§12.5): fresh record dicts for every CACHED wanted facet's houses. The far tier walks
 ## this concatenated with the tracker's records; it never scans the world.
@@ -116,6 +127,7 @@ func note_edit(fid: int, cell: Vector3i) -> void:
 			var nrev := int(_rev.get(root, 0)) + 1
 			_rev[root] = nrev
 			rec["rev"] = nrev
+			_version += 1                              # FP_STRUCT_REG_EPOCH: a damage rev bumped ⇒ records() changed
 
 static func _bbox_has(bmin: Vector3i, bmax: Vector3i, c: Vector3i) -> bool:
 	return c.x >= bmin.x and c.x <= bmax.x and c.y >= bmin.y and c.y <= bmax.y and c.z >= bmin.z and c.z <= bmax.z
@@ -158,6 +170,7 @@ func _facet_centre(fid: int) -> Vector3:
 # --- LRU cache bookkeeping (never-OOM) ------------------------------------------------------------------------------
 func _store(fid: int, recs: Array) -> void:
 	_cache[fid] = recs
+	_version += 1                                  # FP_STRUCT_REG_EPOCH: cache (re)fill — conservative bump (settles once warm)
 	_touch(fid)
 	while _lru.size() > _FACET_CAP:
 		var victim: int = _lru.pop_back()

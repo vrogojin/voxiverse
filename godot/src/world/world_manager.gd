@@ -503,6 +503,9 @@ func _ready() -> void:
 				_facet_ring.set_far_structures_sampler(Callable(self, "structure_cell_at"))
 				_facet_ring.set_far_structures_edits_rev_query(Callable(self, "edit_count"))
 				_facet_ring.set_far_structures_near_query(Callable(self, "far_tree_near_presence"))
+				# FP_STRUCT_REG_EPOCH: the O(1) registry version so the tier's prelude re-materializes its snapshot
+				# only on a real change. Stored like the other queries; only consulted under the flag ⇒ byte-off.
+				_facet_ring.set_far_structures_version_query(Callable(self, "structure_registry_version"))
 		# C1 FP_M2_SMOOTH_DEFER (docs/COSMOS-LOD-LADDER-SMOOTH-DESIGN.md §4): hand the FacetLodMesher (owned by
 		# module_world) the smooth-residency query so its want loop defers coarse M2 megablocks under a resident
 		# smooth tile — mirrors the block-LOD ladder's own set_smooth_query wiring (below). module_world stores it and
@@ -3982,6 +3985,17 @@ func structure_registry() -> Array:
 	if _gen_index != null:
 		out.append_array(_gen_index.records())
 	return out
+
+## FP_STRUCT_REG_EPOCH: an O(1) version of the structure registry — a change token that advances whenever
+## structure_registry() would return different records. Mirrors that call's TWO-producer composition: the tracker
+## version XOR the DECORRELATED GEN-index version (a large-odd multiply so the two counters can't cancel), each
+## treated as 0 when its source is absent (FP_STRUCT_DETECT / FP_STRUCT_GEN off). The far-structure tier reads this
+## to gate its prelude; compared only for equality, so any 64-bit token value is fine. Byte-off: the tier only wires
+## + consults it under FP_STRUCT_REG_EPOCH.
+func structure_registry_version() -> int:
+	var tv: int = _structure_tracker.version() if _structure_tracker != null else 0
+	var gv: int = _gen_index.version() if _gen_index != null else 0
+	return tv ^ (gv * 2654435761)
 
 ## docs/COSMOS-STRUCTURES-DESIGN.md (P0, §6.1): the decimator's cell sampler — the PLACED overlay material at
 ## (fid, cell), or 0 for air / non-placed. Reads the overlay DIRECTLY by (fid, cell) edit key (fid-agnostic, unlike

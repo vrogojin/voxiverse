@@ -6260,7 +6260,8 @@ func worst_frame_markers() -> Dictionary:
 	# FP_STRUCT_CARDS observability: live card instances / cap hit / card-sink self-time (µs) in the last _rebuild.
 	# {} off-flag ⇒ these fold nothing (the card_state() precedent); leaf reads, no allocation on the hot path.
 	var out := {"st_bms": st_bms, "smooth_v2_commit_ms": sv2, "ftr_rb": ftr_rb, "st_rb": st_rb, "st_step_us": st_step_us}
-	if _far_structures != null:
+	# Flag-gated so the OFF arm allocates NOTHING new (card_state() would otherwise build a fresh {} every call).
+	if CubeSphere.FP_STRUCT_CARDS and _far_structures != null:
 		var cs = _far_structures.card_state()
 		if cs is Dictionary and not (cs as Dictionary).is_empty():
 			out["st_ci"] = int((cs as Dictionary)["st_ci"])

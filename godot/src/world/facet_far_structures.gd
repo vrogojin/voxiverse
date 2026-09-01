@@ -56,7 +56,7 @@ var _card_prec: Dictionary = {}
 var _live_cards := 0                           # last rebuild's live card instances (telemetry / gate read-back)
 var _card_capped := false                      # last rebuild hit STRUCT_CARD_INST_MAX
 var _dbg_card_us := 0                           # card-sink self-time inside the last _rebuild (µs) — st_crb_us
-var _last_card_buf: PackedFloat32Array = PackedFloat32Array()   # last card buffer (gate read-back only)
+var _card_cbuf: PackedFloat32Array = PackedFloat32Array()       # persistent card instance buffer (reused, resized once — no per-rebuild 128 KB alloc). Gate read-back reads this directly (a second held reference would force a COW fork every rebuild).
 
 # FP_STRUCT_SHELL_BAND A/B / gate read-back: last computed zone (0=S,1=B,2=O; -1 flag off) + the altitude the law saw.
 var _dbg_shell_zone := -1
@@ -200,6 +200,12 @@ static func make_shell_material() -> ShaderMaterial:
 # in the house's (e_f, e_s) frame — so camera rotation / orbiting rewrites NOTHING on the CPU. The roof cap is a
 # house-local tangent quad. ALBEDO = atlas.rgb · voxi_shade(radial n̂, sun_dir) (the ONE far-tier lighting law).
 # Never read vertex COLOR (use_colors=false — the §1 gl_compat COLOR-slot rule). Only compiled under FP_STRUCT_CARDS.
+#
+# CRITICAL (world_vertex_coords): under this render_mode the vertex() shader RECEIVES VERTEX already in WORLD space
+# (MODEL·local, ~planet-radius magnitude), so the unit-quad corner is reconstructed from UV/UV2 (lx = UV.x−0.5;
+# billboard ly = 1−UV.y; cap lz = UV.y−0.5), NEVER read from VERTEX — VERTEX is only WRITTEN (the world position out).
+# Azimuth sector: canonical x̂↦−e_f, ẑ↦+e_s ⇒ α = atan2(−sa, ca) (mirror of sa). Cap u is canonical +x̂ = −e_f ⇒ the
+# local x is negated along mx. Tile UV is remapped onto the 3-px-pad inset (atlas_uv_lo/span) so no size/float pop.
 # =====================================================================================================================
 const _CARD_HEAD := "shader_type spatial;
 render_mode cull_disabled, world_vertex_coords;
@@ -207,6 +213,8 @@ uniform sampler2D house_atlas : source_color, filter_nearest;
 uniform vec3 planet_centre = vec3(0.0, 0.0, 0.0);
 uniform float atlas_cols = 9.0;
 uniform float atlas_rows = 10.0;
+uniform float atlas_uv_lo = 0.109375;
+uniform float atlas_uv_span = 0.78125;
 "
 const _CARD_TAIL := "varying vec2 v_uv;
 varying vec3 v_n;
@@ -220,26 +228,30 @@ void vertex() {
 	float arch = floor(INSTANCE_CUSTOM.x);
 	float w_s  = INSTANCE_CUSTOM.y;
 	float w_f  = INSTANCE_CUSTOM.z;
+	float lx = UV.x - 0.5;
 	vec3 vc  = CAMERA_POSITION_WORLD - o;
 	vec3 fh  = vc - up_n * dot(vc, up_n);
 	float fl = length(fh);
 	fh = (fl > 1e-4) ? fh / fl : normalize(mx);
 	vec3 wp; float col;
 	if (UV2.x < 0.5) {
+		float ly = 1.0 - UV.y;
 		vec3 raxis = normalize(cross(up_n, fh));
 		float ca = dot(fh, normalize(mx));
 		float sa = dot(fh, normalize(mz));
 		float halfw = 0.5 * (w_s * abs(ca) + w_f * abs(sa)) * s;
-		wp = o + raxis * (VERTEX.x * 2.0 * halfw) + my * VERTEX.y;
-		float alpha = atan(sa, ca);
+		wp = o + raxis * (lx * 2.0 * halfw) + my * ly;
+		float alpha = atan(-sa, ca);
 		float kk = floor(alpha * (8.0 / 6.2831853) + 0.5);
 		col = mod(kk + 8.0, 8.0);
 	} else {
-		wp = o + mx * (VERTEX.x * w_f) + mz * (VERTEX.z * w_s) + my * VERTEX.y;
+		float lz = UV.y - 0.5;
+		wp = o + mx * (-(lx) * w_f) + mz * (lz * w_s) + my;
 		col = 8.0;
 	}
 	VERTEX = wp;
-	v_uv = vec2((col + UV.x) / atlas_cols, (arch + UV.y) / atlas_rows);
+	vec2 uv_in = atlas_uv_lo + UV * atlas_uv_span;
+	v_uv = vec2((col + uv_in.x) / atlas_cols, (arch + uv_in.y) / atlas_rows);
 	v_n  = normalize(wp - planet_centre);
 }
 void fragment() {
@@ -288,6 +300,11 @@ static func make_card_material() -> ShaderMaterial:
 	sm.set_shader_parameter("sun_dir", seed)
 	sm.set_shader_parameter("atlas_cols", float(StructCardKit.COLS))
 	sm.set_shader_parameter("atlas_rows", float(StructCardKit.ROWS))
+	# P1-4 pad compensation: the raster puts tile content in the 3-px-pad inset (texels [PAD, TILE−PAD−1]); remap the
+	# quad's tile-local UV [0,1] onto that inset (texel centres) so the house fills the quad edge-to-edge — no ~0.81×
+	# shrink and no ~0.09·H float above the base (which the placement-parity anchor law exists to prevent).
+	sm.set_shader_parameter("atlas_uv_lo", (float(StructCardKit.PAD) + 0.5) / float(StructCardKit.TILE))
+	sm.set_shader_parameter("atlas_uv_span", (float(StructCardKit.TILE) - 2.0 * float(StructCardKit.PAD) - 1.0) / float(StructCardKit.TILE))
 	if CubeSphere.FP_SHADE_UNIFIED:
 		sm.set_shader_parameter("night_floor", VoxiLight.NIGHT_FLOOR)
 		sm.set_shader_parameter("term_mu", VoxiLight.TERM_MU)
@@ -551,6 +568,7 @@ func _resnapshot(ver: int) -> void:
 	# FP_STRUCT_CARDS (§6): the per-record card-param precompute lives HERE, index-parallel-in-spirit with _centres but
 	# keyed by root (sort-safe). Rebuilt whole each version ⇒ no stale row can outlive its snapshot (risk 7). Off ⇒ the
 	# clear/fill lines are skipped ⇒ the loop body is the shipped two lines (byte-identical).
+	var ctx_cache: Dictionary = {}                 # FP_STRUCT_CARDS: ONE GenCtx per fid so the GATE_MEMO village memo hits across a village's houses
 	if CubeSphere.FP_STRUCT_CARDS:
 		_card_prec.clear()
 	for i in range(_snapshot.size()):
@@ -558,7 +576,7 @@ func _resnapshot(ver: int) -> void:
 		_snap_rev_sum += int(rec["rev"])
 		_centres[i] = _structure_centre(rec)
 		if CubeSphere.FP_STRUCT_CARDS:
-			_card_prec[int(rec["root"])] = _precompute_card(rec)
+			_card_prec[int(rec["root"])] = _precompute_card(rec, ctx_cache)
 	_last_version = ver
 
 ## FP_STRUCT_CARDS (§6): the 12-float card param row for one record — [is_card, arch, w_s, w_f, H, ox,oy,oz, fx,fy,fz,
@@ -568,7 +586,7 @@ func _resnapshot(ver: int) -> void:
 ## door→forward/side axes + pre-swapped extents (§3.3), and the sphere-lifted base-centre origin + height (§5.3, the
 ## SAME lattice→world(+datum_lift) law as _ensure_bake so the cube→card swap never pops — risk 4). Only called under
 ## the flag (from _resnapshot). Cost: O(1) hashes + one lattice_to_world64 per record, once per registry version.
-func _precompute_card(rec: Dictionary) -> PackedFloat32Array:
+func _precompute_card(rec: Dictionary, ctx_cache: Dictionary = {}) -> PackedFloat32Array:
 	var out := PackedFloat32Array()
 	out.resize(STRUCT_CARD_PREC)
 	var root := int(rec["root"])
@@ -576,9 +594,17 @@ func _precompute_card(rec: Dictionary) -> PackedFloat32Array:
 	if root >= 0 or source != StructureGen.SOURCE_GEN:
 		out[0] = 0.0                                # player-built / non-GEN ⇒ never a card (cube path owns it)
 		return out
+	# A DAMAGED GEN house (rev bumped by an edit) must stay on the CUBE path so the hole shows — a pristine card would
+	# hide the damage. Route rev != 0 through the cube sink (is_card 0). The version bump on note_edit re-runs this.
+	if int(rec.get("rev", 0)) != 0:
+		out[0] = 0.0
+		return out
 	var up := StructureGen.unpack_root(root)
 	var fid := int(up[0]); var hx := int(up[1]); var hz := int(up[2])
-	var ctx = TerrainConfig.GenCtx.new(0, fid)
+	var ctx = ctx_cache.get(fid)
+	if ctx == null:
+		ctx = TerrainConfig.GenCtx.new(0, fid)
+		ctx_cache[fid] = ctx
 	var hi := StructureGen.house_info(hx, hz, ctx)
 	if hi.is_empty():
 		out[0] = 0.0                                # defensive: a record StructGenIndex emitted always has a house_info
@@ -630,9 +656,12 @@ func _inputs_changed(cam_abs: Vector3, reg_count: int, rev_sum: int, cover_fp: i
 	# term survives only when the tri cap was hit last rebuild (_capped) — then nearest-first ORDERING is a genuine camera
 	# term. Off ⇒ `(not false or _capped)` == true ⇒ the shipped `dist >= STRUCT_DELTA_MOVE` disjunct verbatim, and the
 	# band-fp disjunct short-circuits on the const ⇒ byte-identical.
+	# The camera term survives under WALK_CALM only when a nearest-first cap was hit last rebuild — the CUBE tri cap
+	# (_capped) OR the CARD instance cap (_card_capped) — because then walking admits newly-closer records without any
+	# band-edge crossing. Off-flag both are false and `not WALK_CALM` short-circuits ⇒ byte-identical.
 	var changed := (not _have_rebuilt) \
 		or (cam_abs.distance_to(_last_cam) >= STRUCT_DELTA_MOVE \
-			and (not CubeSphere.FP_STRUCT_WALK_CALM or _capped)) \
+			and (not CubeSphere.FP_STRUCT_WALK_CALM or _capped or _card_capped)) \
 		or (CubeSphere.FP_STRUCT_WALK_CALM and _band_fp != _last_band_fp) \
 		or reg_count != _last_reg_count \
 		or rev_sum != _last_rev_sum \
@@ -844,17 +873,16 @@ func _rebuild(reg: Array, cam_abs: Vector3) -> void:
 	var tris := 0
 	var count := 0
 	var capped := false
-	# FP_STRUCT_CARDS: the card sink (flag-gated alloc). A GEN house renders in EXACTLY ONE sink — cube OR card —
-	# never both (the `continue` after a card write). Off ⇒ cbuf stays empty, the branches are skipped, and the cube
-	# accumulators / _ensure_bake / _commit_mesh run the shipped lines verbatim (byte-identical). §7.2.
-	var cbuf := PackedFloat32Array()
+	# FP_STRUCT_CARDS: the card sink. Reuses the PERSISTENT _card_cbuf (resized once) — no per-rebuild 128 KB alloc
+	# (WASM dlmalloc convoy hygiene). A GEN house renders in EXACTLY ONE sink — cube OR card. Off ⇒ _card_cbuf is never
+	# touched, the branches are skipped, and the cube accumulators / _ensure_bake / _commit_mesh run verbatim (byte-off).
 	var cn := 0
 	var ccapped := false
-	var _card_t0 := 0
+	var card_write_us := 0                              # accumulated card-sink write time (µs) — the whole write loop, not just the upload
 	if CubeSphere.FP_STRUCT_CARDS:
-		_card_t0 = Time.get_ticks_usec()
-		cbuf.resize(CubeSphere.STRUCT_CARD_INST_MAX * STRUCT_CARD_STRIDE)
-		_dbg_card_us = int(Time.get_ticks_usec() - _card_t0)
+		var need := CubeSphere.STRUCT_CARD_INST_MAX * STRUCT_CARD_STRIDE
+		if _card_cbuf.size() != need:
+			_card_cbuf.resize(need)
 	for rec in ordered:
 		var dist := _structure_dist(rec, cam_abs)
 		if dist > CubeSphere.STRUCT_FAR_MAX:
@@ -865,10 +893,16 @@ func _rebuild(reg: Array, cam_abs: Vector3) -> void:
 			if cn >= CubeSphere.STRUCT_CARD_INST_MAX:
 				ccapped = true
 				continue                                       # nearest-first: the cap keeps the closest houses
-			_write_card_inst(cbuf, cn, _card_prec[int(rec["root"])])
+			var _wt0 := Time.get_ticks_usec()
+			_write_card_inst(_card_cbuf, cn, _card_prec[int(rec["root"])])
+			card_write_us += int(Time.get_ticks_usec() - _wt0)
 			cn += 1
 			count += 1
 			continue                                           # a house renders in EXACTLY one sink
+		# FP_STRUCT_CARDS: once the CUBE tri budget caps, keep scanning for later CARD-eligible records (cards do NOT
+		# share the tri cap) instead of the shipped `break` — else a dense near cube area hides every farther GEN card.
+		if CubeSphere.FP_STRUCT_CARDS and capped:
+			continue
 		if CubeSphere.FP_STRUCT_BAKE_STAGE and not _has_bake(rec):
 			continue        # staged: never-yet-shown house — its addition waits for the drain (removals never wait)
 		var bake := _ensure_bake(rec)
@@ -876,7 +910,9 @@ func _rebuild(reg: Array, cam_abs: Vector3) -> void:
 			continue
 		if tris + int(bake["tris"]) > CubeSphere.struct_far_tris_max():   # FP_STRUCT_COARSE_FAR: 24k under the flag, else 80k
 			capped = true
-			break
+			if CubeSphere.FP_STRUCT_CARDS:
+				continue                                       # cards on: keep scanning for card records past the cube cap
+			break                                              # cards off: shipped behaviour (byte-identical)
 		verts.append_array(bake["verts"])
 		colors.append_array(bake["colors"])
 		tris += int(bake["tris"])
@@ -884,10 +920,9 @@ func _rebuild(reg: Array, cam_abs: Vector3) -> void:
 	_commit_mesh(verts, colors)
 	if CubeSphere.FP_STRUCT_CARDS and _card_mm != null:
 		var _cu0 := Time.get_ticks_usec()
-		_card_mm.set_buffer(cbuf)                              # whole-buffer upload (the tree law — never set_instance_transform)
+		_card_mm.set_buffer(_card_cbuf)                       # whole-buffer upload (the tree law — never set_instance_transform)
 		_card_mm.visible_instance_count = cn
-		_dbg_card_us += int(Time.get_ticks_usec() - _cu0)
-		_last_card_buf = cbuf
+		_dbg_card_us = card_write_us + int(Time.get_ticks_usec() - _cu0)   # write loop + upload (st_crb_us)
 		_live_cards = cn
 		_card_capped = ccapped
 	if CubeSphere.FP_STRUCT_BAKE_STAGE:
@@ -909,6 +944,11 @@ func _card_eligible(rec: Dictionary, dist: float) -> bool:
 ## §7.3 the split floor. Under WALK_CALM + HANDOFF_HYST the hysteretic band code owns it (code 4 = card sub-band ⇒
 ## eligible; code 2 = cube sub-band ⇒ never), so the sink assignment can only change WITH a re-commit (the band-fp
 ## drift), never mid-hysteresis; otherwise the raw STRUCT_CARD_MIN edge (the "cards-all-the-way" A/B arm sets it 0.0).
+## CONFIG HAZARD: the retained inner cube band is [r0+CULL_ANNULUS, STRUCT_CARD_MIN). The served config r0=128
+## (CURVED_RENDER_RADIUS_BLOCKS) ⇒ annulus top 192 < 320, so the band is non-empty. If a future config makes
+## r0+CULL_ANNULUS ≥ STRUCT_CARD_MIN (e.g. the headless FLAT r0=256 ⇒ 320 == 320) the cube sub-band collapses and the
+## card sub-band owns everything past the annulus — correct, but the parallax band the design keeps for near houses
+## vanishes. Keep STRUCT_CARD_MIN > near_render_radius()+CULL_ANNULUS for the served arm.
 func _card_split_lo(rec: Dictionary) -> float:
 	if CubeSphere.FP_STRUCT_WALK_CALM and CubeSphere.FP_STRUCT_HANDOFF_HYST:
 		var code := int(_band.get(int(rec["root"]), -1))
@@ -1032,6 +1072,16 @@ func bake_stage_state() -> Dictionary:
 			"st_live": _live_structures}
 
 func _evict_stale_bakes(reg: Array) -> void:
+	# FP_STRUCT_CARDS: card houses NEVER bake (they carry no _baked entry), so the shipped _baked-keyed reap below can't
+	# drop their _band/_cull state — in a cards-all-the-way arm that grows unboundedly across facets. Under the flag,
+	# sweep _band/_cull against the LIVE registry here (independent of _baked). Off ⇒ this block is skipped and the
+	# shipped _baked-empty early-return + per-dropped-baked-root erase runs verbatim (byte-identical).
+	if CubeSphere.FP_STRUCT_CARDS and (not _cull.is_empty() or not _band.is_empty()):
+		var live0 := {}
+		for rec in reg:
+			live0[int(rec["root"])] = true
+		_reap_dict_keys(_cull, live0)
+		_reap_dict_keys(_band, live0)
 	if _baked.is_empty():
 		return
 	var live := {}
@@ -1046,6 +1096,15 @@ func _evict_stale_bakes(reg: Array) -> void:
 		_baked.erase(root)
 		_cull.erase(root)
 		_band.erase(root)   # FP_STRUCT_WALK_CALM: bound the band-code dict to live structures (no-op key off-flag)
+
+## Erase every key of `d` not present in `live` (bound a state dict to the live registry). Used for the card-root reap.
+static func _reap_dict_keys(d: Dictionary, live: Dictionary) -> void:
+	var drop: Array = []
+	for k in d.keys():
+		if not live.has(k):
+			drop.append(k)
+	for k in drop:
+		d.erase(k)
 
 # --- telemetry / ledger ---------------------------------------------------------------------------------------------
 func rebuild_count() -> int: return _dbg_rebuild_count
@@ -1063,8 +1122,9 @@ func card_state() -> Dictionary:
 	if not CubeSphere.FP_STRUCT_CARDS:
 		return {}
 	return {"st_ci": _live_cards, "st_cq": _card_capped, "st_crb_us": _dbg_card_us}
-## Gate read-back: the last rebuilt card instance buffer (the _last_buf convention, facet_far_trees.gd:1737).
-func debug_card_buffer() -> PackedFloat32Array: return _last_card_buf
+## Gate read-back: the persistent card instance buffer (slots [0, live_cards) are the last rebuild). Returned as a
+## COW reference — the gate READS it (no fork); a production caller holds no second reference so the buffer is reused.
+func debug_card_buffer() -> PackedFloat32Array: return _card_cbuf
 func card_mmi_visible() -> bool: return _card_mmi != null and _card_mmi.visible
 func card_shader_code_str() -> String: return card_shader_code()
 

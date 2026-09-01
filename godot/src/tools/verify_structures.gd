@@ -108,9 +108,11 @@ func _initialize() -> void:
 	_gate_card_off()
 	_gate_card_arch()
 	_gate_card_atlas()
+	_gate_card_shader()
 	_gate_card_emit()
 	_gate_card_split()
 	_gate_card_cull()
+	_gate_card_cubecap()
 	_gate_card_epoch()
 	_gate_card_oom()
 
@@ -1154,6 +1156,14 @@ func _card_sector(alpha: float) -> int:
 	var k: float = floor(alpha * (8.0 / TAU) + 0.5)
 	return int(fposmod(k + 8.0, 8.0))
 
+## The full in-shader sector-select twin (§8.1 corrected): ca = dot(fh, e_f), sa = dot(fh, e_s), col = round(atan2(−sa,
+## ca)·8/2π) mod 8. Mirrors _CARD_TAIL's `atan(-sa, ca)` (the mirror the raster convention x̂↦−e_f, ẑ↦+e_s requires).
+func _shader_sector(fh: Vector3, ef: Vector3, es: Vector3) -> int:
+	var ca := fh.dot(ef)
+	var sa := fh.dot(es)
+	var k: float = floor(atan2(-sa, ca) * (8.0 / TAU) + 0.5)
+	return int(fposmod(k + 8.0, 8.0))
+
 ## The first Earth facet with ≥ n generated houses, as {idx, fid, recs}. {} if none within the scan cap.
 func _find_houses(n: int) -> Dictionary:
 	var idx = SGI.new()
@@ -1259,6 +1269,51 @@ func _gate_card_atlas() -> void:
 				if not img.get_pixel(0 * SCK.TILE + xx, oy + yy).is_equal_approx(img.get_pixel(4 * SCK.TILE + xx, oy + yy)):
 					diff = true
 	_ok(diff, "G-ST-CARD-ATLAS: door view (0) ≠ back view (4) — the door is actually rasterized")
+
+## G-ST-CARD-SHADER — the CPU twin of the card vertex() math (the GPU shader can't compile headless): (1) the UV/UV2
+## local-corner reconstruction matches the mesh (the world_vertex_coords fix — VERTEX is world, reconstructed not read);
+## (2) the corrected sector select round(atan2(−sa,ca)·8/2π) picks atlas column k for the view-k camera direction (the
+## raster convention). Pure math + the static mesh ⇒ runs in BOTH flag states.
+func _gate_card_shader() -> void:
+	# (1) local-corner reconstruction (billboard: lx=UV.x−0.5, ly=1−UV.y; cap: lx=UV.x−0.5, lz=UV.y−0.5).
+	var mesh := FS._build_card_mesh()
+	var arr := mesh.surface_get_arrays(0)
+	var verts: PackedVector3Array = arr[Mesh.ARRAY_VERTEX]
+	var uvs: PackedVector2Array = arr[Mesh.ARRAY_TEX_UV]
+	var uv2s: PackedVector2Array = arr[Mesh.ARRAY_TEX_UV2]
+	var recon_ok := verts.size() == 8
+	for i in range(verts.size()):
+		var v := verts[i]
+		var uv := uvs[i]
+		var lx := uv.x - 0.5
+		if uv2s[i].x < 0.5:
+			if absf(lx - v.x) > 1e-5 or absf((1.0 - uv.y) - v.y) > 1e-5:
+				recon_ok = false
+		else:
+			if absf(lx - v.x) > 1e-5 or absf((uv.y - 0.5) - v.z) > 1e-5:
+				recon_ok = false
+	_ok(recon_ok, "G-ST-CARD-SHADER: UV/UV2 local-corner reconstruction matches the mesh (world_vertex_coords: VERTEX is world, never read as local)")
+	# (2) sector select matches the raster view convention.
+	var found := _find_house()
+	if found.is_empty():
+		_ok(false, "G-ST-CARD-SHADER: no house for the sector twin")
+		return
+	var rec: Dictionary = found["rec"]
+	var prec := FS.new()._precompute_card(rec)
+	if float(prec[0]) < 0.5:
+		_ok(false, "G-ST-CARD-SHADER: the fixture house is not card-eligible (unexpected)")
+		return
+	var o := Vector3(prec[5], prec[6], prec[7])
+	var ef := Vector3(prec[8], prec[9], prec[10])
+	var n := o.normalized()
+	var es := n.cross(ef).normalized()                   # e_s exactly as _write_card_inst derives it
+	var sect_ok := true
+	for k in range(8):
+		var ang := float(k) * (PI / 4.0)
+		var fh := ef * cos(ang) - es * sin(ang)          # the view-k toward-camera reference direction (world)
+		if _shader_sector(fh, ef, es) != k:
+			sect_ok = false
+	_ok(sect_ok, "G-ST-CARD-SHADER: round(atan2(−sa,ca)·8/2π) selects atlas column k for the view-k camera direction (raster convention)")
 
 ## G-ST-CARD-EMIT — one GEN house at dist 800 ⇒ exactly one card (flag on) / cube (flag off). Drives the REAL
 ## _resnapshot → _precompute_card → _rebuild card-sink chain (registry/version Callables, as WorldManager wires them).
@@ -1390,6 +1445,51 @@ func _gate_card_cull() -> void:
 			t2._rebuild([rec], cc - cc.normalized() * 800.0)
 			_ok(t2.live_cards() == 1,
 				"G-ST-CARD-CULL(on): a card beyond the near-mesh reach (dist 800) is emitted unprobed (COVERED is irrelevant)")
+		# (3) SHOULD-FIX 8: a dead card-only root's _band/_cull state is reaped against the live registry (no unbounded
+		# growth in a cards-all-the-way arm where card roots never get a _baked entry the shipped reap keys on).
+		var tr = FS.new(); tr.setup_instance(Node3D.new(), 0); tr.set_sampler(samp)
+		tr.set_near_query(func(_f: int, _b: AABB) -> int: return NearPresence.UNKNOWABLE)
+		tr._cull[-9999] = {"hidden": false, "cover": 0, "uncover": 0}   # stale card-only root (no _baked entry)
+		tr._band[-9999] = 4
+		tr._rebuild([], Vector3(1000.0, 0.0, 0.0))                      # empty registry ⇒ −9999 is dead
+		_ok(not tr._cull.has(-9999) and not tr._band.has(-9999),
+			"G-ST-CARD-CULL(on): a dead card-only root's _band/_cull state is reaped (bounded, no cross-facet leak)")
+
+## G-ST-CARD-CUBECAP (SHOULD-FIX 5) — the cube tri cap must NOT terminate the card sink: a dense near cube cluster that
+## fills STRUCT_FAR_TRIS_MAX must still leave a farther GEN card emitted (the nearest-first loop `continue`s past the
+## cube cap for card records instead of `break`ing). ON-only (the OFF break path is the shipped behaviour).
+func _gate_card_cubecap() -> void:
+	if not CubeSphere.FP_STRUCT_CARDS:
+		return
+	var g := _grass()
+	var found := _find_house()
+	if found.is_empty():
+		_ok(false, "G-ST-CARD-CUBECAP: no GEN house fixture")
+		return
+	# Checkerboard sampler ⇒ no two adjacent solids ⇒ no greedy face merge ⇒ ~10k tris per 12³ box (fills the 80k cube
+	# cap in a handful of boxes, cheaply). The cube houses carry POSITIVE roots ⇒ is_card 0 ⇒ the cube sink.
+	var samp := func(_f: int, c: Vector3i) -> int:
+		return g if ((c.x + c.y + c.z) & 1) == 0 else 0
+	var nearq := func(_f: int, _b: AABB) -> int: return NearPresence.UNKNOWABLE
+	var t = FS.new(); t.setup_instance(Node3D.new(), 0); t.set_sampler(samp); t.set_near_query(nearq)
+	var cardrec: Dictionary = (found["rec"] as Dictionary).duplicate()
+	var fid := int(cardrec["fid"])
+	var reg: Array = []
+	for k in range(12):
+		var bmin := Vector3i(100 + k * 20, 40, 100)
+		reg.append({"root": 700 + k, "fid": fid, "bmin": bmin, "bmax": bmin + Vector3i(11, 11, 11), "rev": 1})
+	cardrec["bmin"] = Vector3i(100, 40, 1600); cardrec["bmax"] = Vector3i(106, 46, 1606); cardrec["fid"] = fid
+	reg.append(cardrec)
+	for r in reg:
+		t._card_prec[int(r["root"])] = t._precompute_card(r)
+	var c0 := t._structure_centre(reg[0])
+	var cam := c0 - c0.normalized() * 500.0
+	_ok(t._structure_dist(cardrec, cam) > t._structure_dist(reg[0], cam) and t._structure_dist(cardrec, cam) < CubeSphere.STRUCT_FAR_MAX,
+		"G-ST-CARD-CUBECAP: the card house is farther than the cube cluster and in-band (nearest-first reaches cubes first)")
+	t._rebuild(reg, cam)
+	_ok(t._capped, "G-ST-CARD-CUBECAP: the checkerboard cube cluster fills the cube tri cap")
+	_ok(t.live_cards() == 1,
+		"G-ST-CARD-CUBECAP: the far GEN card STILL emits past the full cube cap (the cube cap no longer terminates the card scan)")
 
 ## G-ST-CARD-EPOCH — parked over a card village (same version) ⇒ zero card-buffer rewrites; a damage rev bump ⇒ one rebuild.
 func _gate_card_epoch() -> void:
@@ -1420,7 +1520,10 @@ func _gate_card_epoch() -> void:
 	_ok(t._prelude_epoch(cam, false), "G-ST-CARD-EPOCH: a damage rev bump ⇒ rebuild signalled the same step (never delayed)")
 	if on:
 		t._rebuild(t._snapshot, cam)
-		_ok(t.live_cards() == 1, "G-ST-CARD-EPOCH(on): after the edit the card is re-emitted (still 1)")
+		# A DAMAGED (rev != 0) GEN house drops OFF the card path onto the CUBE sink so the hole shows (a pristine card
+		# would hide the damage) — the SHOULD-FIX 7 guard in _precompute_card.
+		_ok(t.live_cards() == 0 and t.live_tris() > 0,
+			"G-ST-CARD-EPOCH(on): a damaged (rev-bumped) GEN house routes to the CUBE sink so the hole shows (not a pristine card)")
 
 ## G-ST-CARD-OOM — the NEVER-OOM ledger + the card cap. 4,000 synthetic card records ⇒ st_ci ≤ STRUCT_CARD_INST_MAX
 ## (cap respected, nearest-first) + total_bytes ≤ STRUCT_BYTES_MAX.

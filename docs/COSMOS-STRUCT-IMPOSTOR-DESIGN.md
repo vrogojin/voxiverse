@@ -454,6 +454,17 @@ uniforms — the :127-139 recipe verbatim).
 
 ### 8.1 Vertex — billboard on a sphere + in-shader view sector
 
+> **CORRECTED after the Fable+Codex review** (three defects the first draft encoded, all
+> verified against the shipped tree shader). (a) Under `world_vertex_coords` the vertex
+> shader *receives* `VERTEX` already in WORLD space (`MODEL·local`, ~planet-radius) — it
+> must **never** be read as the unit-quad local coord (that rendered planet-scale streaks).
+> The local corner is reconstructed from `UV`/`UV2`. (b) The canonical frame maps
+> `x̂ ↦ −e_f`, `ẑ ↦ +e_s`, so the azimuth is `α = atan2(−sa, ca)` (the `sa` is **mirrored**;
+> `atan2(sa,ca)` swapped left/right views). (c) The roof-cap `u` is canonical `+x̂ = −e_f`,
+> so the cap's local x is **negated** along `mx`. (d) The atlas tiles carry a 3-px pad, so
+> the tile-local UV is remapped onto the inset `[atlas_uv_lo, atlas_uv_lo+atlas_uv_span]`
+> before the lookup (else houses render ~0.81× and float ~0.09·H above the base).
+
 ```glsl
 shader_type spatial;
 render_mode cull_disabled, world_vertex_coords;
@@ -461,11 +472,13 @@ uniform sampler2D house_atlas : source_color, filter_nearest;
 uniform vec3 planet_centre = vec3(0.0);
 uniform float atlas_cols = 9.0;   // 8 azimuth + 1 top
 uniform float atlas_rows = 10.0;
+uniform float atlas_uv_lo = 0.109375;    // (PAD+0.5)/TILE          — 3-px pad inset (P1-4)
+uniform float atlas_uv_span = 0.78125;   // (TILE-2*PAD-1)/TILE
 // + VoxiLight.shade_glsl()  (defines sun_dir + voxi_shade)
 
 varying vec2 v_uv;
 varying vec3 v_n;
-varying flat float v_fade;
+// (+ varying flat float v_fade; only under FP_STRUCT_SHELL_BAND)
 
 void vertex() {
     // Instance frame from MODEL_MATRIX columns (world; ring transform + SN3 scale ride along):
@@ -478,7 +491,8 @@ void vertex() {
     float arch = floor(INSTANCE_CUSTOM.x);
     float w_s  = INSTANCE_CUSTOM.y;
     float w_f  = INSTANCE_CUSTOM.z;
-    v_fade     = INSTANCE_CUSTOM.w;
+    // Local unit-quad corner from UV/UV2 (VERTEX is WORLD here — reconstruct, never read it as local):
+    float lx = UV.x - 0.5;
 
     // Horizontal house→camera direction (billboard axis + azimuth source):
     vec3 vc  = CAMERA_POSITION_WORLD - o;
@@ -488,34 +502,39 @@ void vertex() {
 
     vec3 wp; float col;
     if (UV2.x < 0.5) {
-        // vertical billboard: right axis ⊥ (up, camera); width = projected box silhouette
+        float ly = 1.0 - UV.y;                     // ground (UV.y=1) → ly 0; top → ly 1
         vec3 raxis = normalize(cross(up_n, fh));
         float ca = dot(fh, normalize(mx));         // cos α  (α from e_f)
-        float sa = dot(fh, normalize(mz));         // sin α
+        float sa = dot(fh, normalize(mz));         // sin α  (from e_s)
         float halfw = 0.5 * (w_s * abs(ca) + w_f * abs(sa)) * s;
-        wp = o + raxis * (VERTEX.x * 2.0 * halfw) + my * VERTEX.y;   // VERTEX.x ∈ [-0.5,0.5]
-        float alpha = atan(sa, ca);                                  // (-π, π]
+        wp = o + raxis * (lx * 2.0 * halfw) + my * ly;
+        float alpha = atan(-sa, ca);               // canonical x̂↦−e_f, ẑ↦+e_s ⇒ mirror sa
         float k = floor(alpha * (8.0 / 6.2831853) + 0.5);
-        col = mod(k + 8.0, 8.0);                                     // sector 0..7
+        col = mod(k + 8.0, 8.0);                    // sector 0..7
     } else {
-        // roof cap: house-local tangent frame, NOT camera-facing
-        wp = o + mx * (VERTEX.x * w_f) + mz * (VERTEX.z * w_s) + my * VERTEX.y;
-        col = 8.0;                                                   // top-view column
+        float lz = UV.y - 0.5;
+        // roof cap: house-local tangent frame. Canonical +x̂ = −e_f ⇒ negate local x along mx.
+        wp = o + mx * (-(lx) * w_f) + mz * (lz * w_s) + my;
+        col = 8.0;                                  // top-view column
     }
-    VERTEX = wp;                                    // world_vertex_coords
-    v_uv = vec2((col + UV.x) / atlas_cols, (arch + UV.y) / atlas_rows);
+    VERTEX = wp;                                    // world_vertex_coords (WRITE only)
+    vec2 uv_in = atlas_uv_lo + UV * atlas_uv_span;  // remap tile-local UV onto the 3-px pad inset
+    v_uv = vec2((col + uv_in.x) / atlas_cols, (arch + uv_in.y) / atlas_rows);
     v_n  = normalize(wp - planet_centre);           // the ONE radial law (tree class doc :27-34)
 }
 ```
 
 Notes for the implementer:
-- `world_vertex_coords` is required (the tree cards bake orientation CPU-side and don't
-  need it; our billboard is computed in-shader). It is gl_compatibility-safe.
+- `world_vertex_coords` is required for the `VERTEX = wp` OUTPUT; under it VERTEX is read-
+  WORLD, so the local corner is reconstructed from UV/UV2 (never read from VERTEX). It is
+  gl_compatibility-safe.
 - All 8 verts of a quad compute the same `col`/`raxis` (same `o`) — no cross-vertex tear.
 - The sector snap means **camera rotation and orbiting rewrite NOTHING on the CPU** — the
   design's central economy (Codex §2, kept).
-- The `−mx` fallback for the overhead case is arbitrary-but-stable; the vertical quad is
-  edge-on there and the cap owns the pixels.
+- The `normalize(mx)` fallback for the overhead case is arbitrary-but-stable; the vertical
+  quad is edge-on there and the cap owns the pixels.
+- The sector math is gate-covered headless by a CPU twin (G-ST-CARD-SHADER): for the view-k
+  reference direction `fh_k = cos(α_k)·e_f − sin(α_k)·e_s`, `round(atan2(−sa,ca)·8/2π)` == k.
 
 ### 8.2 Fragment
 

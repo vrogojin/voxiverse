@@ -52,6 +52,7 @@ func _initialize() -> void:
 	_gate_schmitt()
 	_gate_walk_budget()
 	_gate_epoch_walk()
+	_gate_card_split_code()
 	print("=== VERIFY fartier_walk: ", _pass, " passed, ", _fail, " failed ===")
 	quit(1 if _fail > 0 else 0)
 
@@ -197,11 +198,14 @@ func _gate_schmitt() -> void:
 	var on := CubeSphere.FP_STRUCT_HANDOFF_HYST
 	var t = FS.new()
 	var r0 := float(TerrainConfig.near_render_radius())
-	var edge := CubeSphere.STRUCT_FAR_MAX            # the BAND|OUT edge (codes 2↔3)
+	var edge := CubeSphere.STRUCT_FAR_MAX            # the BAND|OUT edge (in-band code ↔ 3)
 	var w := CubeSphere.STRUCT_HYST_W
-	# Enter from below the edge (code 2 = BAND). prev latched by the previous call.
+	# Enter from below the edge. The in-band code just below STRUCT_FAR_MAX is 2 (cube band) normally, or 4 (the CARD
+	# sub-band) under FP_STRUCT_CARDS (the §7.3 split puts everything ≥ STRUCT_CARD_MIN in code 4). The Schmitt logic is
+	# identical for either code — only the expected in-band value differs.
+	var band := 4 if CubeSphere.FP_STRUCT_CARDS else 2
 	var prev := t._band_code(edge - 2.0 * w, r0, -1)
-	_ok(prev == 2, "G-WC-SCHMITT: just inside the edge classifies BAND (code 2)")
+	_ok(prev == band, "G-WC-SCHMITT: just inside the edge classifies the in-band code (%d)" % band)
 	# A single-block back-and-forth straddling the edge, feeding prev each time.
 	var flips := 0
 	var offs := [1.0, -1.0, 1.0, -1.0, 1.0, -1.0]    # ±1 blk around the edge (inside the dead-band)
@@ -314,3 +318,32 @@ func _gate_epoch_walk() -> void:
 		if t.live_structures() != 5:
 			stable = false
 	_ok(stable, "G-WC-EPOCH: a 200-blk no-crossing walk ⇒ the merged village stays complete (5 houses) every step (no drop)")
+
+# =====================================================================================================================
+# G-WC-CARD (FP_STRUCT_CARDS §7.3) — the cube→card split-edge fold into _band_code. OFF ⇒ no split (BAND stays code 2,
+# byte-identical); ON ⇒ the BAND zone splits at STRUCT_CARD_MIN into a CUBE sub-band (code 2) and a CARD sub-band
+# (code 4), with the Schmitt dead-band on the new edge under FP_STRUCT_HANDOFF_HYST. Drives the REAL _band_code with a
+# synthetic r0 (so the annulus top < STRUCT_CARD_MIN — the split has room, unlike the headless r0==CARD_MIN coincidence).
+# =====================================================================================================================
+func _gate_card_split_code() -> void:
+	_ok(CubeSphere.FP_STRUCT_CARDS == false or CubeSphere.FP_STRUCT_CARDS == true, "G-WC-CARD: FP_STRUCT_CARDS declared")
+	var cards := CubeSphere.FP_STRUCT_CARDS
+	var t = FS.new()
+	var r0 := 128.0                                # synthetic r0 ⇒ annulus top (192) < STRUCT_CARD_MIN (320): split room
+	var below := CubeSphere.STRUCT_CARD_MIN - 40.0
+	var above := CubeSphere.STRUCT_CARD_MIN + 40.0
+	var cb := t._band_code(below, r0, -1)
+	var ca := t._band_code(above, r0, -1)
+	if cards:
+		_ok(cb == 2, "G-WC-CARD(on): below STRUCT_CARD_MIN ⇒ CUBE sub-band (code 2)")
+		_ok(ca == 4, "G-WC-CARD(on): above STRUCT_CARD_MIN ⇒ CARD sub-band (code 4)")
+	else:
+		_ok(cb == 2 and ca == 2, "G-WC-CARD(off): no split ⇒ both BAND (code 2), byte-identical")
+	_ok(t._band_code(CubeSphere.STRUCT_FAR_MAX + 100.0, r0, -1) == 3, "G-WC-CARD: beyond STRUCT_FAR_MAX ⇒ OUT (code 3, both states)")
+	_ok(t._band_code(r0 - 10.0, r0, -1) == 0, "G-WC-CARD: inside r0 ⇒ FLOOR (code 0, both states)")
+	if cards and CubeSphere.FP_STRUCT_HANDOFF_HYST:
+		var w := CubeSphere.STRUCT_HYST_W
+		_ok(t._band_code(CubeSphere.STRUCT_CARD_MIN - 0.5 * w, r0, 4) == 4,
+			"G-WC-CARD(hyst): a CARD-latched house sticks across a sub-HYST_W dip below the split")
+		_ok(t._band_code(CubeSphere.STRUCT_CARD_MIN + 0.5 * w, r0, 2) == 2,
+			"G-WC-CARD(hyst): a CUBE-latched house sticks across a sub-HYST_W rise above the split")

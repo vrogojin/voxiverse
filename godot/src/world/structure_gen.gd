@@ -430,3 +430,17 @@ static func pack_root(fid: int, hx: int, hz: int) -> int:
 	var b := (hz << 1) ^ (hz >> 63)
 	var p := ((fid & 0xFFF) << 40) | ((a & 0xFFFFF) << 20) | (b & 0xFFFFF)
 	return -(1 + p)
+
+## The exact inverse of pack_root (docs/COSMOS-STRUCT-IMPOSTOR-DESIGN.md §6): recover [fid, hx, hz] from a NEGATIVE
+## GEN root so the far-card tier can re-derive a house's descriptor (StructureGen.house_info) from the registry record
+## alone. p = −root − 1; fid = (p >> 40) & 0xFFF; the 20-bit zigzag fields decode via (a >> 1) ^ −(a & 1). Pure /
+## flag-free; round-trips pack_root over any (fid, hx, hz) whose zigzag(hx)/zigzag(hz) fit the 20-bit fields (the
+## house-lattice indices reachable from the ≤ K-facet worldgen domain). Gate: G-ST-CARD-ARCH (round-trip sweep).
+static func unpack_root(root: int) -> Array:
+	var p := -root - 1
+	var fid := (p >> 40) & 0xFFF
+	var a := (p >> 20) & 0xFFFFF
+	var b := p & 0xFFFFF
+	var hx := (a >> 1) ^ -(a & 1)                       # zigzag⁻¹
+	var hz := (b >> 1) ^ -(b & 1)
+	return [fid, hx, hz]

@@ -1431,6 +1431,24 @@ const FP_STRUCT_XFADE := false               # Lever 2b: structures dither-alpha
 const STRUCT_XFADE_STEPS := 4                 # alpha quantisation steps per transition (≤ this many commits per event)
 const STRUCT_XFADE_STEP_MS := 80             # commit cadence while a fade is in flight
 
+## FP_STRUCT_CARDS (docs/COSMOS-STRUCT-IMPOSTOR-DESIGN.md) — the far-village impostor-card tier (Stage 2 of the
+## far-village perf fix). GEN houses (SOURCE_GEN, negative tracker root) beyond STRUCT_CARD_MIN render as DIRECTIONAL
+## impostor cards: ONE shared 4-triangle mesh (a camera-facing vertical quad + a planet-tangent roof cap) in ONE
+## MultiMeshInstance3D, textured from a CPU-rasterized archetype atlas, with the view sector chosen IN THE VERTEX
+## SHADER so camera rotation never rewrites the instance buffer. The merged-cube path retains the inner band
+## [r0, STRUCT_CARD_MIN) + ALL player-built (tracker root ≥ 0 / non-GEN source) structures at every distance. Off ⇒
+## the shipped merged-cube tier VERBATIM (byte-identical; FLAT 6042/0 — villages absent in FLAT regardless, and every
+## new line is behind the flag). Needs FP_STRUCT_FAR (+_GEN for any GEN record to exist) and is designed to run WITH
+## FP_STRUCT_REG_EPOCH (the card param precompute lives in _resnapshot). Composes with WALK_CALM/HANDOFF_HYST (§7) and
+## SHELL_BAND (§8.4). Gates: verify_structures.gd (G-ST-CARD-*) + verify_fartier_walk.gd (split-edge fingerprint).
+const FP_STRUCT_CARDS := false               # far-village impostor-card tier (data-plane swap)
+const STRUCT_CARD_MIN := 320.0               # cube→card split radius (blocks); the A/B "cards-all-the-way" arm sets 0.0
+const STRUCT_CARD_INST_MAX := 2048           # card MultiMesh instance cap (nearest-first fill)
+const STRUCT_CARD_TILE := 32                 # atlas texels per tile (32² RGBA8)
+const STRUCT_CARD_AZIMUTHS := 8              # side views per archetype (45° sectors, snap-select in-shader)
+const STRUCT_CARD_ARCHES := 10               # §3: 2 flat + 8 gabled canonical archetypes
+const STRUCT_CARD_FADE_W := 16.0             # P2 (optional) cube↔card dither cross-fade half-width (blocks)
+
 ## FP_DEM_DEFER (docs/COSMOS-STREAM-PARALLEL-DESIGN.md Phase A — the fresh-reload fix) — the whole-planet coarse
 ## DEM (`FP_GLOBAL_RELIEF_DATA` / `GlobalReliefData.step`) is frame-budget GATED but the admitted unit is UNBOUNDED
 ## on the main thread (an O(3456) allocating `_next_unbaked` scan + a `bake_smooth_tile` + a 1089-node hillshade =

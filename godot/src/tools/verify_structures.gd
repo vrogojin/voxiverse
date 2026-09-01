@@ -17,6 +17,7 @@ const ST := preload("res://src/world/structure_tracker.gd")
 const SD := preload("res://src/world/struct_decimator.gd")
 const FS := preload("res://src/world/facet_far_structures.gd")
 const FA := preload("res://src/cosmos/facet_atlas.gd")
+const SCK := preload("res://src/world/struct_card_kit.gd")
 
 var _pass := 0
 var _fail := 0
@@ -99,6 +100,19 @@ func _initialize() -> void:
 	# spike fix). Proves the version gate never DROPS or DELAYS a real change vs the shipped registry-every-step
 	# prelude, across a walk / an edit (rev bump) / a crossing (wanted-band re-select), and short-circuits when quiescent.
 	_gate_epoch()
+
+	# COSMOS STRUCT-IMPOSTOR (docs/COSMOS-STRUCT-IMPOSTOR-DESIGN.md §11, FP_STRUCT_CARDS) — the far-village impostor-card
+	# tier. Flag-aware (the G-ST-STAGE/HOLD convention): OFF asserts byte-identical (no card node / no card in the sink);
+	# ON asserts the card emission, split, cull guard, epoch stability + the NEVER-OOM ledger. The pure kit (arch/atlas/
+	# unpack_root) is exercised in BOTH states. Needs FP_STRUCT_REG_EPOCH ON when FP_STRUCT_CARDS is (the §6 coupling).
+	_gate_card_off()
+	_gate_card_arch()
+	_gate_card_atlas()
+	_gate_card_emit()
+	_gate_card_split()
+	_gate_card_cull()
+	_gate_card_epoch()
+	_gate_card_oom()
 
 	print("=== VERIFY structures: ", _pass, " passed, ", _fail, " failed ===")
 	quit(1 if _fail > 0 else 0)
@@ -1129,3 +1143,312 @@ func _ship_prelude(t, cam: Vector3) -> void:
 func _epoch_prelude(t, cam: Vector3) -> void:
 	if t._prelude_epoch(cam, false):
 		t._rebuild(t._snapshot, cam)
+
+# =====================================================================================================================
+# G-ST-CARD-* (FP_STRUCT_CARDS — docs/COSMOS-STRUCT-IMPOSTOR-DESIGN.md §11) — the far-village impostor-card tier.
+# =====================================================================================================================
+
+## The GLSL sector-select mirror (§8.1): the archetype azimuth column from the house→camera azimuth α. Used by the
+## atan-wrap check (risk 10) so the ±π boundary is proven CPU-side.
+func _card_sector(alpha: float) -> int:
+	var k: float = floor(alpha * (8.0 / TAU) + 0.5)
+	return int(fposmod(k + 8.0, 8.0))
+
+## The first Earth facet with ≥ n generated houses, as {idx, fid, recs}. {} if none within the scan cap.
+func _find_houses(n: int) -> Dictionary:
+	var idx = SGI.new()
+	var earth_n := 6 * FA.K * FA.K
+	for fid in range(mini(earth_n, 2000)):
+		var recs: Array = idx.enumerate_facet(fid)
+		if recs.size() >= n:
+			return {"idx": idx, "fid": fid, "recs": recs}
+	return {}
+
+## G-ST-CARD-OFF — flag-off byte-identity of the tier construction + confound-free telemetry (both flag states self-describe).
+func _gate_card_off() -> void:
+	var on := CubeSphere.FP_STRUCT_CARDS
+	_ok(CubeSphere.FP_STRUCT_CARDS == false or CubeSphere.FP_STRUCT_CARDS == true, "G-ST-CARD-OFF: FP_STRUCT_CARDS declared")
+	var tier = FS.new()
+	tier.setup_instance(Node3D.new(), 0)
+	if on:
+		_ok(tier._card_mmi != null, "G-ST-CARD-OFF(on): the card MMI is constructed under the flag")
+		_ok(tier.draw_count() == 2, "G-ST-CARD-OFF(on): draw_count == 2 (merged cube mesh + card MMI)")
+		_ok(not tier.card_state().is_empty(), "G-ST-CARD-OFF(on): card_state() populated")
+	else:
+		_ok(tier._card_mmi == null, "G-ST-CARD-OFF(off): NO card node constructed (byte-identical)")
+		_ok(tier._card_prec.is_empty(), "G-ST-CARD-OFF(off): _card_prec empty (never filled)")
+		_ok(tier.card_state().is_empty(), "G-ST-CARD-OFF(off): card_state() empty (confound-free telemetry)")
+		_ok(tier.draw_count() == 1, "G-ST-CARD-OFF(off): draw_count == 1 (shipped LOD-A cube tier)")
+
+## G-ST-CARD-ARCH — arch_index total + injective + round-trips; unpack_root round-trips pack_root; atan sector wrap. PURE.
+func _gate_card_arch() -> void:
+	var seen: Dictionary = {}
+	var ok_all := true
+	# flat archetypes: roof 0, wall_h ∈ {3,4}.
+	for wall_h in [3, 4]:
+		var i := SCK.arch_index(0, wall_h, 0)
+		if i < 0 or i >= 10 or seen.has(i):
+			ok_all = false
+		seen[i] = true
+		var p := SCK.arch_params(i)
+		if int(p["roof"]) != 0 or int(p["wall_h"]) != wall_h:
+			ok_all = false
+	# gabled: roof 1, wall_h ∈ {3,4}, d ∈ [5,11] ⇒ gable_h = d/2 ∈ {2..5}.
+	var gab: Dictionary = {}
+	for wall_h in [3, 4]:
+		for d in range(5, 12):
+			var gable_h := int(d / 2)
+			var i := SCK.arch_index(1, wall_h, gable_h)
+			if i < 2 or i >= 10:
+				ok_all = false
+			var trip := "1_%d_%d" % [wall_h, gable_h]
+			if gab.has(i) and gab[i] != trip:
+				ok_all = false                        # a distinct triple must not collide onto the same index
+			gab[i] = trip
+			seen[i] = true
+			var p := SCK.arch_params(i)
+			if int(p["roof"]) != 1 or int(p["wall_h"]) != wall_h or int(p["gable_h"]) != gable_h:
+				ok_all = false
+	_ok(ok_all, "G-ST-CARD-ARCH: arch_index total + injective over the reachable space, round-trips arch_params")
+	_ok(seen.size() == 10, "G-ST-CARD-ARCH: exactly 10 distinct archetypes reached")
+	# unpack_root round-trips pack_root over a signed sweep.
+	var rt := true
+	for fid in [0, 1, 500, 3455]:
+		for hx in [-4242, -100, -1, 0, 1, 7, 4242]:
+			for hz in [-4242, -7, 0, 1, 100, 4242]:
+				var root := SG.pack_root(fid, hx, hz)
+				var u := SG.unpack_root(root)
+				if int(u[0]) != fid or int(u[1]) != hx or int(u[2]) != hz:
+					rt = false
+	_ok(rt, "G-ST-CARD-ARCH: unpack_root(pack_root(fid,hx,hz)) round-trips over a signed sweep")
+	# atan sector wrap (risk 10): α at ±π lands in ONE sector (no 0↔7 flicker).
+	_ok(_card_sector(PI - 0.001) == _card_sector(-PI + 0.001),
+		"G-ST-CARD-ARCH: atan sector — α at ±π maps to one sector (mod wrap, no flicker)")
+
+## G-ST-CARD-ATLAS — the atlas builds; 90 tiles each with opaque texels; 3-px pad (no border touch); door ≠ back view. PURE.
+func _gate_card_atlas() -> void:
+	var atlas := SCK.build_atlas()
+	_ok(atlas != null, "G-ST-CARD-ATLAS: atlas builds")
+	var img := atlas.get_image()
+	var wpx := SCK.COLS * SCK.TILE
+	var hpx := SCK.ROWS * SCK.TILE
+	_ok(img.get_width() == wpx and img.get_height() == hpx, "G-ST-CARD-ATLAS: atlas is %d×%d" % [wpx, hpx])
+	_ok(img.get_data().size() == wpx * hpx * 4, "G-ST-CARD-ATLAS: image bytes == %d (RGBA8)" % (wpx * hpx * 4))
+	var all_op := true
+	var no_border := true
+	for a in range(SCK.ROWS):
+		for v in range(SCK.COLS):
+			var ox := v * SCK.TILE
+			var oy := a * SCK.TILE
+			var opq := 0
+			for yy in range(SCK.TILE):
+				for xx in range(SCK.TILE):
+					if img.get_pixel(ox + xx, oy + yy).a > 0.5:
+						opq += 1
+						if xx == 0 or yy == 0 or xx == SCK.TILE - 1 or yy == SCK.TILE - 1:
+							no_border = false
+			if opq == 0:
+				all_op = false
+	_ok(all_op, "G-ST-CARD-ATLAS: every one of the %d tiles has > 0 opaque texels" % (SCK.ROWS * SCK.COLS))
+	_ok(no_border, "G-ST-CARD-ATLAS: no opaque texel touches a tile border (3-px pad, filter_nearest seam-safe)")
+	var diff := false
+	for a in range(SCK.ROWS):
+		var oy := a * SCK.TILE
+		for yy in range(SCK.TILE):
+			for xx in range(SCK.TILE):
+				if not img.get_pixel(0 * SCK.TILE + xx, oy + yy).is_equal_approx(img.get_pixel(4 * SCK.TILE + xx, oy + yy)):
+					diff = true
+	_ok(diff, "G-ST-CARD-ATLAS: door view (0) ≠ back view (4) — the door is actually rasterized")
+
+## G-ST-CARD-EMIT — one GEN house at dist 800 ⇒ exactly one card (flag on) / cube (flag off). Drives the REAL
+## _resnapshot → _precompute_card → _rebuild card-sink chain (registry/version Callables, as WorldManager wires them).
+func _gate_card_emit() -> void:
+	var on := CubeSphere.FP_STRUCT_CARDS
+	var found := _find_house()
+	if found.is_empty():
+		_ok(false, "G-ST-CARD-EMIT: no generated house found (fixture)")
+		return
+	var rec: Dictionary = found["rec"]
+	var reg_src := FakeReg.new()
+	reg_src.set_records([rec.duplicate()])
+	var samp := func(_f: int, _c: Vector3i) -> int: return _grass()
+	var nearq := func(_f: int, _b: AABB) -> int: return NearPresence.UNKNOWABLE
+	var t = FS.new(); t.setup_instance(Node3D.new(), 0); t.set_sampler(samp); t.set_near_query(nearq)
+	t.set_registry_query(Callable(reg_src, "registry")); t.set_version_query(Callable(reg_src, "version"))
+	var centre := t._structure_centre(rec)
+	var cam := centre - centre.normalized() * 800.0
+	_epoch_prelude(t, cam)
+	if not on:
+		_ok(t.live_cards() == 0 and t.debug_card_buffer().is_empty(),
+			"G-ST-CARD-EMIT(off): no card emitted (cube path, byte-identical)")
+		_ok(t.live_structures() == 1 and t.live_tris() > 0, "G-ST-CARD-EMIT(off): the GEN house renders on the merged-cube mesh")
+		return
+	# ON — exactly one card, NOT in the cube mesh (one sink).
+	_ok(t.live_cards() == 1, "G-ST-CARD-EMIT(on): exactly 1 card instance for the GEN house")
+	_ok(t.live_tris() == 0, "G-ST-CARD-EMIT(on): the card house is NOT in the merged-cube mesh (one sink)")
+	var buf := t.debug_card_buffer()
+	var by := Vector3(buf[1], buf[5], buf[9])            # basis-Y column (n̂·H)
+	var o := Vector3(buf[3], buf[7], buf[11])            # origin
+	var n := o.normalized()
+	var H := float((rec["bmax"] as Vector3i).y - (rec["bmin"] as Vector3i).y + 1)
+	_ok(by.normalized().dot(n) > 0.999, "G-ST-CARD-EMIT(on): basis-Y ∥ the origin radial (sphere billboard up-axis)")
+	_ok(absf(by.length() - H) < 1e-2, "G-ST-CARD-EMIT(on): |basis-Y| == house height H")
+	# origin == the SAME lattice_to_world(+datum_lift) base-centre law _ensure_bake uses (risk 4 — no vertical pop).
+	var bmin: Vector3i = rec["bmin"]; var bmax: Vector3i = rec["bmax"]
+	var cxr := (float(bmin.x) + float(bmax.x) + 1.0) * 0.5
+	var czr := (float(bmin.z) + float(bmax.z) + 1.0) * 0.5
+	var byr := float(bmin.y)
+	if CubeSphere.FP_FT_FRAME_WELD:
+		byr += FA.datum_lift(int(rec["fid"]), cxr, czr)
+	var wr := FA.lattice_to_world64(int(rec["fid"]), cxr, byr, czr)
+	_ok(o.distance_to(Vector3(wr[0], wr[1], wr[2])) < 1e-3, "G-ST-CARD-EMIT(on): origin == the ensure_bake base-centre law (±1e-3)")
+	# custom == (arch, w_s, w_f, 1.0) with the door-2/3 w/d swap.
+	var up := SG.unpack_root(int(rec["root"]))
+	var hi := SG.house_info(int(up[1]), int(up[2]), TerrainConfig.GenCtx.new(0, int(up[0])))
+	var door := int(hi["door"])
+	var exp_arch := SCK.arch_index(int(hi["roof"]), int(hi["wall_h"]), int(hi["gable_h"]))
+	var exp_wf := float(hi["w"]) if door <= 1 else float(hi["d"])
+	var exp_ws := float(hi["d"]) if door <= 1 else float(hi["w"])
+	_ok(int(buf[12]) == exp_arch, "G-ST-CARD-EMIT(on): custom.x == arch_index of the house")
+	_ok(is_equal_approx(buf[13], exp_ws) and is_equal_approx(buf[14], exp_wf),
+		"G-ST-CARD-EMIT(on): custom (w_s, w_f) pre-swapped per door=%d (§3.3)" % door)
+	_ok(buf[15] == 1.0, "G-ST-CARD-EMIT(on): custom.w (fade) == 1.0 in P0")
+
+## G-ST-CARD-SPLIT — two GEN houses (real roots, overridden bboxes): one below the split (cube), one above (card);
+## a camera sweep across STRUCT_CARD_MIN ± 2·STRUCT_HYST_W keeps the total emitted count constant (one sink, never
+## dropped/doubled). Injects _card_prec via _precompute_card + drives _rebuild directly (deterministic, no worker).
+func _gate_card_split() -> void:
+	var on := CubeSphere.FP_STRUCT_CARDS
+	var found := _find_houses(2)
+	if found.is_empty():
+		_ok(false, "G-ST-CARD-SPLIT: no facet with ≥2 generated houses (fixture)")
+		return
+	var recs: Array = found["recs"]
+	var fid := int(found["fid"])
+	# rec0 (near, sweeps across the split) + rec1 (far, always card), 700 blocks apart in z on the owner facet.
+	var r0d: Dictionary = (recs[0] as Dictionary).duplicate(); r0d["bmin"] = Vector3i(100, 40, 100); r0d["bmax"] = Vector3i(106, 46, 106); r0d["fid"] = fid
+	var r1d: Dictionary = (recs[1] as Dictionary).duplicate(); r1d["bmin"] = Vector3i(100, 40, 800); r1d["bmax"] = Vector3i(106, 46, 806); r1d["fid"] = fid
+	var samp := func(_f: int, _c: Vector3i) -> int: return _grass()
+	var nearq := func(_f: int, _b: AABB) -> int: return NearPresence.UNKNOWABLE
+	var t = FS.new(); t.setup_instance(Node3D.new(), 0); t.set_sampler(samp); t.set_near_query(nearq)
+	# populate _card_prec directly (bypasses _resnapshot; the same rows _resnapshot would compute).
+	t._card_prec[int(r0d["root"])] = t._precompute_card(r0d)
+	t._card_prec[int(r1d["root"])] = t._precompute_card(r1d)
+	var reg: Array = [r0d, r1d]
+	var c0 := t._structure_centre(r0d)
+	var rdir := c0.normalized()
+	# below the split (dist 300 < 320): rec0 cube; above (dist 340 > 320): rec0 card. rec1 stays far (card).
+	if not on:
+		# OFF: both are cube path (is_card 0 ⇒ _precompute_card returns is_card 0); no cards ever.
+		t._rebuild(reg, c0 - rdir * 340.0)
+		_ok(t.live_cards() == 0, "G-ST-CARD-SPLIT(off): no card emitted at any distance (byte-identical cube path)")
+		return
+	# ON — rec0 cube at dist 300, card at dist 340.
+	t._rebuild(reg, c0 - rdir * 300.0)
+	var rec0_cube := t.live_tris() > 0 and t.live_cards() == 1        # rec0 cube, rec1 card
+	t._rebuild(reg, c0 - rdir * 340.0)
+	var rec0_card := t.live_cards() == 2 and t.live_tris() == 0       # both card
+	_ok(rec0_cube, "G-ST-CARD-SPLIT(on): a house below STRUCT_CARD_MIN renders on the merged-cube mesh (not the card buffer)")
+	_ok(rec0_card, "G-ST-CARD-SPLIT(on): the same house beyond STRUCT_CARD_MIN renders as a card (not the mesh) — the split")
+	# exactly-one-sink invariant across a camera sweep over STRUCT_CARD_MIN ± 2·STRUCT_HYST_W (nothing dropped/doubled).
+	var w := CubeSphere.STRUCT_HYST_W
+	var constant := true
+	var steps := 24
+	for s in range(steps + 1):
+		var d := (CubeSphere.STRUCT_CARD_MIN - 2.0 * w) + (4.0 * w) * float(s) / float(steps)
+		t._rebuild(reg, c0 - rdir * d)
+		var total := t.live_cards() + (1 if t.live_tris() > 0 else 0)   # rec0 sink + rec1 (card)
+		if total != 2:
+			constant = false
+	_ok(constant, "G-ST-CARD-SPLIT(on): total emitted == 2 across a sweep over STRUCT_CARD_MIN ± 2·STRUCT_HYST_W (one sink, never dropped/doubled)")
+
+## G-ST-CARD-CULL — the load-bearing player-built guard (risk 6) + the beyond-near-reach card is never spuriously culled.
+func _gate_card_cull() -> void:
+	var on := CubeSphere.FP_STRUCT_CARDS
+	var samp := func(_f: int, _c: Vector3i) -> int: return _grass()
+	# (1) player-built (root ≥ 0) at a card distance ⇒ merged-cube path, NEVER a card (risk 6, the §6.1 guard).
+	var t = FS.new(); t.setup_instance(Node3D.new(), 0); t.set_sampler(samp)
+	t.set_near_query(func(_f: int, _b: AABB) -> int: return NearPresence.UNKNOWABLE)
+	# a POSITIVE (player-built / tracker) root — no house_info, unique geometry ⇒ the cube path owns it at every distance.
+	var pb := {"root": 42, "fid": 0, "bmin": Vector3i(100, 40, 100), "bmax": Vector3i(106, 46, 106), "rev": 1}
+	if CubeSphere.FP_STRUCT_CARDS:
+		t._card_prec[42] = t._precompute_card(pb)         # is_card MUST be 0 (positive root)
+		_ok(float(t._card_prec[42][0]) < 0.5, "G-ST-CARD-CULL: a positive-root (player-built) record precomputes is_card == 0")
+	var c := t._structure_centre(pb)
+	t._rebuild([pb], c - c.normalized() * 800.0)
+	_ok(t.live_cards() == 0 and t.live_tris() > 0,
+		"G-ST-CARD-CULL: a player-built structure at card distance renders on the cube mesh, NEVER the card buffer")
+	# (2) a GEN card beyond the near-mesh reach is emitted UNPROBED — a COVERED near-query must NOT cull it (near can't reach).
+	if on:
+		var found := _find_house()
+		if not found.is_empty():
+			var rec: Dictionary = found["rec"]
+			var t2 = FS.new(); t2.setup_instance(Node3D.new(), 0); t2.set_sampler(samp)
+			t2.set_near_query(func(_f: int, _b: AABB) -> int: return NearPresence.COVERED)   # near CLAIMS covered
+			t2._card_prec[int(rec["root"])] = t2._precompute_card(rec)
+			var cc := t2._structure_centre(rec)
+			t2._rebuild([rec], cc - cc.normalized() * 800.0)
+			_ok(t2.live_cards() == 1,
+				"G-ST-CARD-CULL(on): a card beyond the near-mesh reach (dist 800) is emitted unprobed (COVERED is irrelevant)")
+
+## G-ST-CARD-EPOCH — parked over a card village (same version) ⇒ zero card-buffer rewrites; a damage rev bump ⇒ one rebuild.
+func _gate_card_epoch() -> void:
+	var on := CubeSphere.FP_STRUCT_CARDS
+	var found := _find_house()
+	if found.is_empty():
+		_ok(false, "G-ST-CARD-EPOCH: no generated house found (fixture)")
+		return
+	var rec: Dictionary = found["rec"]
+	var reg_src := FakeReg.new()
+	reg_src.set_records([rec.duplicate()])
+	var samp := func(_f: int, _c: Vector3i) -> int: return _grass()
+	var nearq := func(_f: int, _b: AABB) -> int: return NearPresence.UNKNOWABLE
+	var t = FS.new(); t.setup_instance(Node3D.new(), 0); t.set_sampler(samp); t.set_near_query(nearq)
+	t.set_registry_query(Callable(reg_src, "registry")); t.set_version_query(Callable(reg_src, "version"))
+	var centre := t._structure_centre(rec)
+	var cam := centre - centre.normalized() * 800.0
+	_epoch_prelude(t, cam)
+	var cards0 := t.live_cards()
+	if on:
+		_ok(cards0 == 1, "G-ST-CARD-EPOCH(on): prime — the card village merges (1 card)")
+	# PARKED — same version, empty annulus (card band) ⇒ O(1) skip (no re-probe, no re-commit).
+	var rb := t.rebuild_count()
+	var did := t._prelude_epoch(cam, false)
+	_ok(not did and t.rebuild_count() == rb, "G-ST-CARD-EPOCH: parked over a card village (same version) ⇒ O(1) skip (no re-commit)")
+	# EDIT — a damage rev bump advances the version; the epoch prelude signals a rebuild THIS step.
+	reg_src.bump_edit(int(rec["root"]))
+	_ok(t._prelude_epoch(cam, false), "G-ST-CARD-EPOCH: a damage rev bump ⇒ rebuild signalled the same step (never delayed)")
+	if on:
+		t._rebuild(t._snapshot, cam)
+		_ok(t.live_cards() == 1, "G-ST-CARD-EPOCH(on): after the edit the card is re-emitted (still 1)")
+
+## G-ST-CARD-OOM — the NEVER-OOM ledger + the card cap. 4,000 synthetic card records ⇒ st_ci ≤ STRUCT_CARD_INST_MAX
+## (cap respected, nearest-first) + total_bytes ≤ STRUCT_BYTES_MAX.
+func _gate_card_oom() -> void:
+	var on := CubeSphere.FP_STRUCT_CARDS
+	var t = FS.new(); t.setup_instance(Node3D.new(), 0)
+	t.set_near_query(func(_f: int, _b: AABB) -> int: return NearPresence.UNKNOWABLE)
+	_ok(t.total_bytes() <= CubeSphere.STRUCT_BYTES_MAX, "G-ST-CARD-OOM: fresh tier total_bytes within the 8 MB ceiling")
+	if not on:
+		_ok(t.card_state().is_empty(), "G-ST-CARD-OOM(off): no card ledger (byte-identical)")
+		return
+	# 4,000 card-eligible records clustered on facet 0 (all in the card band from one camera). Inject valid card precs.
+	var fb := FA.frame_basis(0)
+	var e_f := -fb.x
+	var reg: Array = []
+	for k in range(4000):
+		var bmin := Vector3i(100 + (k % 60), 40, 100 + int(k / 60))
+		var bmax := bmin + Vector3i(6, 6, 6)
+		var root := -(100000 + k)                         # distinct fabricated negative roots (dict keys)
+		reg.append({"root": root, "fid": 0, "source": SG.SOURCE_GEN, "bmin": bmin, "bmax": bmax, "rev": 1})
+		var cxw := (float(bmin.x) + float(bmax.x) + 1.0) * 0.5
+		var czw := (float(bmin.z) + float(bmax.z) + 1.0) * 0.5
+		var wr := FA.lattice_to_world64(0, cxw, float(bmin.y), czw)
+		t._card_prec[root] = PackedFloat32Array([1.0, 0.0, 6.0, 6.0, 7.0, float(wr[0]), float(wr[1]), float(wr[2]), e_f.x, e_f.y, e_f.z, 0.0])
+	var c0 := t._structure_centre(reg[0])
+	var cam := c0 - c0.normalized() * 800.0
+	t._rebuild(reg, cam)
+	_ok(t.live_cards() == CubeSphere.STRUCT_CARD_INST_MAX and t.card_capped(),
+		"G-ST-CARD-OOM(on): st_ci == STRUCT_CARD_INST_MAX (cap respected, nearest-first) under a 4,000-record registry")
+	_ok(t.total_bytes() <= CubeSphere.STRUCT_BYTES_MAX,
+		"G-ST-CARD-OOM(on): total_bytes (cap-full buffer + atlas + prec) ≤ STRUCT_BYTES_MAX")

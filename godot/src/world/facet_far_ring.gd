@@ -6257,7 +6257,16 @@ func worst_frame_markers() -> Dictionary:
 	# FP_STRUCT_REG_EPOCH observability: the last far-structure step() prelude cost (µs), measured in ALL flag states
 	# (a cheap leaf int — never allocates) so the un-gated prelude spike over a village is never invisible again.
 	var st_step_us: int = (_far_structures.step_us() if _far_structures != null else 0)
-	return {"st_bms": st_bms, "smooth_v2_commit_ms": sv2, "ftr_rb": ftr_rb, "st_rb": st_rb, "st_step_us": st_step_us}
+	# FP_STRUCT_CARDS observability: live card instances / cap hit / card-sink self-time (µs) in the last _rebuild.
+	# {} off-flag ⇒ these fold nothing (the card_state() precedent); leaf reads, no allocation on the hot path.
+	var out := {"st_bms": st_bms, "smooth_v2_commit_ms": sv2, "ftr_rb": ftr_rb, "st_rb": st_rb, "st_step_us": st_step_us}
+	if _far_structures != null:
+		var cs = _far_structures.card_state()
+		if cs is Dictionary and not (cs as Dictionary).is_empty():
+			out["st_ci"] = int((cs as Dictionary)["st_ci"])
+			out["st_cq"] = bool((cs as Dictionary)["st_cq"])
+			out["st_crb_us"] = int((cs as Dictionary)["st_crb_us"])
+	return out
 
 ## docs/COSMOS-ORBIT-RELIEF-MESH-DESIGN.md WS3 (task #99 G3): feed the current Sun direction into G3's OWN
 ## ShaderMaterial (a separate material from V2's/the shell's — see facet_orbit_relief.gd's shader doc) so its

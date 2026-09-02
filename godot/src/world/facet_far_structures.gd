@@ -1051,6 +1051,11 @@ func _rebuild(reg: Array, cam_abs: Vector3, use_centres := false) -> void:
 	# (the timer, the distance buffer, the indexed argsort/reuse loop, the NAN-reuse cull calls, the staged telemetry,
 	# the wake latch). Off ⇒ the shipped body below runs VERBATIM (pre-Stage-3) — NO new execution or allocation, so the
 	# flag-off arm is a clean perf control (Codex P1e). Do not fold the two paths back together.
+	#
+	# ⚠ MAINTENANCE (deliberate duplication — correctness > DRY): the emit/commit SINK below (card sink, cube tri-cap
+	# continue-scan, _commit_mesh, the ledger/telemetry tail) is DUPLICATED in _rebuild_staged. A single shared loop was
+	# rejected so the flag-off path stays byte-for-byte the pre-Stage-3 body (Codex P1e). Any change to the sink logic
+	# (a new sink, a cap rule, a commit step) MUST be made in BOTH _rebuild AND _rebuild_staged or they will diverge.
 	if CubeSphere.FP_STRUCT_CARD_STAGE:
 		_rebuild_staged(reg, cam_abs, use_centres)
 		return
@@ -1132,6 +1137,8 @@ func _rebuild(reg: Array, cam_abs: Vector3, use_centres := false) -> void:
 ## S2/S4: the FP_STRUCT_CARD_STAGE _rebuild — a tie-stable precomputed-distance argsort off _centres (S2 §7, the sort
 ## bomb fix) + the wake fade-in latch ATOMIC with the buffer publish (S4 §8). Reached ONLY from _rebuild under the flag,
 ## so every construct here is flag-on-only (the flag-off arm never allocates the distance buffer or reads the clock).
+## ⚠ MAINTENANCE: the emit/commit SINK below is a DELIBERATE DUPLICATE of _rebuild's shipped-path sink (kept separate so
+## the flag-off path stays byte-for-byte pre-Stage-3 — Codex P1e). Any sink/cap/commit change MUST be mirrored in BOTH.
 func _rebuild_staged(reg: Array, cam_abs: Vector3, use_centres: bool) -> void:
 	var _sort_t0 := Time.get_ticks_usec()
 	var staged_sort := use_centres and reg.size() == _centres.size() and reg.size() > 0

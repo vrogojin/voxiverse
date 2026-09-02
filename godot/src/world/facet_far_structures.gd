@@ -58,6 +58,32 @@ var _card_capped := false                      # last rebuild hit STRUCT_CARD_IN
 var _dbg_card_us := 0                           # card-sink self-time inside the last _rebuild (µs) — st_crb_us
 var _card_cbuf: PackedFloat32Array = PackedFloat32Array()       # persistent card instance buffer (reused, resized once — no per-rebuild 128 KB alloc). Gate read-back reads this directly (a second held reference would force a COW fork every rebuild).
 
+# FP_STRUCT_CARD_STAGE / FP_STRUCT_CARD_ALT_BAND telemetry (all 0 off-flag). st_sort_us = _rebuild ordering time;
+# st_mat_us = the last snapshot materialize (registry duplicate); st_prec_us = the last precompute drain pass.
+var _dbg_sort_us := 0
+var _dbg_mat_us := 0
+var _dbg_prec_us := 0
+
+# FP_STRUCT_CARD_STAGE (§6): double-buffered snapshot drain (all inert off-flag). `_snap_next/_centres_next/_card_prec_
+# next/_snap_next_rev_sum` are the fill-in-progress buffers; the LIVE _snapshot/_centres/_card_prec keep rendering until
+# the swap. `_snap_fill` is the drain cursor (−1 idle); `_snap_fill_ver` the version being filled; `_snap_ctx` the
+# GenCtx cache persisted across passes (GATE_MEMO hits); `_snap_pending` true while a fill is in flight.
+var _snap_next: Array = []
+var _centres_next: PackedVector3Array = PackedVector3Array()
+var _card_prec_next: Dictionary = {}
+var _snap_next_rev_sum := 0
+var _snap_fill := -1
+var _snap_fill_ver := 0
+var _snap_ctx: Dictionary = {}
+var _snap_pending := false
+
+# FP_STRUCT_CARD_ALT_BAND (§8): the card altitude zone (0=S,1=B,2=O; −1 off) + current tier_fade + wake fade-in latch.
+var _card_zone := -1
+var _dbg_card_fade := 1.0
+var _wake_t0 := 0                              # ms when the current wake fade-in started (0 = none)
+var _prev_live_cards := 0                      # _live_cards before the last swap — detects the STRUCT_WAKE_JUMP
+var _pending_wake_check := false               # a swap just landed — the next _rebuild tail evaluates the wake jump
+
 # FP_STRUCT_SHELL_BAND A/B / gate read-back: last computed zone (0=S,1=B,2=O; -1 flag off) + the altitude the law saw.
 var _dbg_shell_zone := -1
 var _dbg_shell_h := 0.0
@@ -372,6 +398,12 @@ func setup_instance(ring: Node3D, active_fid: int) -> void:
 		# it, _card_prec stays empty ⇒ cards never appear (safe degrade, but not the intended arm). Warn once at setup.
 		if not CubeSphere.FP_STRUCT_REG_EPOCH:
 			push_warning("FacetFarStructures: FP_STRUCT_CARDS is ON without FP_STRUCT_REG_EPOCH — the card precompute runs in _resnapshot (REG_EPOCH-gated), so cards will not appear. Enable FP_STRUCT_REG_EPOCH in the same arm.")
+		# S3 interlock (§9): the alt-band zone law needs the shell-band machinery + the epoch snapshot.
+		if CubeSphere.FP_STRUCT_CARD_ALT_BAND and not (CubeSphere.FP_STRUCT_SHELL_BAND and CubeSphere.FP_STRUCT_REG_EPOCH):
+			push_warning("FacetFarStructures: FP_STRUCT_CARD_ALT_BAND needs FP_STRUCT_CARDS+FP_STRUCT_SHELL_BAND+FP_STRUCT_REG_EPOCH — the extended card band has no effect otherwise.")
+		# S4 interlock (§9): staging lives inside the epoch prelude.
+		if CubeSphere.FP_STRUCT_CARD_STAGE and not CubeSphere.FP_STRUCT_REG_EPOCH:
+			push_warning("FacetFarStructures: FP_STRUCT_CARD_STAGE needs FP_STRUCT_REG_EPOCH — the staged snapshot + argsort live in the epoch prelude.")
 		_card_material = make_card_material()
 		_card_atlas = StructCardKit.build_atlas()
 		_card_material.set_shader_parameter("house_atlas", _card_atlas)
@@ -421,20 +453,46 @@ func _apply_shell_visibility(offsurf: bool, h := -1.0) -> int:
 			_mi.visible = false                                    # ZONE O: hidden, skin owns the view
 	# FP_STRUCT_CARDS (§8.4): the card tier stays LIVE + LIT off-surface on its OWN radial-shade material (no shell-
 	# material swap — the card shader is not black off-surface); zone B ramps its tier_fade dissolve, zone O hides it.
+	# FP_STRUCT_CARD_ALT_BAND (S3 §4): the CARD tier reclassifies INDEPENDENTLY of the cube zone — hide at STRUCT_CARD_
+	# HIDE_ALT (2400 = STRUCT_FAR_MAX, where the set is empty by construction) with the dissolve re-anchored to
+	# [STRUCT_CARD_FADE_ALT, STRUCT_CARD_HIDE_ALT]. Off ⇒ card_hide/card_fade_lo == the 600/520 cube thresholds ⇒
+	# czone == zone and the shipped 600 fade verbatim (byte-identical).
+	var card_hide := CubeSphere.STRUCT_CARD_HIDE_ALT if CubeSphere.FP_STRUCT_CARD_ALT_BAND else CubeSphere.FT_SHELL_HIDE_ALT
+	var card_fade_lo := CubeSphere.STRUCT_CARD_FADE_ALT if CubeSphere.FP_STRUCT_CARD_ALT_BAND else CubeSphere.FT_SHELL_FADE_ALT
+	var czone := 0 if not offsurf else (1 if h < card_hide else 2)
+	_card_zone = czone if CubeSphere.FP_STRUCT_CARD_ALT_BAND else -1
 	if _card_mmi != null:
-		if zone == 0:
+		if czone == 0:
 			_card_mmi.visible = true
+			_dbg_card_fade = 1.0
 			if _card_material != null:
 				_card_material.set_shader_parameter("tier_fade", 1.0)
-		elif zone == 1:
+		elif czone == 1:
 			_card_mmi.visible = true
+			# S4 (§8): the wake fade-in multiplies the altitude term (1.0 unless a large set just swapped in).
+			var ctf := (1.0 - smoothstep(card_fade_lo, card_hide, h)) * _wake_fade()
+			_dbg_card_fade = ctf
 			if _card_material != null:
-				var ctf := 1.0 - smoothstep(CubeSphere.FT_SHELL_FADE_ALT, CubeSphere.FT_SHELL_HIDE_ALT, h)
 				_card_material.set_shader_parameter("tier_fade", ctf)
 		else:
 			_card_mmi.visible = false
 	_vis_abtest()
 	return zone
+
+## FP_STRUCT_CARD_ALT_BAND (S3 §4): the altitude at/above which the CARD tier freezes (step early-returns). Under the
+## flag it is STRUCT_CARD_HIDE_ALT (= STRUCT_FAR_MAX, where the emitted set is empty anyway); else FT_SHELL_HIDE_ALT
+## (the shipped 600 — byte-identical). This moves the step() freeze line with the extended card band.
+func _card_live_ceiling() -> float:
+	return CubeSphere.STRUCT_CARD_HIDE_ALT if CubeSphere.FP_STRUCT_CARD_ALT_BAND else CubeSphere.FT_SHELL_HIDE_ALT
+
+## S4 (§8) the wake fade-in multiplier: 1.0 unless a staged swap just landed a large card set from an empty/frozen
+## state (`_wake_t0` latched in _swap_snapshot), ramping 0→1 over STRUCT_WAKE_FADE_S. Only non-trivial under
+## FP_STRUCT_CARD_STAGE (else `_wake_t0` stays 0 ⇒ 1.0). Driven from _apply_shell_visibility (every step, no rebuild).
+func _wake_fade() -> float:
+	if not CubeSphere.FP_STRUCT_CARD_STAGE or _wake_t0 == 0:
+		return 1.0
+	var t := float(Time.get_ticks_msec() - _wake_t0) / (CubeSphere.STRUCT_WAKE_FADE_S * 1000.0)
+	return clampf(t, 0.0, 1.0)
 
 ## FP_STRUCT_VIS_ABTEST (Codex diagnostic): while the mesh WOULD be visible, blink it off for half of each period so a
 ## frozen observer can see whether the jerk follows the mesh's on-screen presence (⇒ render/GPU-bound) or persists while
@@ -479,7 +537,9 @@ func step(settled := true, credit_ok := true, cam_render := Vector3.ZERO) -> voi
 	# line: the merged mesh stays VISIBLE + LIVE (fall through to the delta-gated rebuild so it stays correct across
 	# crossings). Off (h defaults -1) ⇒ `_mi.visible = not offsurf` + off-surface early-return, byte-identical.
 	var h := (_ring as FacetFarRing).shell_cam_alt() if CubeSphere.FP_STRUCT_SHELL_BAND else -1.0
-	var shell_mode := CubeSphere.FP_STRUCT_SHELL_BAND and offsurf and h < CubeSphere.FT_SHELL_HIDE_ALT
+	# FP_STRUCT_CARD_ALT_BAND (S3 §4): the freeze line moves to the card ceiling (2400) so the tier stays LIVE to the
+	# distance envelope's edge; off ⇒ _card_live_ceiling() == FT_SHELL_HIDE_ALT (600), the shipped freeze (byte-off).
+	var shell_mode := CubeSphere.FP_STRUCT_SHELL_BAND and offsurf and h < _card_live_ceiling()
 	_dbg_shell_zone = _apply_shell_visibility(offsurf, h)
 	_dbg_shell_h = h
 	_dbg_shell_offsurf = offsurf
@@ -495,8 +555,14 @@ func step(settled := true, credit_ok := true, cam_render := Vector3.ZERO) -> voi
 	var now := Time.get_ticks_msec()
 	# FP_STRUCT_BAKE_STAGE: while a staged drain is pending, step EVERY frame (the per-pass time box bounds the
 	# cost); the merged-mesh COMMIT keeps the shipped STRUCT_STEP_MS cadence via _last_commit_ms in _rebuild.
-	var draining := CubeSphere.FP_STRUCT_BAKE_STAGE and _bake_pending
-	if not draining and now - _last_step_ms < CubeSphere.STRUCT_STEP_MS:
+	var draining := (CubeSphere.FP_STRUCT_BAKE_STAGE and _bake_pending) \
+		or (CubeSphere.FP_STRUCT_CARD_STAGE and _snap_pending)   # S4: staged snapshot drains every frame while filling
+	# FP_STRUCT_CARD_ALT_BAND (S3 §4): in the extended band (h ≥ 600) the view changes slowly — halve the prelude
+	# cadence to STRUCT_SHELL_STEP_MS. Off / below 600 ⇒ STRUCT_STEP_MS (byte-identical). Drain frames bypass either.
+	var cap_ms := CubeSphere.STRUCT_STEP_MS
+	if CubeSphere.FP_STRUCT_CARD_ALT_BAND and h >= CubeSphere.FT_SHELL_HIDE_ALT:
+		cap_ms = CubeSphere.STRUCT_SHELL_STEP_MS
+	if not draining and now - _last_step_ms < cap_ms:
 		return
 	_last_step_ms = now
 	# FP_STRUCT_REG_EPOCH: self-time the WHOLE prelude (registry materialize + probe pass + delta gate) — present in
@@ -514,7 +580,7 @@ func step(settled := true, credit_ok := true, cam_render := Vector3.ZERO) -> voi
 		var need := _prelude_epoch(cam_abs, draining)
 		_dbg_step_us = int(Time.get_ticks_usec() - _step_t0)
 		if need:
-			_rebuild(_snapshot, cam_abs)
+			_rebuild(_snapshot, cam_abs, true)   # reg IS the snapshot ⇒ S2 precomputed-distance argsort off _centres
 		return
 	# --- shipped prelude (byte-identical off — verbatim lines, only the surrounding timer added) --------------------
 	var reg: Array = _registry_query.call() if _registry_query.is_valid() else []
@@ -548,6 +614,10 @@ func _cam_to_absolute(cam_render: Vector3) -> Vector3:
 func _prelude_epoch(cam_abs: Vector3, draining: bool) -> bool:
 	var has_ver := _version_query.is_valid()
 	var ver := int(_version_query.call()) if has_ver else -1
+	# FP_STRUCT_CARD_STAGE (S4 §6): the staged double-buffered snapshot lives here (the epoch prelude). Off ⇒ the shipped
+	# one-shot _resnapshot + O(1) skip below run verbatim (byte-identical).
+	if CubeSphere.FP_STRUCT_CARD_STAGE:
+		return _prelude_epoch_staged(cam_abs, ver, has_ver, draining)
 	if not has_ver or ver != _last_version:
 		_resnapshot(ver)                                   # a real change (or unknown version) ⇒ re-materialize
 	elif not draining and not _cull_pending and _annulus_empty_last \
@@ -556,6 +626,86 @@ func _prelude_epoch(cam_abs: Vector3, draining: bool) -> bool:
 	var cover_fp := _probe_pass(_snapshot, cam_abs, _centres)
 	_last_scan_cam = cam_abs
 	return _inputs_changed(cam_abs, _snapshot.size(), _snap_rev_sum, cover_fp)
+
+## FP_STRUCT_CARD_STAGE (S4 §6): the staged epoch prelude. A version drift STARTS/RESTARTS a fill into the `_next`
+## double-buffers WITHOUT touching the live snapshot (which keeps rendering, resident — §5). Each step while pending
+## drains ≥ STRUCT_SNAP_STAGE_MIN records under a STRUCT_SNAP_STAGE_MS box; on convergence the buffers SWAP and one
+## rebuild fires. While pending (pre-swap) the prelude returns false (no rebuild off a half-filled snapshot). When not
+## pending it is the shipped O(1) skip + delta gate over the live snapshot — the stationary property is untouched.
+func _prelude_epoch_staged(cam_abs: Vector3, ver: int, has_ver: bool, draining: bool) -> bool:
+	# (re)start a fill whenever the target version differs from what we hold/are filling.
+	if not has_ver or ver != _last_version:
+		if not _snap_pending or ver != _snap_fill_ver:
+			_snap_start_fill(ver)
+	if _snap_pending:
+		if _snap_drain():                                  # the fill converged + swapped this pass ⇒ probe + rebuild the NEW set
+			var cfp := _probe_pass(_snapshot, cam_abs, _centres)
+			_last_scan_cam = cam_abs
+			_inputs_changed(cam_abs, _snapshot.size(), _snap_rev_sum, cfp)   # latch; a swap always rebuilds
+			return true
+		return false                                       # still filling — the resident old snapshot renders (§5)
+	# Quiescent: the shipped O(1) stationary skip + delta gate over the live snapshot.
+	if not draining and not _cull_pending and _annulus_empty_last \
+			and cam_abs.distance_to(_last_scan_cam) < STRUCT_EPOCH_STILL:
+		return false
+	var cover_fp := _probe_pass(_snapshot, cam_abs, _centres)
+	_last_scan_cam = cam_abs
+	return _inputs_changed(cam_abs, _snapshot.size(), _snap_rev_sum, cover_fp)
+
+## S4: begin (or restart) a staged fill at `ver`. Materializes the registry ONE-SHOT (§6.2, timed = st_mat_us) into
+## `_snap_next`, sizes the next centres, clears the next prec, resets the drain cursor. Does NOT touch the live buffers.
+func _snap_start_fill(ver: int) -> void:
+	var _mt0 := Time.get_ticks_usec()
+	_snap_next = _registry_query.call() if _registry_query.is_valid() else []
+	_dbg_mat_us = int(Time.get_ticks_usec() - _mt0)
+	_centres_next = PackedVector3Array()
+	_centres_next.resize(_snap_next.size())
+	_card_prec_next = {}
+	_snap_next_rev_sum = 0
+	_snap_fill = 0
+	_snap_fill_ver = ver
+	_snap_ctx = {}
+	_snap_pending = true
+
+## S4: drain the per-record precompute (centre + card params) from `_snap_fill` forward — ≥ STRUCT_SNAP_STAGE_MIN
+## records, then stop past STRUCT_SNAP_STAGE_MS. Returns true iff the fill reached the end and swapped this pass.
+func _snap_drain() -> bool:
+	var _pt0 := Time.get_ticks_usec()
+	var done := 0
+	var n := _snap_next.size()
+	while _snap_fill < n:
+		var rec: Dictionary = _snap_next[_snap_fill]
+		_snap_next_rev_sum += int(rec["rev"])
+		_centres_next[_snap_fill] = _structure_centre(rec)
+		if CubeSphere.FP_STRUCT_CARDS:
+			_card_prec_next[int(rec["root"])] = _precompute_card(rec, _snap_ctx)
+		_snap_fill += 1
+		done += 1
+		if done >= CubeSphere.STRUCT_SNAP_STAGE_MIN \
+				and float(Time.get_ticks_usec() - _pt0) * 0.001 >= CubeSphere.STRUCT_SNAP_STAGE_MS:
+			break
+	_dbg_prec_us = int(Time.get_ticks_usec() - _pt0)
+	if _snap_fill >= n:
+		_swap_snapshot()
+		return true
+	return false
+
+## S4: swap the filled `_next` buffers into the live slots. Records the pre-swap live count (for the §8 wake jump) and
+## arms the wake check for the immediately-following rebuild. Releases the next buffers so the live ones own the data.
+func _swap_snapshot() -> void:
+	_prev_live_cards = _live_cards
+	_snapshot = _snap_next
+	_centres = _centres_next
+	if CubeSphere.FP_STRUCT_CARDS:
+		_card_prec = _card_prec_next
+	_snap_rev_sum = _snap_next_rev_sum
+	_last_version = _snap_fill_ver
+	_snap_pending = false
+	_snap_fill = -1
+	_pending_wake_check = true
+	_snap_next = []
+	_centres_next = PackedVector3Array()
+	_card_prec_next = {}
 
 ## FP_STRUCT_REG_EPOCH: materialize the registry snapshot for `ver` — the ONE per-version registry duplicate plus the
 ## per-record precompute (world centre + rev-sum) the stationary steps reuse. Called only when the version drifted, so
@@ -735,9 +885,11 @@ func _probe_pass(reg: Array, cam_abs: Vector3, centres := PackedVector3Array()) 
 
 ## Advance the cull streak for `rec` from its cached probe and return whether the far model is currently EMITTED.
 ## COVERED → hide after STRUCT_HIDE_STREAK; NOT_COVERED → restore after STRUCT_SHOW_STREAK; UNKNOWABLE → no change.
-func _cull_emit(rec: Dictionary, cam_abs: Vector3) -> bool:
+func _cull_emit(rec: Dictionary, cam_abs: Vector3, pre_dist := NAN) -> bool:
 	var root := int(rec["root"])
-	var dist := _structure_dist(rec, cam_abs)
+	# S2 (FP_STRUCT_CARD_STAGE §7): reuse the caller's precomputed distance; NAN (every shipped call site) ⇒ self-
+	# compute, byte-identical.
+	var dist := pre_dist if not is_nan(pre_dist) else _structure_dist(rec, cam_abs)
 	var r0 := float(TerrainConfig.near_render_radius())
 	if dist < r0:
 		# FP_STRUCT_NEAR_HOLD (live defect: houses vanish during descent): the shipped floor drops the far
@@ -856,16 +1008,37 @@ func _band_code(dist: float, r0: float, prev: int) -> int:
 ## Rebuild the ONE merged LOD-A ArrayMesh: for each registered structure in the band [near_render_radius, STRUCT_FAR_MAX]
 ## that the near-handoff cull leaves visible, ensure its cached bake (re-baked on rev change) and append its ring-local
 ## verts/colours, nearest-first, under the STRUCT_FAR_TRIS_MAX cap. One surface swap.
-func _rebuild(reg: Array, cam_abs: Vector3) -> void:
+func _rebuild(reg: Array, cam_abs: Vector3, use_centres := false) -> void:
 	_dbg_rebuild_count += 1
 	_evict_stale_bakes(reg)
-	# nearest-first so the tri cap keeps the closest (most visible) structures
-	var ordered := reg.duplicate()
-	ordered.sort_custom(func(a, b): return _structure_dist(a, cam_abs) < _structure_dist(b, cam_abs))
+	# nearest-first so the tri cap keeps the closest (most visible) structures. S2 (FP_STRUCT_CARD_STAGE §7): when reg IS
+	# the epoch snapshot (use_centres, size-matched), argsort precomputed distances off _centres (O(N) float ops, no
+	# per-comparison lattice_to_world64 — the WASM alloc convoy). Off / reg≠snapshot ⇒ the shipped sort_custom verbatim.
+	var _sort_t0 := Time.get_ticks_usec()
+	var staged_sort := CubeSphere.FP_STRUCT_CARD_STAGE and use_centres and reg.size() == _centres.size() and reg.size() > 0
+	var ordered: Array
+	var ordered_dist := PackedFloat32Array()
+	if staged_sort:
+		var n0 := reg.size()
+		var order := []; order.resize(n0)                             # plain Array (PackedInt32Array has no sort_custom)
+		var dcache := PackedFloat32Array(); dcache.resize(n0)
+		for i in range(n0):
+			dcache[i] = cam_abs.distance_to(_centres[i])
+			order[i] = i
+		order.sort_custom(func(a, b): return dcache[a] < dcache[b])   # float compares only
+		ordered = []; ordered.resize(n0)
+		ordered_dist.resize(n0)
+		for k in range(n0):
+			ordered[k] = reg[order[k]]
+			ordered_dist[k] = dcache[order[k]]
+	else:
+		ordered = reg.duplicate()
+		ordered.sort_custom(func(a, b): return _structure_dist(a, cam_abs) < _structure_dist(b, cam_abs))
+	_dbg_sort_us = int(Time.get_ticks_usec() - _sort_t0)
 	# FP_STRUCT_BAKE_STAGE: drain fresh bakes under the budget FIRST; on a bake-only frame (pending drain,
 	# commit cadence not due) stop here — the resident merged mesh keeps drawing untouched (never a removal).
 	if CubeSphere.FP_STRUCT_BAKE_STAGE:
-		_drain_bakes(ordered, cam_abs)
+		_drain_bakes(ordered, cam_abs, ordered_dist)
 		if _bake_pending and Time.get_ticks_msec() - _last_commit_ms < CubeSphere.STRUCT_STEP_MS:
 			return
 	var verts := PackedVector3Array()
@@ -883,11 +1056,12 @@ func _rebuild(reg: Array, cam_abs: Vector3) -> void:
 		var need := CubeSphere.STRUCT_CARD_INST_MAX * STRUCT_CARD_STRIDE
 		if _card_cbuf.size() != need:
 			_card_cbuf.resize(need)
-	for rec in ordered:
-		var dist := _structure_dist(rec, cam_abs)
+	for k in range(ordered.size()):
+		var rec: Dictionary = ordered[k]
+		var dist := (ordered_dist[k] if staged_sort else _structure_dist(rec, cam_abs))
 		if dist > CubeSphere.STRUCT_FAR_MAX:
 			continue
-		if not _cull_emit(rec, cam_abs):
+		if not _cull_emit(rec, cam_abs, (dist if staged_sort else NAN)):   # staged: reuse the precomputed dist (no recompute)
 			continue
 		if CubeSphere.FP_STRUCT_CARDS and _card_eligible(rec, dist):
 			if cn >= CubeSphere.STRUCT_CARD_INST_MAX:
@@ -930,6 +1104,13 @@ func _rebuild(reg: Array, cam_abs: Vector3) -> void:
 	_live_structures = count
 	_live_tris = tris
 	_capped = capped
+	# S4 (§8): a just-swapped snapshot that raises the live card count by ≥ STRUCT_WAKE_JUMP from empty/frozen latches
+	# the wake fade-in (paced by _apply_shell_visibility, no rebuild). A descent re-entry with a resident buffer never
+	# jumps _live_cards, so it never trips. Only under FP_STRUCT_CARD_STAGE.
+	if CubeSphere.FP_STRUCT_CARD_STAGE and _pending_wake_check:
+		_pending_wake_check = false
+		if _live_cards - _prev_live_cards >= CubeSphere.STRUCT_WAKE_JUMP:
+			_wake_t0 = Time.get_ticks_msec()
 	if capped:
 		print("  FacetFarStructures: STRUCT_FAR_TRIS_MAX (", CubeSphere.STRUCT_FAR_TRIS_MAX, ") hit (nearest-first) — coarsen or evict")
 
@@ -1040,13 +1221,15 @@ func _has_bake(rec: Dictionary) -> bool:
 ## records (guaranteed forward progress ⇒ guaranteed convergence), then stops past STRUCT_BAKE_STAGE_MS.
 ## Sets _bake_pending iff un-baked in-band records remain. Byte-cap {} bakes are skipped without re-arming
 ## (the shipped NEVER-OOM degrade — they retry next pass at O(1) cost, exactly as today).
-func _drain_bakes(ordered: Array, cam_abs: Vector3) -> void:
+func _drain_bakes(ordered: Array, cam_abs: Vector3, ordered_dist := PackedFloat32Array()) -> void:
 	_dbg_stage_passes += 1
 	var t0 := Time.get_ticks_usec()
 	var fresh := 0
 	_bake_pending = false
-	for rec in ordered:
-		var _sd := _structure_dist(rec, cam_abs)
+	var have_d := ordered_dist.size() == ordered.size()   # S2: reuse the precomputed distances when staged
+	for k in range(ordered.size()):
+		var rec: Dictionary = ordered[k]
+		var _sd := ordered_dist[k] if have_d else _structure_dist(rec, cam_abs)
 		if _sd > CubeSphere.STRUCT_FAR_MAX:
 			continue
 		if CubeSphere.FP_STRUCT_CARDS and _card_eligible(rec, _sd):
@@ -1116,12 +1299,29 @@ func draw_count() -> int: return 1 + (1 if CubeSphere.FP_STRUCT_CARDS else 0)   
 func live_cards() -> int: return _live_cards
 func card_capped() -> bool: return _card_capped
 func card_rebuild_us() -> int: return _dbg_card_us
+func sort_us() -> int: return _dbg_sort_us                     # S2 gate read-back (G-ST-SORT)
+func card_zone() -> int: return _card_zone                     # S3 gate read-back (G-ST-CALT)
+func card_tier_fade() -> float: return _dbg_card_fade          # S3 gate read-back (G-ST-CALT)
+func snap_pending() -> bool: return _snap_pending              # S4 gate read-back (G-ST-SNAPSTAGE)
+func snap_fill() -> int: return _snap_fill
 ## Confound-free ring telemetry: st_ci (live card instances), st_cq (card cap hit), st_crb_us (card-sink self-time in
 ## the last _rebuild). {} with the flag off (never merged ⇒ byte-identical telemetry — the bake_stage_state precedent).
 func card_state() -> Dictionary:
 	if not CubeSphere.FP_STRUCT_CARDS:
 		return {}
-	return {"st_ci": _live_cards, "st_cq": _card_capped, "st_crb_us": _dbg_card_us}
+	var d := {"st_ci": _live_cards, "st_cq": _card_capped, "st_crb_us": _dbg_card_us}
+	# S2/S4 (FP_STRUCT_CARD_STAGE): the spike-attribution counters + the staged-fill state.
+	if CubeSphere.FP_STRUCT_CARD_STAGE:
+		d["st_sort_us"] = _dbg_sort_us
+		d["st_mat_us"] = _dbg_mat_us
+		d["st_prec_us"] = _dbg_prec_us
+		d["st_snap_pend"] = _snap_pending
+		d["st_snap_fill"] = _snap_fill
+	# S3 (FP_STRUCT_CARD_ALT_BAND): the card altitude zone + current tier_fade.
+	if CubeSphere.FP_STRUCT_CARD_ALT_BAND:
+		d["st_czone"] = _card_zone
+		d["st_cfade"] = snappedf(_dbg_card_fade, 0.01)
+	return d
 ## Gate read-back: the persistent card instance buffer (slots [0, live_cards) are the last rebuild). Returned as a
 ## COW reference — the gate READS it (no fork); a production caller holds no second reference so the buffer is reused.
 func debug_card_buffer() -> PackedFloat32Array: return _card_cbuf

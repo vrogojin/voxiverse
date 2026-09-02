@@ -116,6 +116,13 @@ func _initialize() -> void:
 	_gate_card_epoch()
 	_gate_card_oom()
 
+	# COSMOS CARD-BAND-HANDOFF (docs/COSMOS-CARD-BAND-HANDOFF-DESIGN.md, Stage 3 S2-S5). Flag-aware: the shipped 600 law
+	# / one-shot resnapshot / sort_custom asserted OFF; the extended band, staged snapshot + argsort asserted ON.
+	_gate_card_calt()      # S3 alt-band zone law (FP_STRUCT_CARD_ALT_BAND)
+	_gate_card_res()       # S3/§5 residency across altitude boundaries
+	_gate_card_sort()      # S2/§7 precomputed-distance argsort (FP_STRUCT_CARD_STAGE)
+	_gate_card_snapstage() # S4/§6 staged double-buffered snapshot (FP_STRUCT_CARD_STAGE)
+
 	print("=== VERIFY structures: ", _pass, " passed, ", _fail, " failed ===")
 	quit(1 if _fail > 0 else 0)
 
@@ -1555,3 +1562,177 @@ func _gate_card_oom() -> void:
 		"G-ST-CARD-OOM(on): st_ci == STRUCT_CARD_INST_MAX (cap respected, nearest-first) under a 4,000-record registry")
 	_ok(t.total_bytes() <= CubeSphere.STRUCT_BYTES_MAX,
 		"G-ST-CARD-OOM(on): total_bytes (cap-full buffer + atlas + prec) ≤ STRUCT_BYTES_MAX")
+
+# =====================================================================================================================
+# G-ST-CALT (S3 §4 — FP_STRUCT_CARD_ALT_BAND) — the card altitude-band zone law. The card tier reclassifies
+# INDEPENDENTLY of the cube zone: visible through STRUCT_CARD_HIDE_ALT (2400), hidden above; the cube mesh keeps its
+# 600 law. Off ⇒ cards hidden at 601 (the shipped cut). Drives the REAL _apply_shell_visibility via the debug hook.
+# =====================================================================================================================
+func _gate_card_calt() -> void:
+	if not CubeSphere.FP_STRUCT_SHELL_BAND:
+		_ok(true, "G-ST-CALT: SHELL_BAND off ⇒ card zone law inert (skipped)")
+		return
+	var on := CubeSphere.FP_STRUCT_CARD_ALT_BAND
+	_ok(CubeSphere.STRUCT_CARD_HIDE_ALT == CubeSphere.STRUCT_FAR_MAX,
+		"G-ST-CALT: STRUCT_CARD_HIDE_ALT == STRUCT_FAR_MAX (the altitude and distance envelopes coincide, §3.1)")
+	var t = FS.new(); t.setup_instance(Node3D.new(), 0)
+	# on-surface: card + cube both visible (both flag states).
+	t.debug_apply_shell_visibility(false, 41.0)
+	_ok(t.card_mmi_visible() and t.mi_visible(), "G-ST-CALT: on-surface ⇒ card + cube visible")
+	# h=300 (shell band): card visible.
+	t.debug_apply_shell_visibility(true, 300.0)
+	_ok(t.card_mmi_visible(), "G-ST-CALT: h=300 (shell band) ⇒ card visible")
+	# h=601: the CUBE mesh hides at 600 in BOTH flag states (unchanged law).
+	t.debug_apply_shell_visibility(true, 601.0)
+	_ok(not t.mi_visible(), "G-ST-CALT: h=601 ⇒ CUBE mesh hidden (unchanged 600 law, both states)")
+	if on:
+		_ok(t.card_mmi_visible(), "G-ST-CALT(on): h=601 ⇒ card STILL visible (extended band, no vanish)")
+		for hh in [1500.0, 2100.0, 2399.0]:
+			t.debug_apply_shell_visibility(true, hh)
+			_ok(t.card_mmi_visible(), "G-ST-CALT(on): h=%d ⇒ card visible (< STRUCT_CARD_HIDE_ALT)" % int(hh))
+		t.debug_apply_shell_visibility(true, 2401.0)
+		_ok(not t.card_mmi_visible(), "G-ST-CALT(on): h=2401 ⇒ card HIDDEN (≥ STRUCT_CARD_HIDE_ALT; set empty anyway)")
+		# tier_fade == the §4 formula at 2100 and 2399 (wake fade == 1.0, no swap).
+		for hh in [2100.0, 2399.0]:
+			t.debug_apply_shell_visibility(true, hh)
+			var exp := 1.0 - smoothstep(CubeSphere.STRUCT_CARD_FADE_ALT, CubeSphere.STRUCT_CARD_HIDE_ALT, hh)
+			_ok(absf(t.card_tier_fade() - exp) < 1e-3, "G-ST-CALT(on): tier_fade at h=%d == 1-smoothstep(2000,2400,h)" % int(hh))
+	else:
+		_ok(not t.card_mmi_visible(), "G-ST-CALT(off): h=601 ⇒ card HIDDEN (shipped 600 cut, byte-identical)")
+
+# =====================================================================================================================
+# G-ST-RES (S3 §5) — residency: crossing any altitude boundary toggles visible/tier_fade ONLY; the card buffer,
+# visible_instance_count, and rebuild_count all survive. Drives debug_apply_shell_visibility across the boundaries
+# after seeding a resident card set (the epoch prelude) and asserts nothing that would force a re-emit changed.
+# =====================================================================================================================
+func _gate_card_res() -> void:
+	if not (CubeSphere.FP_STRUCT_CARDS and CubeSphere.FP_STRUCT_SHELL_BAND):
+		_ok(true, "G-ST-RES: cards/shell off ⇒ residency n/a (skipped)")
+		return
+	var found := _find_house()
+	if found.is_empty():
+		_ok(false, "G-ST-RES: no GEN house fixture")
+		return
+	var rec: Dictionary = found["rec"]
+	var reg_src := FakeReg.new(); reg_src.set_records([rec.duplicate()])
+	var samp := func(_f: int, _c: Vector3i) -> int: return _grass()
+	var nearq := func(_f: int, _b: AABB) -> int: return NearPresence.UNKNOWABLE
+	var t = FS.new(); t.setup_instance(Node3D.new(), 0); t.set_sampler(samp); t.set_near_query(nearq)
+	t.set_registry_query(Callable(reg_src, "registry")); t.set_version_query(Callable(reg_src, "version"))
+	var centre := t._structure_centre(rec)
+	var cam := centre - centre.normalized() * 800.0
+	_epoch_prelude(t, cam)                             # seed + one rebuild (staged path converges + swaps under CARD_STAGE)
+	var rb := t.rebuild_count()
+	var vic := t.live_cards()
+	var buf_before := t.debug_card_buffer().duplicate()
+	# round-trip the altitude boundaries — visibility toggles only.
+	for hh in [41.0, 599.0, 601.0, 2399.0, 2401.0, 601.0, 41.0]:
+		t.debug_apply_shell_visibility(hh > 256.0, hh)
+	_ok(t.rebuild_count() == rb, "G-ST-RES: an altitude boundary round-trip forces NO rebuild (delta 0)")
+	_ok(t.live_cards() == vic, "G-ST-RES: visible card count unchanged across the boundaries")
+	_ok(t.debug_card_buffer() == buf_before, "G-ST-RES: the card instance buffer is byte-identical across the boundaries")
+
+# =====================================================================================================================
+# G-ST-SORT (S2 §7 — FP_STRUCT_CARD_STAGE) — the precomputed-distance argsort. Proves (a) each _centres[i] distance ==
+# the per-record _structure_dist (the precompute is exact — no drift), and (b) the argsort over _centres yields the
+# SAME nearest-first DISTANCE sequence as the shipped sort_custom (ties allowed). Both flag states (pure ordering).
+# =====================================================================================================================
+func _gate_card_sort() -> void:
+	var found := _find_houses(2)
+	if found.is_empty():
+		_ok(false, "G-ST-SORT: no facet with ≥2 GEN houses")
+		return
+	var recs: Array = found["recs"]
+	var reg_src := FakeReg.new(); reg_src.set_records(recs.duplicate())
+	var t = FS.new(); t.setup_instance(Node3D.new(), 0)
+	t.set_registry_query(Callable(reg_src, "registry")); t.set_version_query(Callable(reg_src, "version"))
+	t._resnapshot(1)                                  # fill _snapshot + _centres one-shot
+	var n: int = t._snapshot.size()
+	var c0 := t._structure_centre(t._snapshot[0])
+	var cam := c0 - c0.normalized() * 900.0
+	# (a) precompute exactness: _centres[i] distance == _structure_dist(_snapshot[i]).
+	var exact := true
+	for i in range(n):
+		if not is_equal_approx(cam.distance_to(t._centres[i]), t._structure_dist(t._snapshot[i], cam)):
+			exact = false
+	_ok(exact, "G-ST-SORT: every _centres[i] distance == the per-record _structure_dist (precompute exact, no drift)")
+	# (b) argsort order == shipped sort order (compare the distance sequence — ties allowed).
+	var ship := []; ship.resize(n)
+	for i in range(n): ship[i] = i
+	ship.sort_custom(func(a, b): return t._structure_dist(t._snapshot[a], cam) < t._structure_dist(t._snapshot[b], cam))
+	var dc := PackedFloat32Array(); dc.resize(n)
+	var stg := []; stg.resize(n)
+	for i in range(n):
+		dc[i] = cam.distance_to(t._centres[i]); stg[i] = i
+	stg.sort_custom(func(a, b): return dc[a] < dc[b])
+	var same := true
+	for k in range(n):
+		if not is_equal_approx(t._structure_dist(t._snapshot[ship[k]], cam), dc[stg[k]]):
+			same = false
+	_ok(same, "G-ST-SORT: the precomputed-distance argsort yields the shipped nearest-first distance sequence (ties allowed)")
+
+# =====================================================================================================================
+# G-ST-SNAPSTAGE (S4 §6 — FP_STRUCT_CARD_STAGE) — the staged double-buffered snapshot. Drives the REAL _snap_start_fill
+# / _snap_drain / _swap_snapshot state machine and asserts: the live snapshot is unchanged until the swap; the fill
+# converges within the pass bound; the post-swap buffers are byte-equal to a one-shot _resnapshot; a mid-fill version
+# restart resets the cursor. ON-only (staging is FP_STRUCT_CARD_STAGE; off the one-shot path is asserted elsewhere).
+# =====================================================================================================================
+func _gate_card_snapstage() -> void:
+	if not CubeSphere.FP_STRUCT_CARD_STAGE:
+		_ok(true, "G-ST-SNAPSTAGE: FP_STRUCT_CARD_STAGE off ⇒ one-shot resnapshot (asserted by G-ST-EPOCH) — skipped")
+		return
+	var recs := _collect_gen_records(150)
+	if recs.size() < 8:
+		_ok(false, "G-ST-SNAPSTAGE: too few GEN records collected (%d)" % recs.size())
+		return
+	var n: int = recs.size()
+	var reg_src := FakeReg.new(); reg_src.set_records(recs.duplicate())
+	var t = FS.new(); t.setup_instance(Node3D.new(), 0)
+	t.set_registry_query(Callable(reg_src, "registry")); t.set_version_query(Callable(reg_src, "version"))
+	# START a fill: live snapshot stays empty, pending latched, cursor 0.
+	t._snap_start_fill(int(reg_src.version()))
+	_ok(t.snap_pending() and t.snap_fill() == 0 and t._snapshot.is_empty(),
+		"G-ST-SNAPSTAGE: _snap_start_fill ⇒ pending, cursor 0, LIVE snapshot untouched (empty)")
+	# DRAIN to convergence; the live snapshot must stay empty until the swap; count passes.
+	var passes := 0
+	var swapped := false
+	while not swapped and passes < 4 * n:
+		var before: int = t._snapshot.size()
+		swapped = t._snap_drain()
+		passes += 1
+		if not swapped:
+			_ok(t._snapshot.size() == before, "G-ST-SNAPSTAGE: LIVE snapshot unchanged after a non-final drain pass")
+	_ok(swapped, "G-ST-SNAPSTAGE: the staged fill converges (swaps)")
+	_ok(passes <= int(ceil(float(n) / float(CubeSphere.STRUCT_SNAP_STAGE_MIN))) + 2,
+		"G-ST-SNAPSTAGE: converged within ⌈N/STRUCT_SNAP_STAGE_MIN⌉ passes (%d ≤ bound)" % passes)
+	_ok(t._snapshot.size() == n and not t.snap_pending(),
+		"G-ST-SNAPSTAGE: after the swap the LIVE snapshot == the new registry, pending cleared")
+	# BYTE-EQUAL to a one-shot resnapshot of the same registry.
+	var ref = FS.new(); ref.setup_instance(Node3D.new(), 0)
+	ref.set_registry_query(Callable(reg_src, "registry")); ref.set_version_query(Callable(reg_src, "version"))
+	ref._resnapshot(int(reg_src.version()))
+	var centres_eq: bool = t._centres == ref._centres
+	var prec_eq: bool = t._card_prec.size() == ref._card_prec.size()
+	for root in ref._card_prec.keys():
+		if not t._card_prec.has(root) or t._card_prec[root] != ref._card_prec[root]:
+			prec_eq = false
+	_ok(centres_eq and t._snap_rev_sum == ref._snap_rev_sum and prec_eq,
+		"G-ST-SNAPSTAGE: the staged snapshot is byte-equal to a one-shot _resnapshot (centres + rev-sum + card prec)")
+	# MID-FILL RESTART: a new version mid-fill resets the cursor to the new target.
+	t._snap_start_fill(5)
+	t._snap_drain()                                   # partial-or-full drain of version 5
+	t._snap_start_fill(6)                             # a new version arrives
+	_ok(t.snap_pending() and t.snap_fill() == 0 and t._snap_fill_ver == 6,
+		"G-ST-SNAPSTAGE: a mid-fill version bump restarts the fill at the new version (cursor 0)")
+
+## Collect up to `target` real GEN records across Earth facets (real roots ⇒ card-eligible), for the staging gates.
+func _collect_gen_records(target: int) -> Array:
+	var idx = SGI.new()
+	var earth_n := 6 * FA.K * FA.K
+	var out: Array = []
+	for fid in range(mini(earth_n, 2000)):
+		for r in idx.enumerate_facet(fid):
+			out.append((r as Dictionary).duplicate())
+			if out.size() >= target:
+				return out
+	return out

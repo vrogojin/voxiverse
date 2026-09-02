@@ -20,6 +20,7 @@ extends SceneTree
 const FT := preload("res://src/world/facet_far_trees.gd")
 const FS := preload("res://src/world/facet_far_structures.gd")
 const FA := preload("res://src/cosmos/facet_atlas.gd")
+const SGI := preload("res://src/world/struct_gen_index.gd")
 
 ## G-WC-EPOCH registry source: mirrors WorldManager.structure_registry() (fresh dicts) + structure_registry_version().
 class EpochReg extends RefCounted:
@@ -53,6 +54,7 @@ func _initialize() -> void:
 	_gate_walk_budget()
 	_gate_epoch_walk()
 	_gate_card_split_code()
+	_gate_card_altitude_leg()
 	print("=== VERIFY fartier_walk: ", _pass, " passed, ", _fail, " failed ===")
 	quit(1 if _fail > 0 else 0)
 
@@ -347,3 +349,64 @@ func _gate_card_split_code() -> void:
 			"G-WC-CARD(hyst): a CARD-latched house sticks across a sub-HYST_W dip below the split")
 		_ok(t._band_code(CubeSphere.STRUCT_CARD_MIN + 0.5 * w, r0, 2) == 2,
 			"G-WC-CARD(hyst): a CUBE-latched house sticks across a sub-HYST_W rise above the split")
+
+# =====================================================================================================================
+# G-WC-CARD-ALT (Stage 3 S5) — the scripted altitude leg. A ground→2500→ground profile over a resident card set: the
+# card visibility follows the S3 zone law (visible to STRUCT_CARD_HIDE_ALT, hidden above), and a version-quiescent
+# altitude change forces NO rebuild (residency §5 — the resident buffer re-appears on descent without a re-emit).
+# Flag-aware: ON asserts the extended band; OFF asserts the shipped 600 cut + still no rebuild across the round-trip.
+# =====================================================================================================================
+func _first_gen_house() -> Dictionary:
+	var idx = SGI.new()
+	var earth_n := 6 * FA.K * FA.K
+	for fid in range(mini(earth_n, 2000)):
+		var recs: Array = idx.enumerate_facet(fid)
+		if not recs.is_empty():
+			return recs[0]
+	return {}
+
+func _gate_card_altitude_leg() -> void:
+	if not (CubeSphere.FP_STRUCT_CARDS and CubeSphere.FP_STRUCT_SHELL_BAND and CubeSphere.FP_STRUCT_REG_EPOCH):
+		_ok(true, "G-WC-CARD-ALT: cards/shell/epoch not all on ⇒ altitude leg inert (skipped)")
+		return
+	var g := BlockCatalog.id_of(&"grass")
+	var rec := _first_gen_house()
+	if rec.is_empty() or g <= 0:
+		_ok(false, "G-WC-CARD-ALT: no GEN house / grass fixture")
+		return
+	var alt_on := CubeSphere.FP_STRUCT_CARD_ALT_BAND
+	var reg_src := EpochReg.new(); reg_src.recs = [rec.duplicate()]; reg_src.ver = 1
+	var t = FS.new(); t.setup_instance(Node3D.new(), 0)
+	t.set_sampler(func(_f: int, _c: Vector3i) -> int: return g)
+	t.set_near_query(func(_f: int, _b: AABB) -> int: return NearPresence.UNKNOWABLE)
+	t.set_registry_query(Callable(reg_src, "registry")); t.set_version_query(Callable(reg_src, "version"))
+	var centre := t._structure_centre(rec)
+	var cam := centre - centre.normalized() * 900.0
+	# prime (staged path converges + swaps under CARD_STAGE, or one-shot otherwise): one rebuild, the card resident.
+	if t._prelude_epoch(cam, false):
+		t._rebuild(t._snapshot, cam, true)
+	_ok(t.live_cards() == 1, "G-WC-CARD-ALT: prime — the card is resident (1 instance)")
+	var rb := t.rebuild_count()
+	# the scripted altitude profile (ground → 2500 → ground). At each 'frame' apply the zone law + the quiescent prelude.
+	var profile := [41.0, 300.0, 700.0, 1500.0, 2401.0, 2500.0, 2401.0, 1500.0, 700.0, 300.0, 41.0]
+	var zone_ok := true
+	var no_rebuild := true
+	for hh in profile:
+		var offs: bool = hh > 256.0
+		t.debug_apply_shell_visibility(offs, hh)
+		# a version-quiescent prelude ⇒ the O(1) skip ⇒ false (no rebuild).
+		if t._prelude_epoch(cam, false):
+			t._rebuild(t._snapshot, cam, true)
+			no_rebuild = false
+		# zone-law expectation for the CARD tier.
+		var hide: float = CubeSphere.STRUCT_CARD_HIDE_ALT if alt_on else CubeSphere.FT_SHELL_HIDE_ALT
+		var want_vis: bool = (not offs) or (hh < hide)
+		if t.card_mmi_visible() != want_vis:
+			zone_ok = false
+	_ok(zone_ok, "G-WC-CARD-ALT: card visibility follows the zone law across the ground→2500→ground profile (hide at %d)"
+		% int(CubeSphere.STRUCT_CARD_HIDE_ALT if alt_on else CubeSphere.FT_SHELL_HIDE_ALT))
+	_ok(no_rebuild and t.rebuild_count() == rb,
+		"G-WC-CARD-ALT: a version-quiescent altitude round-trip forces NO rebuild (residency — resident buffer, O(1) skip)")
+	if alt_on:
+		# on descent below the hide line the resident card is shown again with NO re-emit.
+		_ok(t.live_cards() == 1, "G-WC-CARD-ALT(on): after the round-trip the resident card set is intact (1)")

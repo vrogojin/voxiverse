@@ -1449,6 +1449,35 @@ const STRUCT_CARD_AZIMUTHS := 8              # side views per archetype (45° se
 const STRUCT_CARD_ARCHES := 10               # §3: 2 flat + 8 gabled canonical archetypes
 const STRUCT_CARD_FADE_W := 16.0             # P2 (optional) cube↔card dither cross-fade half-width (blocks)
 
+## FP_STRUCT_CARD_ALT_BAND (docs/COSMOS-CARD-BAND-HANDOFF-DESIGN.md §4, Stage 3 S3) — the card altitude-band extension.
+## The shipped card zone law hides cards at FT_SHELL_HIDE_ALT=600 (with the cube tier), so villages VANISH above 600
+## and pop back on descent — but cards are ~4 tris/house, so they can afford the WHOLE 3D distance envelope. Under this
+## flag the CARD tier's zone law in _apply_shell_visibility uses STRUCT_CARD_HIDE_ALT (= STRUCT_FAR_MAX = 2400, where
+## the emitted set is empty by construction — _rebuild drops dist>2400) and re-anchors the card tier_fade dissolve to
+## [STRUCT_CARD_FADE_ALT, STRUCT_CARD_HIDE_ALT]; the freeze line (step early-return) and the extended-band rate cap move
+## with it. The CUBE tier keeps its 600 law unchanged. Off ⇒ the FT_SHELL_HIDE_ALT=600 law verbatim (byte-identical).
+## Requires FP_STRUCT_CARDS ∧ FP_STRUCT_SHELL_BAND ∧ FP_STRUCT_REG_EPOCH (warns at setup otherwise). Gates: G-ST-CALT/RES.
+const FP_STRUCT_CARD_ALT_BAND := false       # cards render to STRUCT_FAR_MAX (not 600); roof-skin owns the view above
+const STRUCT_CARD_HIDE_ALT := 2400.0         # card zone-O boundary (blocks) — kept == STRUCT_FAR_MAX by law (§3.1; gate-asserted)
+const STRUCT_CARD_FADE_ALT := 2000.0         # card tier_fade dissolve start (the top cross-fade band [2000, 2400])
+const STRUCT_SHELL_STEP_MS := 500            # extended-band (h ≥ FT_SHELL_HIDE_ALT) prelude cadence — the view changes slowly up there
+
+## FP_STRUCT_CARD_STAGE (docs/COSMOS-CARD-BAND-HANDOFF-DESIGN.md §6-§7, Stage 3 S2+S4) — kills the ~1136 ms crossing
+## spike, two composing fixes. (S2/§7) THE SORT BOMB: _rebuild's nearest-first sort_custom recomputes _structure_dist
+## → _structure_centre → lattice_to_world64 (a fresh 3-Variant Array) PER COMPARISON (~N·log N allocating calls); under
+## the flag the ordering is a precomputed-distance argsort off the REG_EPOCH _centres (O(N) float ops, no per-comparison
+## lattice), and _cull_emit/_drain_bakes reuse the same precomputed distances. (S4/§6) THE WAKE DEBT: _resnapshot's
+## per-record precompute is drained over frames into a DOUBLE-BUFFERED snapshot (the old snapshot keeps rendering) at
+## ≤STRUCT_SNAP_STAGE_MS/≥STRUCT_SNAP_STAGE_MIN per pass, swapped on convergence; plus a ~STRUCT_WAKE_FADE_S fade-in on
+## a large set entry. Preserves the REG_EPOCH O(1)-stationary skip (staging engages only when the version drifts). Off ⇒
+## the one-shot _resnapshot body + the shipped sort_custom lambda run verbatim (byte-identical). Requires FP_STRUCT_REG_
+## EPOCH (staging lives inside the epoch prelude; warns at setup otherwise). Gates: G-ST-SORT / G-ST-SNAPSTAGE.
+const FP_STRUCT_CARD_STAGE := false          # staged double-buffered snapshot + precomputed-distance argsort + wake fade-in
+const STRUCT_SNAP_STAGE_MS := 2.0            # staged-snapshot per-pass time box (ms)
+const STRUCT_SNAP_STAGE_MIN := 32            # min records precomputed per pass — guaranteed forward progress ⇒ convergence
+const STRUCT_WAKE_FADE_S := 0.7              # §8 wake fade-in duration (s) when a swap lands a large card set
+const STRUCT_WAKE_JUMP := 64                 # §8 min _live_cards jump (from empty/frozen) that latches a wake fade
+
 ## FP_DEM_DEFER (docs/COSMOS-STREAM-PARALLEL-DESIGN.md Phase A — the fresh-reload fix) — the whole-planet coarse
 ## DEM (`FP_GLOBAL_RELIEF_DATA` / `GlobalReliefData.step`) is frame-budget GATED but the admitted unit is UNBOUNDED
 ## on the main thread (an O(3456) allocating `_next_unbaked` scan + a `bake_smooth_tile` + a 1089-node hillshade =

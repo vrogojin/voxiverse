@@ -1277,7 +1277,10 @@ const FT_SHELL_SWAP_DWELL := 2               # steps of zone dwell before the me
 ##    (§7.3) — the SAME "near meshed here ⇒ hide the far impostor" law the far-trees cull uses. Ledger: ≤ +2 draws,
 ##    STRUCT_FAR_TRIS_MAX tris, STRUCT_BYTES_MAX hard byte cap (never-OOM).
 ##  - FP_STRUCT_GEN (§5, P1 — declared, unused in P0): the procedural village GENERATOR (worldgen, not edits).
-##  - FP_STRUCT_LOD (§7.4/§10, P2 — declared, unused in P0): LOD-B band + orbit exception + fine-map roof texels.
+##  - FP_STRUCT_LOD (§7.4a — LIVE, fully implemented): far-skin roof texels — StructureGen.top_decoration composites a
+##    house roof-pixel into the band/fine map (GDScript bakers) + the C++ bake_far_tile path (patch 0013) + the far_
+##    palette dark_oak→BROWN re-home, so villages read as brown rooftop specks above the card band (the zone-O handoff
+##    the card altitude-band relies on). Default false (byte-off); shipped TRUE in the combined deploy arm. Gate: G-ST-LODSKIN.
 ## All default false, byte-identical off: the choke-point hook is one flag test, `FacetFarRing.setup` never
 ## constructs the tier (the FP_ORBIT_RELIEF pattern), `resolve_cell` never calls the generator. Gate:
 ## verify_structures.gd (G-ST-OFF/CLUSTER/DECIM/HANDOFF/BYTES/DRAWS/DELTA + the shared G-NP-*), full suite byte-off.

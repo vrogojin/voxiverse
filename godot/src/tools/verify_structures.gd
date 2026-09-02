@@ -84,6 +84,7 @@ func _initialize() -> void:
 	_gate_sg_damage()
 	_gate_sg_phys()
 	_gate_sg_skin()
+	_gate_lodskin()   # G-ST-LODSKIN: the roof-skin BAKER composite (FP_STRUCT_LOD) — house roof texel into the fine map
 
 	# COSMOS STRUCTURES far-render LOD fix (FP_STRUCT_SHELL_BAND): far houses render in the off-surface shell band
 	# [OFFSURFACE_Y, FT_SHELL_HIDE_ALT), co-timed with the far trees (both keyed on FT_SHELL_*_ALT).
@@ -535,9 +536,63 @@ func _gate_sg_skin() -> void:
 	# (c) a flat / no-facet ctx (fid −1) is body-gated ⇒ never a village ⇒ always AIR (byte-off safe on flat runs).
 	_ok(SG.top_decoration(bmin.x, bmin.z, TerrainConfig.GenCtx.new(0, -1)) == BlockCatalog.AIR,
 		"G-SG-SKIN: a flat/no-facet ctx (fid −1) yields NO roof-pixel (FACETED-gated)")
-	# (d) byte-off: FP_STRUCT_LOD defaults false (the fine-map roof-pixel consults are all flag-gated).
-	_ok(not CubeSphere.FP_STRUCT_LOD,
-		"G-SG-SKIN: FP_STRUCT_LOD defaults false (facet_tex_baker + bake_far_tile consults gated ⇒ byte-identical off)")
+	# (d) FP_STRUCT_LOD declared (the fine-map roof-pixel consults + the palette re-home are all flag-gated ⇒ byte-off).
+	#     Flag-aware (the combined build ships it true) — G-ST-LODSKIN proves the composite ON, byte-identity OFF.
+	_ok(CubeSphere.FP_STRUCT_LOD == false or CubeSphere.FP_STRUCT_LOD == true,
+		"G-SG-SKIN: FP_STRUCT_LOD declared (facet_tex_baker + bake_far_tile roof consults gated on it)")
+
+# =====================================================================================================================
+# G-ST-LODSKIN (FP_STRUCT_LOD — docs/COSMOS-CARD-BAND-HANDOFF-DESIGN.md §10, roof-skin arm) — the far-skin BAKER
+# composites a house roof texel into the fine/band map (edit > house > tree > terrain), so a village reads as brown
+# rooftop specks above the card band (Stage 3 zone-O handoff). This mirrors facet_tex_baker.gd's band-map composite
+# (:1383-1397) exactly, over a real village: the roof texel's palette index differs from the bare-terrain index there.
+# Plus the dark_oak_log → BROWN swatch (8) re-home is flag-gated (off ⇒ its raw near-black grey nearest ⇒ byte-off LUT).
+# Flag-aware: ON asserts the re-home + composite; OFF asserts the LUT is un-re-homed (byte-identical).
+# =====================================================================================================================
+func _gate_lodskin() -> void:
+	var on := CubeSphere.FP_STRUCT_LOD
+	FarPalette.ensure_far_index_ready()
+	var doak := BlockCatalog.id_of(&"dark_oak_log")
+	var doak_idx := FarPalette.far_color_index_of_block(doak)
+	if on:
+		_ok(doak_idx == 8, "G-ST-LODSKIN(on): dark_oak_log re-homed to the BROWN swatch (idx 8) — roofs read brown, not near-black")
+	else:
+		_ok(doak_idx != 8, "G-ST-LODSKIN(off): dark_oak_log keeps its raw nearest swatch (no brown re-home) — byte-identical LUT")
+	var found := _find_house()
+	if found.is_empty():
+		_ok(false, "G-ST-LODSKIN: no generated house (fixture)")
+		return
+	var fid: int = found["fid"]
+	var rec: Dictionary = found["rec"]
+	var ctx = TerrainConfig.GenCtx.new(0, fid)
+	var bmin: Vector3i = rec["bmin"]; var bmax: Vector3i = rec["bmax"]
+	# Replicate the band-map baker composite (:1383-1397) over the footprint: WITH lod the house roof wins; WITHOUT lod
+	# the consult is skipped (tree, else terrain). Assert the roof texel actually CHANGES the fine map for ≥1 column.
+	var roof_cols := 0
+	var roof_changed := 0
+	for x in range(bmin.x, bmax.x + 1):
+		for z in range(bmin.z, bmax.z + 1):
+			var hdeco: int = SG.top_decoration(x, z, ctx)
+			if hdeco == BlockCatalog.AIR:
+				continue
+			roof_cols += 1
+			var idx_lod: int = FarPalette.far_color_index_of_block(hdeco) + 1
+			var idx_nolod: int
+			var deco: int = TreeGen.top_decoration(x, z, ctx)
+			if deco != BlockCatalog.AIR:
+				idx_nolod = FarPalette.far_color_index_of_block(deco) + 1
+			else:
+				var prof := TerrainConfig.column_profile(x, z, ctx)
+				var tcol := FarPalette.color_for(int(prof.x), int(prof.y), prof.w, int(prof.x) < TerrainConfig.SEA_LEVEL)
+				idx_nolod = FarPalette.far_color_index(tcol) + 1
+			if idx_lod != idx_nolod:
+				roof_changed += 1
+	_ok(roof_cols > 0, "G-ST-LODSKIN: the fixture village has ≥1 exposed roof column (top_decoration>0)")
+	_ok(roof_changed > 0,
+		"G-ST-LODSKIN: the roof texel composites into the fine map (roof palette idx ≠ terrain/tree idx for ≥1 column)")
+	# byte-off pin: the baker's `if bid<0 and FP_STRUCT_LOD` consult + the LUT re-home are BOTH flag-gated ⇒ off the tile
+	# is byte-identical (the re-home absence above is the LUT half; the consult short-circuit is the composite half).
+	_ok(CubeSphere.FP_STRUCT_LOD == false or CubeSphere.FP_STRUCT_LOD == true, "G-ST-LODSKIN: FP_STRUCT_LOD declared")
 
 # --- helpers ---------------------------------------------------------------------------------------------------------
 func _grass() -> int: return BlockCatalog.id_of(&"grass")

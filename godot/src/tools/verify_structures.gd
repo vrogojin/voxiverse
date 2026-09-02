@@ -120,9 +120,10 @@ func _initialize() -> void:
 	# COSMOS CARD-BAND-HANDOFF (docs/COSMOS-CARD-BAND-HANDOFF-DESIGN.md, Stage 3 S2-S5). Flag-aware: the shipped 600 law
 	# / one-shot resnapshot / sort_custom asserted OFF; the extended band, staged snapshot + argsort asserted ON.
 	_gate_card_calt()      # S3 alt-band zone law (FP_STRUCT_CARD_ALT_BAND)
-	_gate_card_res()       # S3/§5 residency across altitude boundaries
-	_gate_card_sort()      # S2/§7 precomputed-distance argsort (FP_STRUCT_CARD_STAGE)
-	_gate_card_snapstage() # S4/§6 staged double-buffered snapshot (FP_STRUCT_CARD_STAGE)
+	_gate_card_res()       # S3/§5 residency across altitude boundaries (real prelude path)
+	_gate_card_sort()      # S2/§7 precomputed-distance argsort — set+cap equality + tie determinism
+	_gate_card_snapstage() # S4/§6 staged double-buffered snapshot + churn-starvation (FP_STRUCT_CARD_STAGE)
+	_gate_card_wake()      # S4/§8 wake fade-in — atomic, empty-only, no resident blink, zones S+B
 
 	print("=== VERIFY structures: ", _pass, " passed, ", _fail, " failed ===")
 	quit(1 if _fail > 0 else 0)
@@ -1544,7 +1545,7 @@ func _gate_card_cubecap() -> void:
 	reg.append(cardrec)
 	for r in reg:
 		t._card_prec[int(r["root"])] = t._precompute_card(r)
-	var c0 := t._structure_centre(reg[0])
+	var c0: Vector3 = t._structure_centre(reg[0])
 	var cam := c0 - c0.normalized() * 500.0
 	_ok(t._structure_dist(cardrec, cam) > t._structure_dist(reg[0], cam) and t._structure_dist(cardrec, cam) < CubeSphere.STRUCT_FAR_MAX,
 		"G-ST-CARD-CUBECAP: the card house is farther than the cube cluster and in-band (nearest-first reaches cubes first)")
@@ -1610,7 +1611,7 @@ func _gate_card_oom() -> void:
 		var czw := (float(bmin.z) + float(bmax.z) + 1.0) * 0.5
 		var wr := FA.lattice_to_world64(0, cxw, float(bmin.y), czw)
 		t._card_prec[root] = PackedFloat32Array([1.0, 0.0, 6.0, 6.0, 7.0, float(wr[0]), float(wr[1]), float(wr[2]), e_f.x, e_f.y, e_f.z, 0.0])
-	var c0 := t._structure_centre(reg[0])
+	var c0: Vector3 = t._structure_centre(reg[0])
 	var cam := c0 - c0.normalized() * 800.0
 	t._rebuild(reg, cam)
 	_ok(t.live_cards() == CubeSphere.STRUCT_CARD_INST_MAX and t.card_capped(),
@@ -1655,14 +1656,42 @@ func _gate_card_calt() -> void:
 	else:
 		_ok(not t.card_mmi_visible(), "G-ST-CALT(off): h=601 ⇒ card HIDDEN (shipped 600 cut, byte-identical)")
 
+# One real step()-EPOCH+SHELL frame WITHOUT a live ring: apply the zone law, then the version-gated prelude (+ the
+# swap-triggered rebuild). Drives the ACTUAL _apply_shell_visibility + _prelude_epoch path (not the debug wrappers /
+# _snap_start_fill). Returns whether a rebuild fired this frame.
+func _stage_frame(t, cam: Vector3, offsurf: bool, h: float) -> bool:
+	t._apply_shell_visibility(offsurf, h)
+	if t._prelude_epoch(cam, offsurf and h >= CubeSphere.FT_SHELL_HIDE_ALT):
+		t._rebuild(t._snapshot, cam, true)
+		return true
+	return false
+
+## Build + inject `count` synthetic card records clustered on facet 0 (distinct distances) with valid is_card=1 precs,
+## returns {reg, cam}. Roots are fabricated negative (distinct); dist ∈ card band from `cam`. For the SORT/WAKE gates.
+func _inject_cards(t, count: int) -> Dictionary:
+	var fb := FA.frame_basis(0)
+	var e_f := -fb.x
+	var reg: Array = []
+	for k in range(count):
+		var bmin := Vector3i(100 + (k % 50), 40, 100 + int(k / 50) * 3)
+		var bmax := bmin + Vector3i(6, 6, 6)
+		var root := -(200000 + k)
+		reg.append({"root": root, "fid": 0, "source": SG.SOURCE_GEN, "bmin": bmin, "bmax": bmax, "rev": 1})
+		var cxw := (float(bmin.x) + float(bmax.x) + 1.0) * 0.5
+		var czw := (float(bmin.z) + float(bmax.z) + 1.0) * 0.5
+		var wr := FA.lattice_to_world64(0, cxw, float(bmin.y), czw)
+		t._card_prec[root] = PackedFloat32Array([1.0, 0.0, 6.0, 6.0, 7.0, float(wr[0]), float(wr[1]), float(wr[2]), e_f.x, e_f.y, e_f.z, 0.0])
+	var c0: Vector3 = t._structure_centre(reg[0])
+	return {"reg": reg, "cam": c0 - c0.normalized() * 800.0}
+
 # =====================================================================================================================
-# G-ST-RES (S3 §5) — residency: crossing any altitude boundary toggles visible/tier_fade ONLY; the card buffer,
-# visible_instance_count, and rebuild_count all survive. Drives debug_apply_shell_visibility across the boundaries
-# after seeding a resident card set (the epoch prelude) and asserts nothing that would force a re-emit changed.
+# G-ST-RES (S3 §5) — residency across altitude boundaries, driving the REAL prelude path. A version-quiescent altitude
+# round-trip toggles visibility ONLY: NO rebuild fires, and the card buffer + _centres survive byte-for-byte; a genuine
+# version bump triggers EXACTLY one swap rebuild (so the resident buffer re-appears on descent without a re-emit).
 # =====================================================================================================================
 func _gate_card_res() -> void:
-	if not (CubeSphere.FP_STRUCT_CARDS and CubeSphere.FP_STRUCT_SHELL_BAND):
-		_ok(true, "G-ST-RES: cards/shell off ⇒ residency n/a (skipped)")
+	if not (CubeSphere.FP_STRUCT_CARDS and CubeSphere.FP_STRUCT_SHELL_BAND and CubeSphere.FP_STRUCT_REG_EPOCH):
+		_ok(true, "G-ST-RES: cards/shell/epoch not all on ⇒ residency n/a (skipped)")
 		return
 	var found := _find_house()
 	if found.is_empty():
@@ -1676,61 +1705,81 @@ func _gate_card_res() -> void:
 	t.set_registry_query(Callable(reg_src, "registry")); t.set_version_query(Callable(reg_src, "version"))
 	var centre := t._structure_centre(rec)
 	var cam := centre - centre.normalized() * 800.0
-	_epoch_prelude(t, cam)                             # seed + one rebuild (staged path converges + swaps under CARD_STAGE)
+	var primed := _stage_frame(t, cam, false, 41.0)   # prime (real prelude → staged swap → rebuild)
+	_ok(primed and t.live_cards() == 1, "G-ST-RES: prime — the card is resident (1), via a swap-triggered rebuild")
 	var rb := t.rebuild_count()
 	var vic := t.live_cards()
 	var buf_before := t.debug_card_buffer().duplicate()
-	# round-trip the altitude boundaries — visibility toggles only.
+	var centres_before: PackedVector3Array = t._centres.duplicate()
+	var extra := 0
 	for hh in [41.0, 599.0, 601.0, 2399.0, 2401.0, 601.0, 41.0]:
-		t.debug_apply_shell_visibility(hh > 256.0, hh)
-	_ok(t.rebuild_count() == rb, "G-ST-RES: an altitude boundary round-trip forces NO rebuild (delta 0)")
+		if _stage_frame(t, cam, hh > 256.0, hh):
+			extra += 1
+	_ok(extra == 0 and t.rebuild_count() == rb, "G-ST-RES: a version-quiescent altitude round-trip triggers NO rebuild (delta 0)")
 	_ok(t.live_cards() == vic, "G-ST-RES: visible card count unchanged across the boundaries")
-	_ok(t.debug_card_buffer() == buf_before, "G-ST-RES: the card instance buffer is byte-identical across the boundaries")
+	_ok(t.debug_card_buffer() == buf_before and t._centres == centres_before,
+		"G-ST-RES: the card buffer + _centres are byte-identical across the boundary round-trip (resident)")
+	# a genuine version bump ⇒ exactly one swap-triggered rebuild (the resident buffer re-populates on the real change).
+	reg_src.bump_edit(int(rec["root"]))
+	var did_edit := _stage_frame(t, cam, false, 41.0)
+	_ok(did_edit and t.rebuild_count() == rb + 1, "G-ST-RES: a genuine version bump ⇒ EXACTLY one swap-triggered rebuild")
 
 # =====================================================================================================================
-# G-ST-SORT (S2 §7 — FP_STRUCT_CARD_STAGE) — the precomputed-distance argsort. Proves (a) each _centres[i] distance ==
-# the per-record _structure_dist (the precompute is exact — no drift), and (b) the argsort over _centres yields the
-# SAME nearest-first DISTANCE sequence as the shipped sort_custom (ties allowed). Both flag states (pure ordering).
+# G-ST-SORT (S2 §7 — FP_STRUCT_CARD_STAGE) — the precomputed-distance argsort. (a) precompute exact; (b) the tie-stable
+# argsort emits the IDENTICAL card SET + cap flags as the shipped sort_custom, UNDER THE CAP (4k records, nearest-first);
+# (c) the tie-stable argsort is deterministic (repeat ⇒ byte-identical buffer). Set+cap equality, not a tautological seq.
 # =====================================================================================================================
 func _gate_card_sort() -> void:
+	# (a) precompute exactness over a real village.
 	var found := _find_houses(2)
 	if found.is_empty():
 		_ok(false, "G-ST-SORT: no facet with ≥2 GEN houses")
 		return
-	var recs: Array = found["recs"]
-	var reg_src := FakeReg.new(); reg_src.set_records(recs.duplicate())
-	var t = FS.new(); t.setup_instance(Node3D.new(), 0)
-	t.set_registry_query(Callable(reg_src, "registry")); t.set_version_query(Callable(reg_src, "version"))
-	t._resnapshot(1)                                  # fill _snapshot + _centres one-shot
-	var n: int = t._snapshot.size()
-	var c0 := t._structure_centre(t._snapshot[0])
-	var cam := c0 - c0.normalized() * 900.0
-	# (a) precompute exactness: _centres[i] distance == _structure_dist(_snapshot[i]).
+	var reg_src := FakeReg.new(); reg_src.set_records((found["recs"] as Array).duplicate())
+	var te = FS.new(); te.setup_instance(Node3D.new(), 0)
+	te.set_registry_query(Callable(reg_src, "registry")); te.set_version_query(Callable(reg_src, "version"))
+	te._resnapshot(1)
+	var ne: int = te._snapshot.size()
+	var ce: Vector3 = te._structure_centre(te._snapshot[0])
+	var came := ce - ce.normalized() * 900.0
 	var exact := true
-	for i in range(n):
-		if not is_equal_approx(cam.distance_to(t._centres[i]), t._structure_dist(t._snapshot[i], cam)):
+	for i in range(ne):
+		if not is_equal_approx(came.distance_to(te._centres[i]), te._structure_dist(te._snapshot[i], came)):
 			exact = false
 	_ok(exact, "G-ST-SORT: every _centres[i] distance == the per-record _structure_dist (precompute exact, no drift)")
-	# (b) argsort order == shipped sort order (compare the distance sequence — ties allowed).
-	var ship := []; ship.resize(n)
-	for i in range(n): ship[i] = i
-	ship.sort_custom(func(a, b): return t._structure_dist(t._snapshot[a], cam) < t._structure_dist(t._snapshot[b], cam))
-	var dc := PackedFloat32Array(); dc.resize(n)
-	var stg := []; stg.resize(n)
-	for i in range(n):
-		dc[i] = cam.distance_to(t._centres[i]); stg[i] = i
-	stg.sort_custom(func(a, b): return dc[a] < dc[b])
-	var same := true
-	for k in range(n):
-		if not is_equal_approx(t._structure_dist(t._snapshot[ship[k]], cam), dc[stg[k]]):
-			same = false
-	_ok(same, "G-ST-SORT: the precomputed-distance argsort yields the shipped nearest-first distance sequence (ties allowed)")
+	# (b)+(c) need cards actually EMITTED (FP_STRUCT_CARDS) and the argsort path (FP_STRUCT_CARD_STAGE) — ON-only.
+	if not (CubeSphere.FP_STRUCT_CARDS and CubeSphere.FP_STRUCT_CARD_STAGE):
+		_ok(true, "G-ST-SORT: cards/stage off ⇒ set+cap equality + determinism n/a (the shipped sort is the only path)")
+		return
+	# (b) SET + CAP equality under the cap: 4k injected cards. staged argsort (use_centres=true) vs shipped sort_custom
+	#     (use_centres=false) — assert IDENTICAL live_cards + cap flags.
+	var samp := func(_f: int, _c: Vector3i) -> int: return _grass()
+	var nearq := func(_f: int, _b: AABB) -> int: return NearPresence.UNKNOWABLE
+	var ta = FS.new(); ta.setup_instance(Node3D.new(), 0); ta.set_sampler(samp); ta.set_near_query(nearq)
+	var inj := _inject_cards(ta, 4000)
+	var reg: Array = inj["reg"]; var cam: Vector3 = inj["cam"]
+	# _centres index-parallel with reg (for the argsort path): compute them once (the resnapshot would key by root).
+	ta._centres = PackedVector3Array(); ta._centres.resize(reg.size())
+	for i in range(reg.size()):
+		ta._centres[i] = ta._structure_centre(reg[i])
+	ta._rebuild(reg, cam, true)                       # staged argsort (use_centres)
+	var a_cards := ta.live_cards(); var a_cq := ta.card_capped()
+	var a_buf := ta.debug_card_buffer().duplicate()
+	var ts = FS.new(); ts.setup_instance(Node3D.new(), 0); ts.set_sampler(samp); ts.set_near_query(nearq)
+	for root in ta._card_prec.keys():
+		ts._card_prec[root] = ta._card_prec[root]
+	ts._rebuild(reg, cam)                             # shipped sort_custom (use_centres=false ⇒ else branch)
+	_ok(a_cards == ts.live_cards() and a_cq == ts.card_capped() and a_cards == CubeSphere.STRUCT_CARD_INST_MAX,
+		"G-ST-SORT: argsort vs shipped-sort emit the IDENTICAL set size + cap flag under the cap (%d, capped)" % a_cards)
+	# (c) determinism (the root tie-key): a repeat argsort yields the identical buffer (heavily-tied fixture ⇒ this
+	#     ONLY holds because the tie-break is deterministic — an un-keyed argsort would flap the kept boundary set).
+	ta._rebuild(reg, cam, true)
+	_ok(ta.debug_card_buffer() == a_buf, "G-ST-SORT: the tie-stable argsort is deterministic (repeat ⇒ byte-identical buffer)")
 
 # =====================================================================================================================
-# G-ST-SNAPSTAGE (S4 §6 — FP_STRUCT_CARD_STAGE) — the staged double-buffered snapshot. Drives the REAL _snap_start_fill
-# / _snap_drain / _swap_snapshot state machine and asserts: the live snapshot is unchanged until the swap; the fill
-# converges within the pass bound; the post-swap buffers are byte-equal to a one-shot _resnapshot; a mid-fill version
-# restart resets the cursor. ON-only (staging is FP_STRUCT_CARD_STAGE; off the one-shot path is asserted elsewhere).
+# G-ST-SNAPSTAGE (S4 §6 — FP_STRUCT_CARD_STAGE) — the staged snapshot via the REAL prelude path: the live snapshot is
+# unchanged until the swap, the fill converges, the post-swap buffers are byte-equal to a one-shot _resnapshot, AND a
+# §2 CHURN-STARVATION test (version drift every frame) proves the swap STILL lands (coalescing) with a complete resident.
 # =====================================================================================================================
 func _gate_card_snapstage() -> void:
 	if not CubeSphere.FP_STRUCT_CARD_STAGE:
@@ -1742,28 +1791,25 @@ func _gate_card_snapstage() -> void:
 		return
 	var n: int = recs.size()
 	var reg_src := FakeReg.new(); reg_src.set_records(recs.duplicate())
-	var t = FS.new(); t.setup_instance(Node3D.new(), 0)
+	var samp := func(_f: int, _c: Vector3i) -> int: return _grass()
+	var nearq := func(_f: int, _b: AABB) -> int: return NearPresence.UNKNOWABLE
+	var t = FS.new(); t.setup_instance(Node3D.new(), 0); t.set_sampler(samp); t.set_near_query(nearq)
 	t.set_registry_query(Callable(reg_src, "registry")); t.set_version_query(Callable(reg_src, "version"))
-	# START a fill: live snapshot stays empty, pending latched, cursor 0.
-	t._snap_start_fill(int(reg_src.version()))
-	_ok(t.snap_pending() and t.snap_fill() == 0 and t._snapshot.is_empty(),
-		"G-ST-SNAPSTAGE: _snap_start_fill ⇒ pending, cursor 0, LIVE snapshot untouched (empty)")
-	# DRAIN to convergence; the live snapshot must stay empty until the swap; count passes.
-	var passes := 0
+	var c0: Vector3 = t._structure_centre(recs[0])
+	var cam := c0 - c0.normalized() * 900.0
+	# (a) drive the REAL prelude (draining) frames: the live snapshot stays empty until the swap; count frames.
+	var frames := 0
 	var swapped := false
-	while not swapped and passes < 4 * n:
-		var before: int = t._snapshot.size()
-		swapped = t._snap_drain()
-		passes += 1
-		if not swapped:
-			_ok(t._snapshot.size() == before, "G-ST-SNAPSTAGE: LIVE snapshot unchanged after a non-final drain pass")
-	_ok(swapped, "G-ST-SNAPSTAGE: the staged fill converges (swaps)")
-	_ok(passes <= int(ceil(float(n) / float(CubeSphere.STRUCT_SNAP_STAGE_MIN))) + 2,
-		"G-ST-SNAPSTAGE: converged within ⌈N/STRUCT_SNAP_STAGE_MIN⌉ passes (%d ≤ bound)" % passes)
-	_ok(t._snapshot.size() == n and not t.snap_pending(),
-		"G-ST-SNAPSTAGE: after the swap the LIVE snapshot == the new registry, pending cleared")
-	# BYTE-EQUAL to a one-shot resnapshot of the same registry.
-	var ref = FS.new(); ref.setup_instance(Node3D.new(), 0)
+	var live_ok := true
+	while not swapped and frames < 4 * n + 20:
+		swapped = t._prelude_epoch(cam, true)
+		frames += 1
+		if not swapped and t.snap_pending() and not t._snapshot.is_empty():
+			live_ok = false                            # the live snapshot changed BEFORE the swap
+	_ok(swapped and t._snapshot.size() == n, "G-ST-SNAPSTAGE: the staged fill converges + swaps the full village (real prelude path)")
+	_ok(live_ok, "G-ST-SNAPSTAGE: the LIVE snapshot is untouched until the swap (the old set renders resident)")
+	# (b) byte-equal to a one-shot resnapshot.
+	var ref = FS.new(); ref.setup_instance(Node3D.new(), 0); ref.set_sampler(samp)
 	ref.set_registry_query(Callable(reg_src, "registry")); ref.set_version_query(Callable(reg_src, "version"))
 	ref._resnapshot(int(reg_src.version()))
 	var centres_eq: bool = t._centres == ref._centres
@@ -1773,12 +1819,62 @@ func _gate_card_snapstage() -> void:
 			prec_eq = false
 	_ok(centres_eq and t._snap_rev_sum == ref._snap_rev_sum and prec_eq,
 		"G-ST-SNAPSTAGE: the staged snapshot is byte-equal to a one-shot _resnapshot (centres + rev-sum + card prec)")
-	# MID-FILL RESTART: a new version mid-fill resets the cursor to the new target.
-	t._snap_start_fill(5)
-	t._snap_drain()                                   # partial-or-full drain of version 5
-	t._snap_start_fill(6)                             # a new version arrives
-	_ok(t.snap_pending() and t.snap_fill() == 0 and t._snap_fill_ver == 6,
-		"G-ST-SNAPSTAGE: a mid-fill version bump restarts the fill at the new version (cursor 0)")
+	# (c) §2 CHURN STARVATION: drift the version EVERY frame; the swap STILL lands (coalescing, not restart) and the
+	#     resident village is NEVER partial/empty after the first swap (no ghosts, no gaps).
+	var churn_swaps := 0
+	var min_live := 0x7fffffff
+	for f in range(300):
+		reg_src.ver += 1
+		if t._prelude_epoch(cam, true):
+			churn_swaps += 1
+		if churn_swaps >= 1:
+			min_live = mini(min_live, t._snapshot.size())
+	_ok(churn_swaps >= 1, "G-ST-SNAPSTAGE: under version-drift-every-frame the swap STILL lands (coalescing — no starvation)")
+	_ok(min_live == n, "G-ST-SNAPSTAGE: the resident village stays COMPLETE (%d) under sustained drift (no ghosts/gaps)" % n)
+
+# =====================================================================================================================
+# G-ST-WAKE (S4 §8 — the wake fade-in rework) — (a) an EMPTY→populated (≥ JUMP) swap latches the wake AND publishes the
+# buffer with tier_fade == 0 (ATOMIC — no full-bright frame); (b) the ramp 0→1 over STRUCT_WAKE_FADE_S; (c) a
+# NONEMPTY→grown swap does NOT wake (the resident set never blinks); (d) BOTH zone S and zone B apply the wake fade.
+# =====================================================================================================================
+func _gate_card_wake() -> void:
+	if not (CubeSphere.FP_STRUCT_CARD_STAGE and CubeSphere.FP_STRUCT_CARDS):
+		_ok(true, "G-ST-WAKE: CARD_STAGE/CARDS off ⇒ wake n/a (skipped)")
+		return
+	var nearq := func(_f: int, _b: AABB) -> int: return NearPresence.UNKNOWABLE
+	# (a) EMPTY→populated: drive _rebuild_staged with _prev_live_cards=0 + the wake armed.
+	var t = FS.new(); t.setup_instance(Node3D.new(), 0); t.set_near_query(nearq)
+	var inj := _inject_cards(t, 100)
+	var reg: Array = inj["reg"]; var cam: Vector3 = inj["cam"]
+	t._prev_live_cards = 0
+	t._pending_wake_check = true
+	t._rebuild_staged(reg, cam, false)                # cn=100 ≥ WAKE_JUMP, from empty ⇒ wake
+	_ok(t.live_cards() == 100, "G-ST-WAKE: fixture — 100 cards emitted")
+	_ok(t.wake_t0() != 0, "G-ST-WAKE(a): an EMPTY→populated (≥ WAKE_JUMP) swap latches the wake")
+	_ok(absf(t.card_material_tier_fade()) < 1e-4,
+		"G-ST-WAKE(a): the new buffer is published with tier_fade == 0 (ATOMIC — no full-bright frame, the pop-then-fade fix)")
+	# (b) the ramp (manipulate the anchor — no wall-clock wait).
+	var wsec := CubeSphere.STRUCT_WAKE_FADE_S
+	t.debug_set_wake_t0(Time.get_ticks_msec())
+	_ok(t.wake_fade() < 0.2, "G-ST-WAKE(b): just-latched ⇒ wake_fade ≈ 0")
+	t.debug_set_wake_t0(Time.get_ticks_msec() - int(wsec * 500.0))
+	_ok(absf(t.wake_fade() - 0.5) < 0.2, "G-ST-WAKE(b): half-way ⇒ wake_fade ≈ 0.5")
+	t.debug_set_wake_t0(Time.get_ticks_msec() - int(wsec * 2000.0))
+	_ok(t.wake_fade() >= 0.999, "G-ST-WAKE(b): past the fade window ⇒ wake_fade == 1 (clamped)")
+	# (c) NONEMPTY→grown: NO wake (resident must not blink).
+	var t2 = FS.new(); t2.setup_instance(Node3D.new(), 0); t2.set_near_query(nearq)
+	var inj2 := _inject_cards(t2, 100)
+	t2._prev_live_cards = 80                           # the resident set was already showing 80
+	t2._pending_wake_check = true
+	t2._rebuild_staged(inj2["reg"], inj2["cam"], false)
+	_ok(t2.wake_t0() == 0, "G-ST-WAKE(c): a NONEMPTY→grown swap (80→100) does NOT wake-fade (the resident set never blinks)")
+	# (d) zones S AND B both apply the wake fade (§8 fix b). Re-arm a fresh wake on t, then apply the zone law.
+	t.debug_set_wake_t0(Time.get_ticks_msec())
+	t._apply_shell_visibility(false, 41.0)            # zone S (on-surface)
+	_ok(t.card_tier_fade() < 0.2, "G-ST-WAKE(d): zone S applies the wake fade (an on-surface/initial swap ramps, not pops)")
+	t.debug_set_wake_t0(Time.get_ticks_msec())
+	t._apply_shell_visibility(true, 700.0)            # zone B (shell band)
+	_ok(t.card_tier_fade() < 0.2, "G-ST-WAKE(d): zone B applies the wake fade")
 
 ## Collect up to `target` real GEN records across Earth facets (real roots ⇒ card-eligible), for the staging gates.
 func _collect_gen_records(target: int) -> Array:

@@ -181,6 +181,15 @@ var _guard_dirty_card := false          # card buffer zeroed this guard pass (ca
 var _last_rebuild_wall_ms := 0
 var _stale_ref_cam := Vector3.ZERO
 
+## FP_FT_STALE_PARKED (docs/COSMOS-LOD-DROPOUT-DESIGN.md §3.2, Stage S1): the trees' pending-restore latch — the converse
+## of the cull-only FP_FT_NEAR_GUARD (which only ever HIDES). Recomputed fresh each `_compute_nearcull_fp` pass: set true
+## whenever a near-presence probe DISAGREES with the committed visibility — COVERED on a still-SHOWN tree (a hide wants to
+## start) or NOT_COVERED on a dwell-held HIDDEN tree (a restore wants to advance). Pure read (never mutates a dwell
+## streak). It feeds `_stale_override` (§3.1) and OR-folds into `_rebuild_inputs_changed`, so a cull streak frozen at
+## credit 0 under a PARKED camera drains at the ≤0.5 Hz wall-clock floor instead of stalling unbounded. Read/written only
+## under FP_FT_STALE_PARKED ⇒ byte-identical off (never set, never read).
+var _ft_cull_pending := false
+
 # =====================================================================================================================
 # Shader — HEAD + VoxiLight.shade_glsl() + TAIL. Alpha-scissor (discard), opaque (no sort), cull_disabled (the
 # cross is double-sided). ALBEDO = atlas.rgb · voxi_shade(radial_n, sun_dir). planet_centre + sun_dir are uniforms.
@@ -582,6 +591,10 @@ func _nearcull_emit(fid: int, dist: float, bx: float, gy: float, bz: float) -> b
 ## (otherwise DELTA-skipped) rebuild. PURE READ: no dwell mutation (dwell advances only in the real rebuild, so the
 ## FT_CULL_DWELL count stays 'consecutive rebuilds'). Probes are capped at CULL_PROBE_CAP. Only called under the flag.
 func _compute_nearcull_fp(cam_abs: Vector3, wanted: Array) -> int:
+	# FP_FT_STALE_PARKED §3.2: recompute the pending-restore latch fresh each pass (set below on any presence/visibility
+	# disagreement). Reset here — before the is_valid early-out — so an unwired near-query settles it false. Off ⇒ untouched.
+	if CubeSphere.FP_FT_STALE_PARKED:
+		_ft_cull_pending = false
 	if not _near_query.is_valid():
 		return 0
 	var probe_hi := float(TerrainConfig.near_render_radius()) + 32.0 + 8.0
@@ -625,8 +638,12 @@ func _compute_nearcull_fp(cam_abs: Vector3, wanted: Array) -> int:
 			var dw := int(_cull_dwell.get(key, -1))
 			if st == NearPresence.COVERED:
 				fp ^= h
+				if CubeSphere.FP_FT_STALE_PARKED and dw < 0:
+					_ft_cull_pending = true          # §3.2: COVERED on a still-SHOWN tree ⇒ a hide wants to advance
 			elif st == NearPresence.NOT_COVERED and dw >= 0:
 				fp ^= _cull_mix(h, dw)
+				if CubeSphere.FP_FT_STALE_PARKED:
+					_ft_cull_pending = true          # §3.2: NOT_COVERED on a dwell-held HIDDEN tree ⇒ a restore wants to advance
 			elif st == NearPresence.UNKNOWABLE and dw >= 1:
 				fp ^= _cull_mix(h, dw) ^ FT_CULL_SALT_U
 	return fp
@@ -894,7 +911,14 @@ func step(settled := true, credit_ok := true, cam_render := Vector3.ZERO) -> voi
 func _stale_override(settled: bool, credit_ok: bool, cam_abs: Vector3) -> bool:
 	if not (CubeSphere.FP_FT_STALE_REBUILD and settled and not credit_ok):
 		return false
-	return Time.get_ticks_msec() - _last_rebuild_wall_ms >= FT_STALE_MS and cam_abs.distance_to(_stale_ref_cam) > FT_STALE_MOVE
+	if Time.get_ticks_msec() - _last_rebuild_wall_ms < FT_STALE_MS:
+		return false                                          # the ≤0.5 Hz wall-clock floor (BOTH arms — never removed)
+	# FP_FT_STALE_PARKED §3.1 (S1): drop the FT_STALE_MOVE conjunct so the floor fires for a PARKED camera too, but gate it
+	# on (moved ∨ _stale ∨ _ft_cull_pending) so a fully-settled parked camera with NOTHING latched/pending re-admits no
+	# rebuilds (the cost bound). Off ⇒ the shipped `moved > FT_STALE_MOVE` conjunct verbatim (byte-identical credit gate).
+	if CubeSphere.FP_FT_STALE_PARKED:
+		return cam_abs.distance_to(_stale_ref_cam) > FT_STALE_MOVE or _stale or _ft_cull_pending
+	return cam_abs.distance_to(_stale_ref_cam) > FT_STALE_MOVE
 
 ## FP_FT_STALE_REBUILD §4.1: record that a real rebuild just ran — resets the staleness floor (time + reference camera) so
 ## a still camera never re-triggers and a moving one rebuilds at most every FT_STALE_MS. Cheap unconditional write; the
@@ -1074,7 +1098,8 @@ func _rebuild_inputs_changed(cam_abs: Vector3, shell_mode := false, h := 0.0) ->
 		or _cache_epoch != _last_rebuild_cache_epoch \
 		or _current_edits_rev() != _last_rebuild_edits_rev \
 		or (CubeSphere.FP_FAR_TREES_COLORFIX and _stale) \
-		or (not shell_mode and CubeSphere.FP_FAR_TREES_NEARCULL and _pending_nearcull_fp != _last_rebuild_nearcull_fp)
+		or (not shell_mode and CubeSphere.FP_FAR_TREES_NEARCULL and _pending_nearcull_fp != _last_rebuild_nearcull_fp) \
+		or (CubeSphere.FP_FT_STALE_PARKED and _ft_cull_pending)
 	if changed:
 		_have_rebuilt = true
 		_last_rebuild_cam = cam_abs
@@ -1668,6 +1693,15 @@ func debug_set_stale_ref(cam_abs: Vector3, wall_ms: int) -> void:
 	_last_rebuild_wall_ms = wall_ms
 func debug_stale_ref_cam() -> Vector3:
 	return _stale_ref_cam
+
+## FP_FT_STALE_PARKED gate hooks (G-LG-FLOOR / G-LG-PENDING): drive/read the parked-floor latches directly, so the S1
+## predicate (wall-clock floor + the _stale / _ft_cull_pending disjuncts) is provable without a live ring or a 2 s wait.
+func debug_set_stale(v: bool) -> void:
+	_stale = v
+func debug_set_ft_cull_pending(v: bool) -> void:
+	_ft_cull_pending = v
+func debug_ft_cull_pending() -> bool:
+	return _ft_cull_pending
 
 ## FP_FT_NEAR_GUARD gate read-backs (G-FTG-*): captured live-impostor metadata rows, rows the guard has zero-scaled this
 ## epoch, and the world-space X-axis length of a mesh instance's live transform (≈0 once the guard has collapsed it — the

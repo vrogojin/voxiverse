@@ -129,6 +129,9 @@ func _initialize() -> void:
 		_gate_texmean()
 		# G-FTS (FP_FT_STALE_REBUILD, #132 P1): the ≤0.5Hz staleness floor — credit-0 rebuild-while-moving. Two-state.
 		_gate_stale()
+		# G-LG-FLOOR / G-LG-PENDING (FP_FT_STALE_PARKED, LOD-DROPOUT S1): the PARKED-camera wall-clock floor +
+		# pending-restore latch. Two-state, self-describing (off => the shipped move-AND-time override verbatim).
+		_gate_parked_floor()
 		# G-FTSB (FP_FT_SHELL_BAND, far-tree orbit dropout): the three-zone altitude visibility law + zone-B card-only
 		# rebuild + cadence + de-orbit latch. Two-state, self-describing (off ⇒ shipped binary offsurf⇒hide).
 		_gate_shell_band()
@@ -1499,6 +1502,117 @@ func _gate_stale() -> void:
 	_ok(tier.debug_stale_ref_cam().is_equal_approx(moved),
 		"G-FTS-4: a real rebuild resets the staleness reference camera (floor re-arms from the new pos)")
 	ring.queue_free()
+
+# ---- G-LG-FLOOR / G-LG-PENDING (FP_FT_STALE_PARKED — the LOD-dropout Stage S1 parked-camera floor) ------------------
+
+## docs/COSMOS-LOD-DROPOUT-DESIGN.md §3. Two-state, self-describing. S1 drops the FT_STALE_MOVE conjunct from the credit-0
+## override so the wall-clock floor fires for a PARKED camera too — but ONLY when the tier is _stale OR a cull restore is
+## pending (else a fully-settled parked camera re-admits NO rebuilds: the cost bound). Drives the decision directly
+## (debug_stale_override) with the latches set via debug hooks, so the full predicate is provable without a live ring or a
+## 2 s wall wait — the G-FTS pattern. G-LG-PENDING then proves the _ft_cull_pending latch is SET on a near-presence
+## disagreement and cleared on agreement (the M3 drain path), and opens the parked override off it.
+func _gate_parked_floor() -> void:
+	var parked := CubeSphere.FP_FT_STALE_PARKED
+	if not CubeSphere.FP_FT_STALE_REBUILD:
+		print("  (G-LG-FLOOR skipped — FP_FT_STALE_PARKED requires FP_FT_STALE_REBUILD sed-toggled true)")
+		return
+	var ring := _fake_ring()
+	var fid: int = _sample_facets()[0]
+	var tier = FT.new()
+	tier.setup_instance(ring, fid)
+	var cam0 := Vector3(1000.0, 2000.0, 3000.0)
+	var now := Time.get_ticks_msec()
+	var moved := cam0 + Vector3(FT.FT_STALE_MOVE + 8.0, 0.0, 0.0)
+	# time-stale reference (last rebuild FT_STALE_MS+1s ago); the camera stays PARKED at cam0 (moved 0 < FT_STALE_MOVE)
+	tier.debug_set_stale_ref(cam0, now - FT.FT_STALE_MS - 1000)
+
+	# --- case A: parked + _stale latched (the primary M1 fix) ---
+	tier.debug_set_stale(true); tier.debug_set_ft_cull_pending(false)
+	if parked:
+		_ok(tier.debug_stale_override(true, false, cam0),
+			"G-LG-FLOOR-ON: parked (no-move) STALE tier => wall-clock override fires (the parked-descent fix)")
+	else:
+		_ok(not tier.debug_stale_override(true, false, cam0),
+			"G-LG-FLOOR-OFF: parked STALE tier => NO override off-flag (shipped: needs move > FT_STALE_MOVE)")
+
+	# --- case B: parked + pending cull-restore (the M3 drain) ---
+	tier.debug_set_stale(false); tier.debug_set_ft_cull_pending(true)
+	if parked:
+		_ok(tier.debug_stale_override(true, false, cam0),
+			"G-LG-FLOOR-ON: parked tier with a pending cull-restore => override fires (M3 drains at the floor)")
+	else:
+		_ok(not tier.debug_stale_override(true, false, cam0),
+			"G-LG-FLOOR-OFF: parked pending tier => NO override off-flag (byte-identical credit gate)")
+
+	# --- case C (the cost bound, holds in BOTH states): parked + nothing latched/pending => NO override ---
+	tier.debug_set_stale(false); tier.debug_set_ft_cull_pending(false)
+	_ok(not tier.debug_stale_override(true, false, cam0),
+		"G-LG-FLOOR: parked SETTLED tier (not stale, nothing pending) => NO override in EITHER state (zero-cost bound)")
+
+	# --- case D: the wall-clock floor still holds — a fresh rebuild ref blocks the parked override even when stale ---
+	tier.debug_set_stale(true)
+	tier.debug_set_stale_ref(cam0, now)
+	_ok(not tier.debug_stale_override(true, false, cam0),
+		"G-LG-FLOOR: < FT_STALE_MS since the last rebuild => NO override even when stale (the <=0.5 Hz floor holds)")
+
+	# --- case E (BOTH states): a MOVED camera still overrides (the shipped move disjunct is preserved) ---
+	tier.debug_set_stale(false); tier.debug_set_ft_cull_pending(false)
+	tier.debug_set_stale_ref(cam0, now - FT.FT_STALE_MS - 1000)
+	_ok(tier.debug_stale_override(true, false, moved),
+		"G-LG-FLOOR: moved > FT_STALE_MOVE => override in BOTH states (shipped move disjunct survives)")
+	_ok(not tier.debug_stale_override(true, true, moved),
+		"G-LG-FLOOR: credit OK => no override (the normal path already rebuilds)")
+	_ok(not tier.debug_stale_override(false, false, moved),
+		"G-LG-FLOOR: not settled => never overrides (fresh-load pile-up stays protected)")
+	ring.queue_free()
+
+	# --- G-LG-PENDING: the _ft_cull_pending latch — SET on a near-presence disagreement, cleared on agreement, and then it
+	# opens the parked override. Needs the NEARCULL+DELTA+MESH fp path that maintains it (self-describes/skips otherwise). ---
+	if not (CubeSphere.FP_FAR_TREES_NEARCULL and CubeSphere.FP_FAR_TREES_DELTA and CubeSphere.FP_FAR_TREES_MESH):
+		print("  (G-LG-PENDING skipped — needs FP_FAR_TREES_NEARCULL + _DELTA + _MESH, the fp path that maintains the latch)")
+		return
+	var ring2 := _fake_ring()
+	var tp = FT.new()
+	tp.setup_instance(ring2, fid)
+	var d := FA.cell_dir(fid, (FA.dom_min(fid).x + FA.dom_max(fid).x) / 2, (FA.dom_min(fid).y + FA.dom_max(fid).y) / 2)
+	var centre := Vector3(d.x, d.y, d.z) * FA.R_BLOCKS
+	var radial := centre.normalized()
+	var up := Vector3(0, 1, 0)
+	if absf(radial.dot(up)) > 0.99: up = Vector3(1, 0, 0)
+	var tangent := radial.cross(up).normalized()
+	var one := PackedFloat32Array()
+	var pd := centre + tangent * 140.0          # inside the probe annulus [FT_CULL_MIN=64, near_render_radius()+40=168]
+	var pr := pd.normalized()
+	one.push_back(pd.x); one.push_back(pd.y); one.push_back(pd.z)
+	one.push_back(pr.x); one.push_back(pr.y); one.push_back(pr.z)
+	one.push_back(0.0); one.push_back(5.0); one.push_back(140.0); one.push_back(10.0); one.push_back(0.0)
+	tp.debug_set_cache(fid, one)
+	# step 1: COVERED probe on a still-SHOWN tree => a hide wants to start => pending SET
+	tp.set_near_query(func(_f, _b): return NearPresence.COVERED)
+	tp.debug_step([fid], centre)
+	if parked:
+		_ok(tp.debug_ft_cull_pending(),
+			"G-LG-PENDING-ON: COVERED on a shown far tree SETS _ft_cull_pending (a hide wants to advance)")
+	else:
+		_ok(not tp.debug_ft_cull_pending(),
+			"G-LG-PENDING-OFF: _ft_cull_pending never set off-flag (the latch is inert)")
+	# step 2: still COVERED, now the tree is committed-HIDDEN => probe AGREES => pending CLEARS (no churn while settled)
+	tp.debug_step([fid], centre)
+	if parked:
+		_ok(not tp.debug_ft_cull_pending(),
+			"G-LG-PENDING-ON: steady COVERED on a hidden tree CLEARS _ft_cull_pending (quiet while settled)")
+	# step 3: near unloads (NOT_COVERED) on the still-hidden tree => a restore wants to advance => pending SET again, and
+	# the parked credit-0 override now fires off it (the M3 drain, end-to-end)
+	tp.set_near_query(func(_f, _b): return NearPresence.NOT_COVERED)
+	tp.debug_step([fid], centre)
+	if parked:
+		_ok(tp.debug_ft_cull_pending(),
+			"G-LG-PENDING-ON: NOT_COVERED on a hidden tree re-SETS _ft_cull_pending (a restore wants to advance)")
+		tp.debug_set_stale(false)
+		tp.debug_set_stale_ref(centre, now - FT.FT_STALE_MS - 1000)
+		_ok(tp.debug_stale_override(true, false, centre),
+			"G-LG-PENDING-ON: a pending restore opens the parked credit-0 override (the streak drains at the floor)")
+	ring2.queue_free()
 
 # ---- G-NP (NearPresence tri-state predicate) -----------------------------------------------------------------------
 

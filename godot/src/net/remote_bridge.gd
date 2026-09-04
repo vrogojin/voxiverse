@@ -726,7 +726,11 @@ func _capture_worst_frame_snapshot() -> Dictionary:
 			# FP_WF_TIER_ATTR S1 (docs/COSMOS-SURFACE-ENTRY-SPIKE-DESIGN.md): per-tier worst-frame self-time markers (us)
 			# — present only under the flag (absent keys => not merged => byte-identical telemetry off). These pin the
 			# surface->off-surface flip spike to a tier (far-tree rebuild / orbit-relief / ring dispatch prelude / ring swap).
-			for _wk in ["wf_ftr_us", "wf_or_us", "wf_ring_disp_us", "wf_ring_swap_us", "ft_flip_defers", "shell_ascent_lazy_arms"]:
+			# break-freeze attribution (FP_WORST_FRAME_ATTR): wf_collapse_ms (full _structural_update), wf_solve_ms
+			# (nested StructuralSolver.solve), wf_reclust_ms (tracker _recluster_all, debounced later frame), and the
+			# cumulative wf_ftr_edit_fires (edits that bump edit_count → far-tree rebuild). Absent off-flag ⇒ byte-identical.
+			for _wk in ["wf_ftr_us", "wf_or_us", "wf_ring_disp_us", "wf_ring_swap_us", "ft_flip_defers", "shell_ascent_lazy_arms",
+					"wf_collapse_ms", "wf_solve_ms", "wf_reclust_ms", "wf_ftr_edit_fires"]:
 				if (wm as Dictionary).has(_wk):
 					snap[_wk] = (wm as Dictionary).get(_wk, 0)
 			# FP_STRUCT_EDIT_DEBOUNCE (§7): the far-edit debounce sensors — present only under the flag (absent keys ⇒

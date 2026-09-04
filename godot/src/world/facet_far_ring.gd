@@ -3997,6 +3997,13 @@ func shell_telemetry() -> Dictionary:
 	# FP_FAR_TERMINATOR_WELD sun-echo telemetry: each far tier's OWN live shader sun_dir, so a live A/B can confirm
 	# they all track the same Sun (pre-fix: sd_v2 stuck ~(1,0,0) day while others live; post-fix: all match). Off =>
 	# the keys are never added to the dict => byte-identical for any telemetry consumer.
+	# FP_SKIN_READY_GATE / FP_WORST_FRAME_ATTR (docs/COSMOS-LOD-DROPOUT-DESIGN.md §6): the far-structure card-tier state —
+	# st_skin_hold/st_skin_frac/st_skin_held + the drawable-gap counters (st_gap_ms/st_gap_worst_ms/st_hold_ms). card_state()
+	# returns {} off FP_STRUCT_CARDS and adds the skin/gap keys only under their own flags ⇒ byte-identical off.
+	if CubeSphere.FP_STRUCT_CARDS and _far_structures != null:
+		var cs2 = _far_structures.card_state()
+		if cs2 is Dictionary and not (cs2 as Dictionary).is_empty():
+			out.merge(cs2 as Dictionary)
 	if CubeSphere.FP_FAR_TERMINATOR_WELD:
 		out["sd_shell"] = _shell_sun_dir_telemetry()
 		out["sd_v2"] = (_smooth_v2.sun_dir_telemetry() if _smooth_v2 != null else Vector3(1.0, 0.0, 0.0))

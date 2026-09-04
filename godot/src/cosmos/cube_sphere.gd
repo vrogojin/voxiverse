@@ -1531,8 +1531,15 @@ const FP_SKIN_HANDOFF_PREWARM := false       # baker "handoff" priority class + 
 const FT_SHELL_HOLD_MAX_ALT := 900.0         # far-tree hold ceiling (blocks): release the mesh/card even if skin not ready (> FT_SHELL_HIDE_ALT 600)
 const STRUCT_CARD_HOLD_MAX_ALT := 2800.0     # far-structure card hold ceiling (blocks): release even if skin not ready (> STRUCT_CARD_HIDE_ALT 2400)
 const SKIN_HANDOFF_MARGIN_ALT := 40.0        # blocks below *_FADE_ALT at which the readiness-hold logic starts watching
-const SKIN_READY_MIN := 1.0                  # min baked fraction (0..1) of wanted skin fids to release the hold (< ⇒ hold)
+const SKIN_READY_MIN := 0.9                  # min baked fraction (0..1) of the EMITTED-card skin fids to release the hold
+                                             # (< ⇒ hold). 0.9 (not 1.0) so a single slow-baking straggler in the actual
+                                             # committed set can't pin the whole tier to the ceiling (Codex P0 amplifier).
 const SKIN_HOLD_FADE := 1.0                  # tier_fade floor (0..1) while holding — keep the tier fully visible, no dissolve
+## FP_SKIN_HANDOFF_PREWARM §4.3: the descent-prewarm un-freeze ceiling (blocks, radial altitude). The page baker is only
+## un-frozen off-surface when the skin is retired AND the camera has fallen BELOW this — a bounded window that gives the
+## descent lead time to prebake the 600/2400 handoff disc, WITHOUT baking invisibly through all of parked orbit above it
+## (Codex P1). Above the struct card-hold ceiling (2800) + margin so the roof skin prebakes before the 2400 handoff.
+const SKIN_PREWARM_MAX_ALT := 3600.0
 
 ## FP_STRUCT_CARD_STAGE (docs/COSMOS-CARD-BAND-HANDOFF-DESIGN.md §6-§7, Stage 3 S2+S4) — kills the ~1136 ms crossing
 ## spike, two composing fixes. (S2/§7) THE SORT BOMB: _rebuild's nearest-first sort_custom recomputes _structure_dist

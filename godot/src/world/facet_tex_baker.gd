@@ -535,13 +535,41 @@ func set_frozen(frozen: bool) -> void:
 	_frozen = frozen
 
 # --- S3/S4 skin-handoff readiness (docs/COSMOS-LOD-DROPOUT-DESIGN.md §4) -------------------------
-## FP_SKIN_READY_GATE §4.1: is facet `fid`'s SKIN actually baked for the card→skin handover? Under FP_PAGES_SHOT the
-## canopy/roof pixels live only in the g1 shot bake (_shot_baked); otherwise the g0 floor (_baked) already carries the
-## far colour. Pure dict lookup ⇒ cheap enough to call per visible facet each (rate-capped) tier step. WorldManager
-## wires this to the tier's `skin_ready` query only under the flag ⇒ unwired ⇒ the tier's ready_frac degrades to 1.0
-## ⇒ the shipped pure-altitude hide (byte-identical).
-func handoff_ready(fid: int) -> bool:
+## FP_SKIN_READY_GATE §4.1: is facet `fid`'s BASE page covered? The g1 shot (real shot incl trees, _shot_baked) when
+## FP_PAGES_SHOT serves, else the g0 palette floor (_baked). This is the coverage-sentinel surface — a facet whose base
+## texels are still alpha 0 draws the flat vertex-colour ring (no skin at all). Kept as its own predicate because the
+## S4 handoff bake CLASS produces exactly this surface (see _next_handoff_fid).
+func _base_covered(fid: int) -> bool:
 	return _shot_baked.has(fid) if _shot_on else _baked.has(fid)
+
+## FP_SKIN_READY_GATE §4.1: is facet `fid`'s SKIN actually baked for the card→skin handover — i.e. does the surface the
+## cards DISSOLVE INTO actually carry this facet's canopy/roof pixels yet? (Codex P1: the shipped predicate checked only
+## the base page, which is terrain colour WITHOUT the tree/roof replacement — it reported "ready" while the real skin was
+## still empty, so the tier released into a blank = the very dropout this gate fixes.) When the whole-planet FINE map is
+## live (FP_PLANET_MAP → _fm_on) it is the rung-3 canopy/roof speckle that OWNS the view above the hide line, so require
+## its tile COMMITTED (_fine_commit → _fine_baked) AND the base page present (else the sentinel shows the flat ring).
+## An edit (chop) erases _fine_baked (invalidate_far_skin) but not the base — so the hold correctly re-arms until the
+## fresh skin re-bakes. With no fine map, the g1 shot (trees baked in) / g0 base IS the whole far skin, so base coverage
+## alone defines readiness. Pure dict lookups ⇒ cheap per visible facet each (rate-capped) tier step. Unwired ⇒ the
+## tier's ready_frac degrades to 1.0 ⇒ the shipped pure-altitude hide (byte-identical).
+func handoff_ready(fid: int) -> bool:
+	if _fm_on:
+		return _fine_uploaded(fid) and _base_covered(fid)
+	return _base_covered(fid)
+
+## FP_SKIN_READY_GATE §4.1 (Codex GAP-B): is facet `fid`'s FINE tile actually on the GPU? `_fine_baked` is only CPU
+## residency (set at _fine_commit); the sub-page layer that holds the tile uploads on a THROTTLE (~1 layer / 15 frames,
+## `_fm_dirty` drained in _update_band_parallel), and the shell shader samples the GPU Texture2DArray — so a fid can be
+## `_fine_baked` while its layer is still dirty (un-uploaded) = a false-ready release into an empty skin. Require the
+## layer NOT dirty. Conservative (a co-resident neighbour re-dirtying the layer holds this fid a few frames too) but SAFE
+## (never releases into an un-uploaded tile); the throttle drains + the hold ceiling both bound the extra wait. The layer
+## index mirrors _fine_commit exactly.
+func _fine_uploaded(fid: int) -> bool:
+	if not _fine_baked.has(fid):
+		return false
+	var d := _decode(fid)
+	var layer := int(d[0]) * 4 + (int(d[2]) / _fm_quad) * 2 + (int(d[1]) / _fm_quad)
+	return not _fm_dirty.has(layer)
 
 ## FP_SKIN_READY_GATE §4.1: the baked fraction of a supplied facet set (the tier's card-band handoff set). Empty set
 ## ⇒ 1.0 (nothing to wait for ⇒ do not hold). Bounded by the set size (≤ the card-band facet count, ~180) — one dict
@@ -572,8 +600,11 @@ func _next_handoff_fid(axis: Array) -> int:
 	var best_dot := HANDOFF_DOT_MIN
 	var total := _base_all
 	for fid in range(total):
-		if handoff_ready(fid):
-			continue                    # already ready ⇒ not a handoff unit
+		# This class BAKES the base page (bake_facet[_shot] below), so it selects by _base_covered — NOT handoff_ready.
+		# (Under a live fine map handoff_ready also requires _fine_baked, which the fine cursor drains; selecting on it
+		# here would loop forever re-baking an already-covered base whose fine tile is not this class's to produce.)
+		if _base_covered(fid):
+			continue                    # its base page is done ⇒ not a base-handoff unit
 		var c: Vector3 = _centre_pack[fid]
 		var dot := c.x * ax + c.y * ay + c.z * az
 		if dot > best_dot:

@@ -79,12 +79,42 @@ func _gate_skin_ready(fid: int) -> void:
 	_ok(baker.ready_frac([fid]) == 1.0 and baker.ready_frac([fid, f1]) == 0.5,
 		"G-SKIN-READY: ready_frac = |ready|/|set| ({fid} baked, {f1} not ⇒ 0.5)".format({"fid": fid, "f1": f1}))
 
+	# G-SKIN-READY (Codex P1 — false-ready): the shipped predicate checked ONLY the base page (_shot_baked/_baked), which
+	# is terrain colour WITHOUT the tree/roof replacement — so it reported "ready" while the real skin was still blank and
+	# the tier released into a dropout. When the fine map is the live skin (_fm_on), readiness MUST require the FINE tile
+	# committed (_fine_commit → _fine_baked) AND the base page. Force _fm_on to prove the corrected predicate directly.
+	var bf := FacetTexBaker.new(); bf.setup(fid)
+	bf._fm_on = true
+	bf._fm_quad = CubeSphere.PLANET_MAP_QUAD               # _fine_uploaded's layer math needs the quad edge (setup() skips the fine map)
+	bf.bake_facet(fid)                                     # base page covered — the OLD predicate would (wrongly) say ready
+	_ok(not bf.handoff_ready(fid),
+		"G-SKIN-READY(fine): base baked but fine tile NOT ⇒ NOT handoff_ready (false-ready falsified — the P1 fix)")
+	# GAP-B (GPU-upload false-ready): mark the fine tile CPU-committed but its sub-page LAYER still dirty (un-uploaded).
+	var dd := bf._decode(fid)
+	var layer := int(dd[0]) * 4 + (int(dd[2]) / bf._fm_quad) * 2 + (int(dd[1]) / bf._fm_quad)
+	bf._fine_baked[fid] = true
+	bf._fm_dirty[layer] = true                             # committed to CPU page but NOT yet uploaded to the GPU array
+	_ok(not bf.handoff_ready(fid),
+		"G-SKIN-READY(fine): fine baked but LAYER still dirty (un-uploaded) ⇒ NOT ready (GAP-B GPU-throttle false-ready falsified)")
+	bf._fm_dirty.erase(layer)                              # the throttled update_layer lands ⇒ on the GPU
+	_ok(bf.handoff_ready(fid), "G-SKIN-READY(fine): fine tile uploaded (layer clean) + base ⇒ handoff_ready (the real skin is on-screen)")
+	var bf2 := FacetTexBaker.new(); bf2.setup(fid); bf2._fm_on = true; bf2._fm_quad = CubeSphere.PLANET_MAP_QUAD
+	bf2._fine_baked[fid] = true                            # fine uploaded (no dirty layer) but base page absent
+	_ok(not bf2.handoff_ready(fid),
+		"G-SKIN-READY(fine): fine uploaded but base page NOT ⇒ NOT ready (the coverage sentinel still needs the base page)")
+
 	# The emit axis toward the (ready) spawn facet's centre — _next_handoff_fid must return an UN-READY facet, never fid.
 	var c = FA.cell_dir(fid, (FA.dom_min(fid).x + FA.dom_max(fid).x) / 2, (FA.dom_min(fid).y + FA.dom_max(fid).y) / 2)
 	var axis: Array = [c.x, c.y, c.z]
 	var hf := baker._next_handoff_fid(axis)
 	_ok(hf != fid, "G-SKIN-PRI: _next_handoff_fid never returns the already-ready facet")
 	_ok(hf < 0 or not baker.handoff_ready(hf), "G-SKIN-PRI: _next_handoff_fid returns an UN-READY facet (or -1 when the disc is all ready)")
+	# priority == the wanted set: the selected handoff fid is inside the near-axis cap (the visible disc the player is
+	# descending into), never a far-side facet — so the budget serves what will be handed off, not a random backside bake.
+	if hf >= 0:
+		var chf: Vector3 = baker._centre_pack[hf]
+		_ok(chf.x * axis[0] + chf.y * axis[1] + chf.z * axis[2] >= FacetTexBaker.HANDOFF_DOT_MIN,
+			"G-SKIN-PRI: the selected handoff fid is inside the near-axis cap (priority serves the wanted/visible disc)")
 	# Bake the whole nearest-axis disc ready ⇒ _next_handoff_fid returns -1 (the hold would release; convergence proof).
 	for f in range(total):
 		var cf: Vector3 = baker._centre_pack[f]

@@ -201,8 +201,25 @@ var _ft_cull_pending := false
 ## the card-band handoff set (FacetTexBaker.ready_frac). Unset ⇒ `_skin_ready_frac()` returns 1.0 ⇒ the hold never
 ## arms ⇒ the shipped pure-altitude zone-O hide verbatim (byte-identical). Read only under the flag.
 var _skin_ready_query: Callable = Callable()
+## FP_SKIN_READY_GATE §4.2 (Codex P0): the EMITTED-card handoff set — the DISTINCT facets that actually rendered a card
+## instance in the last _rebuild_cards commit (populated at the real _write_card sink, published atomically with the
+## card buffer). This — NOT the over-broad `_last_wanted` scan (which includes wanted-but-capped-out / near-culled
+## facets that render nothing) — is what the tier is genuinely holding, so it is the set whose skin readiness gates the
+## release. Empty ⇒ nothing on screen to hold ⇒ ready_frac 1.0 ⇒ no hold. Only touched under the flag (byte-off: the
+## empty dict is allocated once at construct and never cleared/written off-flag).
+var _skin_hold_fids: Dictionary = {}
 var _dbg_skin_hold := false             # S3 gate read-back: the card→skin hold was active last step
 var _dbg_skin_ready_frac := 1.0         # S3 gate read-back: the handoff set's baked fraction last step
+# FP_WORST_FRAME_ATTR (docs/COSMOS-LOD-DROPOUT-DESIGN.md §6): drawable-gap + hold telemetry for the live A/B. gap_ms =
+# accumulated wall-time the tier was in the DROPOUT state (off-surface, in the card band, with NO drawable cards AND the
+# replacement skin not yet ready) — the exact user-visible bug; gap_worst_ms = the longest single such contiguous run
+# (the A arm should show 2-30 s, the B arm ≤ ~2 s); hold_ms = time the readiness gate held cards. Only written under the
+# flag (leaf ints/floats, read only under the flag ⇒ byte-identical off).
+var _dbg_gap_ms := 0
+var _dbg_gap_worst_ms := 0
+var _dbg_hold_ms := 0
+var _dbg_gap_run_ms := 0                 # current contiguous gap run (ms), folded into worst on exit
+var _dbg_telem_last_ms := 0             # wall clock at the last telemetry tick (0 = un-primed)
 
 # =====================================================================================================================
 # Shader — HEAD + VoxiLight.shade_glsl() + TAIL. Alpha-scissor (discard), opaque (no sort), cull_disabled (the
@@ -575,13 +592,41 @@ func set_near_query(q: Callable) -> void:
 func set_skin_ready_query(q: Callable) -> void:
 	_skin_ready_query = q
 
-## FP_SKIN_READY_GATE §4.2: the baked fraction of THIS tier's card-band handoff set (`_last_wanted`, exactly the facets
-## the tier is about to hand to the skin). Unwired ⇒ 1.0 (degrade to the shipped hide). Called once per step, in the
-## rate-capped step(), so the ≤180 dict lookups inside ready_frac are negligible.
+## FP_SKIN_READY_GATE §4.2: the baked fraction of THIS tier's EMITTED-card handoff set (`_skin_hold_fids` — the facets
+## that actually rendered a card last commit, NOT the over-broad `_last_wanted` want-scan; Codex P0). Unwired query OR an
+## empty emitted set ⇒ 1.0 (degrade to the shipped hide / nothing to hold). Called once per step, in the rate-capped
+## step(), so the ≤ card-instance-cap dict lookups inside ready_frac are negligible.
 func _skin_ready_frac() -> float:
-	if not _skin_ready_query.is_valid():
+	if not _skin_ready_query.is_valid() or _skin_hold_fids.is_empty():
 		return 1.0
-	return float(_skin_ready_query.call(_last_wanted))
+	return float(_skin_ready_query.call(_skin_hold_fids.keys()))
+
+## FP_WORST_FRAME_ATTR (§6): accumulate the drawable-GAP + hold telemetry once per step (called before step()'s zone-O
+## early-return so the timer advances while the tier is hidden — precisely the gap state). A GAP is: off-surface, inside
+## the handoff altitude window, with NO DRAWABLE cards (node visible AND visible_instance_count > 0 — Codex: measure
+## drawable content, not just node.visible) AND the replacement skin not yet ready. Off ⇒ returns immediately (byte-off).
+func _skin_telem_tick(offsurf: bool, h: float) -> void:
+	if not CubeSphere.FP_WORST_FRAME_ATTR:
+		return
+	var now := Time.get_ticks_msec()
+	var dt := 0
+	if _dbg_telem_last_ms != 0:
+		dt = maxi(0, now - _dbg_telem_last_ms)
+	_dbg_telem_last_ms = now
+	if dt <= 0 or not CubeSphere.FP_FT_SHELL_BAND:
+		return
+	if _dbg_skin_hold:
+		_dbg_hold_ms += dt
+	var in_band := offsurf and h >= (CubeSphere.FT_SHELL_FADE_ALT - CubeSphere.SKIN_HANDOFF_MARGIN_ALT) \
+			and h < (CubeSphere.FT_SHELL_HOLD_MAX_ALT + 200.0)
+	var drawable := _mmi != null and _mmi.visible and _mm != null and _mm.visible_instance_count > 0
+	var skin_ok := _skin_ready_frac() >= CubeSphere.SKIN_READY_MIN
+	if in_band and not drawable and not skin_ok:
+		_dbg_gap_ms += dt
+		_dbg_gap_run_ms += dt
+		_dbg_gap_worst_ms = maxi(_dbg_gap_worst_ms, _dbg_gap_run_ms)
+	else:
+		_dbg_gap_run_ms = 0
 
 ## FP_FAR_TREES_NEARCULL §5.2-§5.3: should this tree's FAR impostor be EMITTED, given the NEAR field's ACTUAL mesh
 ## presence? Only the uncertainty annulus [FT_CULL_MIN, near_render_radius()+40] is probed (below ⇒ never emit — the near
@@ -895,6 +940,7 @@ func step(settled := true, credit_ok := true, cam_render := Vector3.ZERO) -> voi
 	# visible (no gap) while the paced zone-B rebuild is deferred. No-op unless the flag is live.
 	_note_shell_flip(shell_mode)
 	_apply_visibility(offsurf, h, hide_alt)
+	_skin_telem_tick(offsurf, h)   # FP_WORST_FRAME_ATTR: gap/hold accounting BEFORE the zone-O early-return (byte-off)
 	if offsurf and not shell_mode:
 		return
 	# FP_FT_SHELL_BAND §3.3: drive the tier dissolve uniform every frame (cheap, no rebuild) — 1.0 in zone S, ramping to 0
@@ -1272,6 +1318,12 @@ func _rebuild_cards(cam_abs: Vector3, wanted: Array, shell_mode := false) -> voi
 	buf.resize(cap * CARD_STRIDE)
 	var n := 0
 	var capped := false
+	# FP_SKIN_READY_GATE §4.2 (Codex P0): rebuild the EMITTED-card handoff set from the ACTUAL card sink below (a fid is
+	# added only when a card instance is truly written for it), published atomically with `buf`. Cleared here, before the
+	# emit loop; off ⇒ never touched (byte-identical). See _skin_hold_fids.
+	var gather_hold := CubeSphere.FP_SKIN_READY_GATE and CubeSphere.FP_FT_SHELL_BAND
+	if gather_hold:
+		_skin_hold_fids.clear()
 	for fid in wanted:
 		if n >= cap:
 			capped = true
@@ -1334,6 +1386,11 @@ func _rebuild_cards(cam_abs: Vector3, wanted: Array, shell_mode := false) -> voi
 			var snow := 1.0 if (raw & 8) != 0 else 0.0    # bit 3 = P3 snow flag (always 0 with SNOW off)
 			# .w carries the dither alpha under FADE (0.0 off); .z carries the snow flag (0.0 off) — byte-identical.
 			_write_card(buf, n * CARD_STRIDE, sx, sy, sz, rx, ry, rz, trunk_h, col, hue, alpha if fade else 0.0, snow, fb)
+			# FP_SKIN_READY_GATE §4.2 (Codex P0): this facet actually rendered a card ⇒ it is genuinely held → part of the
+			# skin-readiness handoff set. (Recorded at the true sink so capped-out / near-culled facets that emit nothing
+			# are excluded — the set equals what is on screen.)
+			if gather_hold:
+				_skin_hold_fids[int(fid)] = true
 			# FP_FT_NEAR_GUARD §1: when the mesh rung is OFF the cards own the near frontier, so record card impostors for the
 			# guard (mm_sel = −1 → the shared card MultiMesh; slot = n). With meshes ON, cards live ≥448 (never guard-relevant)
 			# so they're not recorded — the mesh capture owns the frontier. Only under the flag ⇒ byte-identical off.
@@ -1873,6 +1930,25 @@ func debug_apply_visibility(offsurf: bool, h := -1.0, hide_alt := -1.0) -> void:
 ## FP_SKIN_READY_GATE gate hook (G-SKIN-GATE): replicate step()'s hold decision + visibility + tier_fade for a scripted
 ## altitude sweep (no live ring). Uses the wired _skin_ready_query (a gate stub) exactly as step() does. Returns the
 ## computed {skin_hold, skin_ready_frac, hide_alt, ft_cards (card MMI visible), tier_fade, ft_stale}.
+## G-SKIN-GATE helper: seed the emitted-card handoff set directly so a scripted hold test can drive ready_frac through
+## the wired query WITHOUT a live card rebuild (the hold-law tests). The REAL construction is exercised by
+## debug_rebuild_cards below (G-SKIN-SET). Only a gate touches this.
+func debug_seed_skin_hold_fids(fids: Array) -> void:
+	_skin_hold_fids.clear()
+	for f in fids:
+		_skin_hold_fids[int(f)] = true
+
+## G-SKIN-SET helper: run the REAL card sink (populates _skin_hold_fids from the actual _write_card, published with the
+## buffer) so the gate can assert the handoff set == the emitted-card facets (not the over-broad wanted scan) + the
+## drawable instance count. Returns the committed instance count.
+func debug_rebuild_cards(cam_abs: Vector3, wanted: Array, shell_mode := true) -> int:
+	_rebuild_cards(cam_abs, wanted, shell_mode)
+	return _mm.visible_instance_count
+
+## G-SKIN-SET read-back: the emitted-card handoff set (the facets that actually rendered a card last rebuild).
+func skin_hold_fids() -> Array:
+	return _skin_hold_fids.keys()
+
 func debug_skin_gate(offsurf: bool, h: float) -> Dictionary:
 	var hold := false
 	if CubeSphere.FP_SKIN_READY_GATE and CubeSphere.FP_FT_SHELL_BAND and offsurf \
@@ -1910,13 +1986,25 @@ func mesh_mmi_visible() -> bool:
 func shell_band_state() -> Dictionary:
 	if not CubeSphere.FP_FT_SHELL_BAND:
 		return {}
-	return {
+	var d := {
 		"ft_zone": _dbg_shell_zone,
 		"ft_cards": (_mmi != null and _mmi.visible),
+		"ft_ci": (_mm.visible_instance_count if _mm != null else 0),   # DRAWABLE card count (0 with node visible ⇒ hidden gap)
 		"ft_mesh": mesh_mmi_visible(),
 		"ft_off": _dbg_shell_offsurf,
 		"ft_h": snappedf(_dbg_shell_h, 0.1),
 	}
+	# FP_SKIN_READY_GATE / FP_WORST_FRAME_ATTR §6: the skin-handoff readiness + drawable-gap telemetry (absent off both
+	# flags ⇒ byte-identical snapshot). ft_gap_worst_ms is the A/B discriminator (A: 2-30 s spikes; B: ≤ ~2 s).
+	if CubeSphere.FP_SKIN_READY_GATE:
+		d["ft_skin_hold"] = _dbg_skin_hold
+		d["ft_skin_frac"] = snappedf(_dbg_skin_ready_frac, 0.01)
+		d["ft_skin_held"] = _skin_hold_fids.size()
+	if CubeSphere.FP_WORST_FRAME_ATTR:
+		d["ft_gap_ms"] = _dbg_gap_ms
+		d["ft_gap_worst_ms"] = _dbg_gap_worst_ms
+		d["ft_hold_ms"] = _dbg_hold_ms
+	return d
 func is_stale() -> bool:
 	return _stale
 func mesh_uses_colors() -> bool:

@@ -62,6 +62,9 @@ func _ok(c: bool, m: String) -> void:
 var _fake_skin_frac := 1.0
 func _fake_skin_ready(_fids) -> float:
 	return _fake_skin_frac
+## G-SKIN-SET near-query stub: a valid _near_query so _probe_pass iterates (returns NOT_COVERED — no cull side effects).
+func _probe_not_covered(_fid: int, _aabb: AABB) -> int:
+	return NearPresence.NOT_COVERED
 
 func _initialize() -> void:
 	print("=== verify_structures (task #121 P0 — FP_STRUCT_DETECT + FP_STRUCT_FAR) ===")
@@ -920,6 +923,56 @@ func _gate_skin_gate() -> void:
 		var t4 = FS.new(); t4.setup_instance(Node3D.new(), 0); t4.set_skin_ready_query(Callable(self, "_fake_skin_ready"))
 		_fake_skin_frac = 0.0
 		_ok(not t4.debug_skin_gate(true, 2500.0)["skin_hold"], "G-SKIN-GATE(on): empty handoff set ⇒ no hold (degrade-safe)")
+		# G-SKIN-SET (Codex P0): the probe pass must NO LONGER gather the roof-handoff set — that source was over-broad
+		# (every in-band registered structure: cube-tier, culled, capped, damaged/player-builds with no procedural roof
+		# skin, one of which pinned the whole tier). Drive the REAL _probe_pass over in-band records and assert it leaves
+		# _skin_hold_fids UNTOUCHED (the set is now built ONLY at the actual card sink in _rebuild). If someone re-added the
+		# probe gather, this FAILS.
+		var t6 = FS.new(); t6.setup_instance(Node3D.new(), 0)
+		t6.set_near_query(Callable(self, "_probe_not_covered"))     # valid query so _probe_pass iterates
+		var rec6 := {"root": 200, "fid": 20, "bmin": Vector3i(10, 40, 10), "bmax": Vector3i(16, 46, 16), "rev": 1}
+		var centre6 := t6._structure_centre(rec6)
+		var r0s := float(TerrainConfig.near_render_radius())
+		# Camera placed so the structure is IN the old gather band [r0, STRUCT_CARD_HIDE_ALT] — the OLD probe-pass code
+		# WOULD have added it. Assert the (now removed) gather leaves the set empty.
+		var cam6 := centre6 - centre6.normalized() * (r0s + 50.0)
+		t6._probe_pass([rec6], cam6)
+		_ok(t6.skin_hold_fids_count() == 0,
+			"G-SKIN-SET(on): an IN-BAND structure through _probe_pass gathers NO handoff fids (over-broad source removed; set built at the card sink)")
+
+		# G-SKIN-SET-STRUCT (Codex P0 + GAP-A): drive the REAL card sink (_rebuild) and prove (1) the handoff set == the
+		# facets that actually EMITTED a drawable card, (2) above STRUCT_FAR_MAX a rebuild emits ZERO (the dead band — why
+		# the tier must FREEZE not rebuild), (3) last-good-resident — at h=2500 the frozen non-empty set holds the cards
+		# DRAWABLE while the skin is unready.
+		var ts = FS.new(); ts.setup_instance(Node3D.new(), 0)
+		ts.set_near_query(Callable(self, "_probe_not_covered"))
+		ts.set_skin_ready_query(Callable(self, "_fake_skin_ready"))
+		var recS := {"root": 300, "fid": 30, "bmin": Vector3i(20, 40, 20), "bmax": Vector3i(26, 46, 26), "rev": 1}
+		var cS := ts._structure_centre(recS)
+		# a valid card precompute (is_card=1, radial origin at the structure centre) so _card_eligible + _write_card_inst fire
+		ts._card_prec[300] = PackedFloat32Array([1.0, 0.0, 1.0, 1.0, 5.0, cS.x, cS.y, cS.z, 1.0, 0.0, 0.0, 0.0])
+		var camIn := cS - cS.normalized() * 600.0     # dist 600 ∈ [STRUCT_CARD_MIN 320, STRUCT_FAR_MAX 2400], > r0+annulus
+		ts._rebuild([recS], camIn)
+		_ok(ts.card_live_count() > 0 and ts.skin_hold_fids_count() == 1 and ts.skin_hold_has(30),
+			"G-SKIN-SET-STRUCT: a real in-band rebuild emits a DRAWABLE card (%d) and the handoff set == that emitted facet" % ts.card_live_count())
+		var camOut := cS - cS.normalized() * 2500.0   # above STRUCT_FAR_MAX
+		ts._rebuild([recS], camOut)
+		_ok(ts.card_live_count() == 0 and ts.skin_hold_fids_count() == 0,
+			"G-SKIN-SET-STRUCT: above STRUCT_FAR_MAX a rebuild emits ZERO cards (dead band ⇒ the tier must freeze, not rebuild)")
+		# last-good-resident: re-emit in-band (frozen buffer + set), then at h=2500 with an unready skin the cards HOLD.
+		ts._rebuild([recS], camIn)
+		_fake_skin_frac = 0.0
+		var rHold := ts.debug_skin_gate(true, 2500.0)
+		_ok(rHold["skin_hold"] and rHold["st_cards"] and ts.card_live_count() > 0,
+			"G-SKIN-SET-STRUCT/GAP-A: at h=2500 the last-good cards stay HELD + DRAWABLE (%d) while skin unready (freeze, not blank)" % ts.card_live_count())
+		# GAP-A regression guard: in (2400,2800) with hold active the tier MUST be FROZEN (shell_mode false ⇒ step
+		# early-returns ⇒ _rebuild does not run ⇒ the non-empty set is retained). FAILS if hide_alt is re-extended to 2800.
+		var sm := ts.debug_shell_mode(true, 2500.0)
+		_ok(sm["card_hold"] and not sm["shell_mode"] and int(sm["held_count"]) > 0 and float(sm["hide_alt"]) == CubeSphere.STRUCT_CARD_HIDE_ALT,
+			"G-SKIN-SET-STRUCT/GAP-A: at h=2500 hold active ⇒ shell_mode FROZEN (hide_alt stays 2400), set RETAINED (%d) — no dead-band rebuild" % int(sm["held_count"]))
+		# and the boundary: just below 2400 the tier is LIVE (shell_mode true ⇒ cards keep emitting through the [600,2400] band).
+		var sm_lo := ts.debug_shell_mode(true, 2300.0)
+		_ok(sm_lo["shell_mode"], "G-SKIN-SET-STRUCT/GAP-A: below STRUCT_CARD_HIDE_ALT (h=2300) the tier is LIVE (shell_mode true — cards emit)")
 	else:
 		var t0 = FS.new(); t0.setup_instance(Node3D.new(), 0); t0.set_skin_ready_query(Callable(self, "_fake_skin_ready"))
 		t0.debug_seed_hold_fids([0, 1, 2])

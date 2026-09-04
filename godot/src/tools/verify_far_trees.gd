@@ -172,13 +172,17 @@ func _gate_skin_gate() -> void:
 	var fid: int = _sample_facets()[0]
 	if on:
 		# un-ready skin at h=650 (∈ (HIDE 600, HOLD_MAX 900)) ⇒ cards HELD visible, faded ≥ floor, NOT stale.
+		# The handoff set MUST be non-empty for the readiness query to be consulted (Codex P0: readiness is over the
+		# EMITTED set, so an empty set degrades to frac 1.0 = no hold). Seed one facet, then drive the hold law.
 		var t1 = FT.new(); t1.setup_instance(_fake_ring(), fid); t1.set_skin_ready_query(Callable(self, "_fake_skin_ready"))
+		t1.debug_seed_skin_hold_fids([fid])
 		_fake_skin_frac = 0.0
 		var rh := t1.debug_skin_gate(true, 650.0)
 		_ok(rh["skin_hold"] and rh["ft_cards"] and not rh["ft_stale"] and rh["tier_fade"] >= CubeSphere.SKIN_HOLD_FADE,
 			"G-SKIN-GATE(on): skin un-ready at h=650 ⇒ cards HELD (visible, tier_fade %.2f ≥ %.2f, no stale)" % [rh["tier_fade"], CubeSphere.SKIN_HOLD_FADE])
 		# ready ⇒ the hand-off completes (zone-O hide + stale latch) — the shipped behaviour, within one step.
 		var t2 = FT.new(); t2.setup_instance(_fake_ring(), fid); t2.set_skin_ready_query(Callable(self, "_fake_skin_ready"))
+		t2.debug_seed_skin_hold_fids([fid])
 		_fake_skin_frac = 1.0
 		var rr := t2.debug_skin_gate(true, 650.0)
 		# The hand-off = cards HIDDEN at zone O (the _stale latch is FP_FAR_TREES_COLORFIX's own concern — G-FTSB).
@@ -186,19 +190,55 @@ func _gate_skin_gate() -> void:
 			"G-SKIN-GATE(on): skin ready at h=650 ⇒ cards hidden, zone-O hand-off (releases)")
 		# threshold: frac == SKIN_READY_MIN releases (hold is strictly frac < MIN).
 		var t3 = FT.new(); t3.setup_instance(_fake_ring(), fid); t3.set_skin_ready_query(Callable(self, "_fake_skin_ready"))
+		t3.debug_seed_skin_hold_fids([fid])
 		_fake_skin_frac = CubeSphere.SKIN_READY_MIN
 		_ok(not t3.debug_skin_gate(true, 650.0)["skin_hold"], "G-SKIN-GATE(on): ready_frac == SKIN_READY_MIN ⇒ no hold (releases)")
 		# ceiling: un-ready but above FT_SHELL_HOLD_MAX_ALT ⇒ the hold RELEASES (never held to true orbit).
 		var t4 = FT.new(); t4.setup_instance(_fake_ring(), fid); t4.set_skin_ready_query(Callable(self, "_fake_skin_ready"))
+		t4.debug_seed_skin_hold_fids([fid])
 		_fake_skin_frac = 0.0
 		var rc := t4.debug_skin_gate(true, 950.0)
 		_ok(not rc["skin_hold"] and not rc["ft_cards"],
 			"G-SKIN-GATE(on): above FT_SHELL_HOLD_MAX_ALT the hold releases regardless of readiness (ceiling bounds duty)")
+		# empty EMITTED set ⇒ frac degrades to 1.0 ⇒ NO hold (Codex P0: nothing on screen to hold — degrade-safe).
+		var t5 = FT.new(); t5.setup_instance(_fake_ring(), fid); t5.set_skin_ready_query(Callable(self, "_fake_skin_ready"))
+		_fake_skin_frac = 0.0   # the query WOULD say un-ready, but the empty set never reaches it
+		_ok(not t5.debug_skin_gate(true, 650.0)["skin_hold"],
+			"G-SKIN-GATE(on): empty emitted set ⇒ no hold (readiness is over the emitted cards, not the wanted scan)")
+		_gate_skin_set()
 	else:
 		var t0 = FT.new(); t0.setup_instance(_fake_ring(), fid); t0.set_skin_ready_query(Callable(self, "_fake_skin_ready"))
+		t0.debug_seed_skin_hold_fids([fid])
 		_fake_skin_frac = 0.0
 		_ok(not t0.debug_skin_gate(true, 650.0)["skin_hold"],
 			"G-SKIN-GATE(off): FP_SKIN_READY_GATE off ⇒ never holds (byte-identical zone-O hide)")
+
+## G-SKIN-SET (Codex P0): the handoff set is built from the ACTUAL card sink, NOT the over-broad wanted scan. Drive a
+## REAL _rebuild_cards over a cache holding ONE enumerated facet but a wanted list of TWO — assert the emitted-card set
+## equals the facet that truly rendered cards (drawable instance count > 0) and EXCLUDES the wanted-but-non-emitting one
+## (the old code, keyed on _last_wanted, would have wrongly included it → an unrelated fid pinning the tier). FACETED-gated
+## (enumeration needs GenCtx). No-op on the off arm.
+func _gate_skin_set() -> void:
+	if not CubeSphere.FACETED or not CubeSphere.FP_FAR_TREES_CARDS:
+		print("  (G-SKIN-SET skipped — needs FACETED + FP_FAR_TREES_CARDS for a real card rebuild)")
+		return
+	var facets := _sample_facets()
+	var fid: int = facets[0]
+	var other: int = facets[1]
+	var t = FT.new(); t.setup_instance(_fake_ring(), fid)
+	var recs: PackedFloat32Array = t.enumerate_facet_sync(fid)   # cache ONLY `fid` (the other stays empty)
+	if recs.size() < 3:
+		print("  (G-SKIN-SET skipped — facet %d enumerated no trees)" % fid)
+		return
+	# Place the camera ~300 blocks radially above the first tree so its cards fall in [r0, CARD_MAX] (shell_mode emits).
+	var tp := Vector3(recs[0], recs[1], recs[2])
+	var cam := tp + tp.normalized() * 300.0
+	var n: int = t.debug_rebuild_cards(cam, [fid, other], true)   # wanted = BOTH facets; only `fid` is cached
+	_ok(n > 0, "G-SKIN-SET: the real card rebuild emitted ≥1 DRAWABLE card (visible_instance_count %d > 0)" % n)
+	var held := t.skin_hold_fids()
+	_ok(held.has(fid), "G-SKIN-SET: the emitting facet %d is in the handoff set (built from the real sink)" % fid)
+	_ok(not held.has(other),
+		"G-SKIN-SET: the wanted-but-NON-emitting facet %d is EXCLUDED (set == emitted cards, not the wanted scan — the P0 fix)" % other)
 
 # ---- helpers -------------------------------------------------------------------------------------------------------
 

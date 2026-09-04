@@ -106,9 +106,16 @@ var _version_query: Callable = Callable()     # FP_STRUCT_REG_EPOCH: () -> int r
 ## skin). `_skin_hold_fids` is the distinct fid set of the card instances the last rebuild emitted (the exact facets
 ## about to hand off to the skin); ready_frac over it drives the hold. Unset query ⇒ 1.0 ⇒ no hold ⇒ byte-identical.
 var _skin_ready_query: Callable = Callable()  # (Array[int]) -> float baked fraction
-var _skin_hold_fids: Dictionary = {}          # fid -> true: distinct facets of emitted cards (the roof handoff set)
+var _skin_hold_fids: Dictionary = {}          # fid -> true: distinct facets of the ACTUAL committed cards (Codex P0 handoff set)
 var _dbg_skin_hold := false                   # S3 gate read-back: the card→skin hold was active last step
 var _dbg_skin_ready_frac := 1.0               # S3 gate read-back: the roof handoff set's baked fraction last step
+# FP_WORST_FRAME_ATTR (§6): drawable-gap + hold telemetry for the live A/B (see the far-tree equivalent). gap = off-surface,
+# in the card band, with NO drawable cards (visible AND visible_instance_count > 0) AND the roof skin not yet ready.
+var _dbg_gap_ms := 0
+var _dbg_gap_worst_ms := 0
+var _dbg_hold_ms := 0
+var _dbg_gap_run_ms := 0
+var _dbg_telem_last_ms := 0
 
 # per-structure baked models: root -> {rev, verts:PackedVector3Array (ring-local), colors:PackedColorArray, tris, bytes}
 var _baked: Dictionary = {}
@@ -551,6 +558,32 @@ func _skin_ready_frac() -> float:
 		return 1.0
 	return float(_skin_ready_query.call(_skin_hold_fids.keys()))
 
+## FP_WORST_FRAME_ATTR (§6): drawable-GAP + hold telemetry, ticked once per step BEFORE the off-surface early-return so
+## the timer advances while the card tier is hidden (the gap state). GAP = off-surface, inside the card handoff window,
+## with NO DRAWABLE cards (node visible AND visible_instance_count > 0) AND the roof skin not yet ready. Off ⇒ byte-off.
+func _skin_telem_tick(offsurf: bool, h: float) -> void:
+	if not CubeSphere.FP_WORST_FRAME_ATTR:
+		return
+	var now := Time.get_ticks_msec()
+	var dt := 0
+	if _dbg_telem_last_ms != 0:
+		dt = maxi(0, now - _dbg_telem_last_ms)
+	_dbg_telem_last_ms = now
+	if dt <= 0 or not (CubeSphere.FP_STRUCT_CARDS and CubeSphere.FP_STRUCT_CARD_ALT_BAND):
+		return
+	if _dbg_skin_hold:
+		_dbg_hold_ms += dt
+	var in_band := offsurf and h >= (CubeSphere.STRUCT_CARD_FADE_ALT - CubeSphere.SKIN_HANDOFF_MARGIN_ALT) \
+			and h < (CubeSphere.STRUCT_CARD_HOLD_MAX_ALT + 200.0)
+	var drawable := _card_mmi != null and _card_mmi.visible and _card_mm != null and _card_mm.visible_instance_count > 0
+	var skin_ok := _skin_ready_frac() >= CubeSphere.SKIN_READY_MIN
+	if in_band and not drawable and not skin_ok:
+		_dbg_gap_ms += dt
+		_dbg_gap_run_ms += dt
+		_dbg_gap_worst_ms = maxi(_dbg_gap_worst_ms, _dbg_gap_run_ms)
+	else:
+		_dbg_gap_run_ms = 0
+
 ## FP_STRUCT_REG_EPOCH: last step() prelude cost (µs). Present in all flag states (0 until step() runs) — a leaf int.
 func step_us() -> int: return _dbg_step_us
 
@@ -570,28 +603,15 @@ func step(settled := true, credit_ok := true, cam_render := Vector3.ZERO) -> voi
 	# line: the merged mesh stays VISIBLE + LIVE (fall through to the delta-gated rebuild so it stays correct across
 	# crossings). Off (h defaults -1) ⇒ `_mi.visible = not offsurf` + off-surface early-return, byte-identical.
 	var h := (_ring as FacetFarRing).shell_cam_alt() if CubeSphere.FP_STRUCT_SHELL_BAND else -1.0
-	# FP_STRUCT_CARD_ALT_BAND (S3 §4): the freeze line moves to the card ceiling (2400) so the tier stays LIVE to the
-	# distance envelope's edge; off ⇒ hide_alt == FT_SHELL_HIDE_ALT (600), the shipped freeze (byte-off — no fn call).
-	var hide_alt := CubeSphere.FT_SHELL_HIDE_ALT
-	if CubeSphere.FP_STRUCT_CARD_ALT_BAND:
-		hide_alt = CubeSphere.STRUCT_CARD_HIDE_ALT
-	# FP_SKIN_READY_GATE §4.2 (S3): the card→roof-skin HOLD — keep the card tier rendering above STRUCT_CARD_HIDE_ALT
-	# until the roof handoff set's fine-map skin is baked (ready_frac ≥ SKIN_READY_MIN), up to STRUCT_CARD_HOLD_MAX_ALT.
-	# Only meaningful with the extended card band (ALT_BAND) + a roof skin (STRUCT_LOD). Unwired baker ⇒ frac 1.0 ⇒ no
-	# hold ⇒ byte-identical. While holding the freeze line moves to the ceiling so the prelude keeps the cards live.
-	var card_hold := false
-	if CubeSphere.FP_SKIN_READY_GATE and CubeSphere.FP_STRUCT_LOD and CubeSphere.FP_STRUCT_CARD_ALT_BAND and offsurf \
-			and h >= (CubeSphere.STRUCT_CARD_FADE_ALT - CubeSphere.SKIN_HANDOFF_MARGIN_ALT) \
-			and h < CubeSphere.STRUCT_CARD_HOLD_MAX_ALT:
-		_dbg_skin_ready_frac = _skin_ready_frac()
-		card_hold = _dbg_skin_ready_frac < CubeSphere.SKIN_READY_MIN
-	_dbg_skin_hold = card_hold
-	if card_hold:
-		hide_alt = CubeSphere.STRUCT_CARD_HOLD_MAX_ALT
-	var shell_mode := CubeSphere.FP_STRUCT_SHELL_BAND and offsurf and h < hide_alt
+	# The freeze-line + card-hold decision. Computed by the SHARED _shell_mode_decision (also the GAP-A gate's entry, so
+	# the regression guard tests THIS logic, not a replica). Sets _dbg_skin_ready_frac / _dbg_skin_hold as a side effect.
+	var _dec := _shell_mode_decision(offsurf, h)
+	var card_hold: bool = _dec["card_hold"]
+	var shell_mode: bool = _dec["shell_mode"]
 	_dbg_shell_zone = _apply_shell_visibility(offsurf, h, card_hold)
 	_dbg_shell_h = h
 	_dbg_shell_offsurf = offsurf
+	_skin_telem_tick(offsurf, h)   # FP_WORST_FRAME_ATTR: gap/hold accounting BEFORE the off-surface early-return (byte-off)
 	if offsurf and not shell_mode:
 		return
 	# FP_LOAD_DEFER settle gate + stream credit — no structure work during fresh-load pile-up (mirror of the trees).
@@ -911,11 +931,10 @@ func _probe_pass(reg: Array, cam_abs: Vector3, centres := PackedVector3Array()) 
 	_probe_cache.clear()
 	_cull_pending = false
 	_annulus_empty_last = true                    # FP_STRUCT_REG_EPOCH: set false below iff a structure is annulus-probed
-	# FP_SKIN_READY_GATE §4.2 (S3): recompute the roof-handoff facet set this pass (distinct fids of in-card-band
-	# structures). Only under the flag ∧ FP_STRUCT_LOD (there is a roof skin to wait for). Off ⇒ never touched / read.
-	var gather_hold := CubeSphere.FP_SKIN_READY_GATE and CubeSphere.FP_STRUCT_LOD
-	if gather_hold:
-		_skin_hold_fids.clear()
+	# Codex P0: the roof-handoff facet set is NO LONGER gathered here (this pass sees ALL in-band registered structures —
+	# damaged houses, player-builds, cube-tier records, culled/capped ones — many with no procedural roof skin that ever
+	# bakes; with the readiness threshold one such never-baking fid pinned the whole tier). It is now built from the ACTUAL
+	# committed CARD sink in _rebuild / _rebuild_staged (a fid enters only when a card instance is truly written).
 	if not _near_query.is_valid():
 		return 0
 	var r0 := float(TerrainConfig.near_render_radius())
@@ -933,10 +952,6 @@ func _probe_pass(reg: Array, cam_abs: Vector3, centres := PackedVector3Array()) 
 		var rec: Dictionary = reg[i]
 		var fid: int = int(rec["fid"])
 		var dist := (cam_abs.distance_to(centres[i]) if use_centres else _structure_dist(rec, cam_abs))
-		# S3 roof-handoff set: the facets holding cards in the emitted band [r0, card-hide]. Conservative (all in-band
-		# structures, a superset of the capped card set) ⇒ the hold releases only when the whole band's roof skin is in.
-		if gather_hold and dist >= r0 and dist <= CubeSphere.STRUCT_CARD_HIDE_ALT:
-			_skin_hold_fids[fid] = true
 		if CubeSphere.FP_STRUCT_WALK_CALM:
 			var root_b := int(rec["root"])
 			var code := _band_code(dist, r0, int(_band.get(root_b, -1)))
@@ -1130,6 +1145,11 @@ func _rebuild(reg: Array, cam_abs: Vector3, use_centres := false) -> void:
 		var need := CubeSphere.STRUCT_CARD_INST_MAX * STRUCT_CARD_STRIDE
 		if _card_cbuf.size() != need:
 			_card_cbuf.resize(need)
+	# FP_SKIN_READY_GATE §4.2 (Codex P0): rebuild the roof-handoff set from the ACTUAL card sink below (a fid enters only
+	# when a card instance is truly written), published atomically with the card buffer. Off ⇒ never touched (byte-off).
+	var gather_hold := CubeSphere.FP_SKIN_READY_GATE and CubeSphere.FP_STRUCT_LOD
+	if gather_hold:
+		_skin_hold_fids.clear()
 	for rec in ordered:
 		var dist := _structure_dist(rec, cam_abs)
 		if dist > CubeSphere.STRUCT_FAR_MAX:
@@ -1143,6 +1163,8 @@ func _rebuild(reg: Array, cam_abs: Vector3, use_centres := false) -> void:
 			var _wt0 := Time.get_ticks_usec()
 			_write_card_inst(_card_cbuf, cn, _card_prec[int(rec["root"])])
 			card_write_us += int(Time.get_ticks_usec() - _wt0)
+			if gather_hold:
+				_skin_hold_fids[int(rec["fid"])] = true    # Codex P0: real committed card ⇒ genuinely held
 			cn += 1
 			count += 1
 			continue                                           # a house renders in EXACTLY one sink
@@ -1223,6 +1245,11 @@ func _rebuild_staged(reg: Array, cam_abs: Vector3, use_centres: bool) -> void:
 	var need := CubeSphere.STRUCT_CARD_INST_MAX * STRUCT_CARD_STRIDE
 	if CubeSphere.FP_STRUCT_CARDS and _card_cbuf.size() != need:
 		_card_cbuf.resize(need)
+	# FP_SKIN_READY_GATE §4.2 (Codex P0): rebuild the roof-handoff set from the ACTUAL card sink (mirror of _rebuild;
+	# the staged path publishes _card_cbuf at the swap below, so the set is atomic with what actually renders). Off ⇒ untouched.
+	var gather_hold := CubeSphere.FP_SKIN_READY_GATE and CubeSphere.FP_STRUCT_LOD
+	if gather_hold:
+		_skin_hold_fids.clear()
 	for k in range(ordered.size()):
 		var rec: Dictionary = ordered[k]
 		var dist := ordered_dist[k] if staged_sort else _structure_dist(rec, cam_abs)
@@ -1237,6 +1264,8 @@ func _rebuild_staged(reg: Array, cam_abs: Vector3, use_centres: bool) -> void:
 			var _wt0 := Time.get_ticks_usec()
 			_write_card_inst(_card_cbuf, cn, _card_prec[int(rec["root"])])
 			card_write_us += int(Time.get_ticks_usec() - _wt0)
+			if gather_hold:
+				_skin_hold_fids[int(rec["fid"])] = true    # Codex P0: real committed card ⇒ genuinely held
 			cn += 1
 			count += 1
 			continue
@@ -1498,6 +1527,16 @@ func card_state() -> Dictionary:
 	if CubeSphere.FP_STRUCT_CARD_ALT_BAND:
 		d["st_czone"] = _card_zone
 		d["st_cfade"] = snappedf(_dbg_card_fade, 0.01)
+	# FP_SKIN_READY_GATE / FP_WORST_FRAME_ATTR §6: roof-skin readiness + drawable-gap telemetry (absent off both flags ⇒
+	# byte-identical). st_gap_worst_ms is the A/B discriminator (A: 2-30 s dropouts; B: ≤ ~2 s). st_skin_held = |emitted set|.
+	if CubeSphere.FP_SKIN_READY_GATE:
+		d["st_skin_hold"] = _dbg_skin_hold
+		d["st_skin_frac"] = snappedf(_dbg_skin_ready_frac, 0.01)
+		d["st_skin_held"] = _skin_hold_fids.size()
+	if CubeSphere.FP_WORST_FRAME_ATTR:
+		d["st_gap_ms"] = _dbg_gap_ms
+		d["st_gap_worst_ms"] = _dbg_gap_worst_ms
+		d["st_hold_ms"] = _dbg_hold_ms
 	return d
 ## Gate read-back: the persistent card instance buffer (slots [0, live_cards) are the last rebuild). Returned as a
 ## COW reference — the gate READS it (no fork); a production caller holds no second reference so the buffer is reused.
@@ -1562,11 +1601,60 @@ func debug_skin_gate(offsurf: bool, h: float) -> Dictionary:
 		"card_fade": _dbg_card_fade,
 	}
 
+## The freeze-line + card-hold decision — the SINGLE source shared by step() and the GAP-A gate (debug_shell_mode), so
+## the regression guard tests the REAL logic (no replica drift). Sets _dbg_skin_ready_frac / _dbg_skin_hold as a side
+## effect (step relies on them). Returns {card_hold, hide_alt, shell_mode, held_count}.
+##
+## FP_STRUCT_CARD_ALT_BAND (S3 §4): the freeze line is the card ceiling (2400); off ⇒ FT_SHELL_HIDE_ALT (600), the
+## shipped freeze (byte-off — no flag reads fire). FP_SKIN_READY_GATE §4.2 (S3): the card→roof-skin HOLD keeps the card
+## tier DRAWABLE above STRUCT_CARD_HIDE_ALT until the roof skin bakes — but WITHOUT extending `hide_alt` (Codex GAP-A):
+## card EMISSION is capped at STRUCT_FAR_MAX (== STRUCT_CARD_HIDE_ALT == 2400), so a live rebuild above 2400 would commit
+## ZERO cards, blank the tier for a frame, and empty `_skin_hold_fids` (⇒ frac 1.0 ⇒ the hold self-releases into a
+## dropout). Instead `shell_mode` goes false above 2400 ⇒ step early-returns ⇒ the rebuild FREEZES, retaining the
+## last-good NON-EMPTY card buffer AND the frozen non-empty `_skin_hold_fids`; the card VISIBILITY ceiling (2800) lives
+## independently in _apply_shell_visibility, so the frozen cards stay drawn to 2800 (last-good-resident). Trees don't
+## need this (FAR_TREES_CARD_MAX 2400 ≫ the tree ceiling 900, so tree cards emit through the whole hold).
+func _shell_mode_decision(offsurf: bool, h: float) -> Dictionary:
+	var hide_alt := CubeSphere.FT_SHELL_HIDE_ALT
+	if CubeSphere.FP_STRUCT_CARD_ALT_BAND:
+		hide_alt = CubeSphere.STRUCT_CARD_HIDE_ALT
+	var card_hold := false
+	if CubeSphere.FP_SKIN_READY_GATE and CubeSphere.FP_STRUCT_LOD and CubeSphere.FP_STRUCT_CARD_ALT_BAND and offsurf \
+			and h >= (CubeSphere.STRUCT_CARD_FADE_ALT - CubeSphere.SKIN_HANDOFF_MARGIN_ALT) \
+			and h < CubeSphere.STRUCT_CARD_HOLD_MAX_ALT:
+		_dbg_skin_ready_frac = _skin_ready_frac()
+		card_hold = _dbg_skin_ready_frac < CubeSphere.SKIN_READY_MIN
+	_dbg_skin_hold = card_hold
+	# GAP-A (Codex P0): do NOT extend hide_alt during the hold. Above STRUCT_CARD_HIDE_ALT (2400) shell_mode goes false ⇒
+	# step early-returns ⇒ the rebuild FREEZES, retaining the last-good non-empty card buffer + _skin_hold_fids; the card
+	# VISIBILITY ceiling (card_hide=STRUCT_CARD_HOLD_MAX_ALT while holding) lives independently in _apply_shell_visibility,
+	# so the frozen cards stay DRAWABLE to 2800. Extending hide_alt here would keep shell_mode true ⇒ a rebuild fires above
+	# STRUCT_FAR_MAX(=2400) that emits cn=0 ⇒ empty buffer ⇒ the 1-step blank-flash-then-drop this fix removes.
+	var shell_mode := CubeSphere.FP_STRUCT_SHELL_BAND and offsurf and h < hide_alt
+	return {"card_hold": card_hold, "hide_alt": hide_alt, "shell_mode": shell_mode, "held_count": _skin_hold_fids.size()}
+
+## GAP-A regression guard entry (verify_structures): the SAME _shell_mode_decision step() runs, so the guard tests real
+## logic. The invariant: in (STRUCT_CARD_HIDE_ALT, STRUCT_CARD_HOLD_MAX_ALT) with an unready skin, `shell_mode` MUST be
+## false (⇒ step early-returns ⇒ _rebuild does NOT run ⇒ the last-good buffer + `_skin_hold_fids` are RETAINED). If the
+## deleted `if card_hold: hide_alt = STRUCT_CARD_HOLD_MAX_ALT` were reinstated in _shell_mode_decision, hide_alt would be
+## 2800 ⇒ shell_mode TRUE ⇒ a rebuild fires above STRUCT_FAR_MAX and empties everything ⇒ this guard FAILS.
+func debug_shell_mode(offsurf: bool, h: float) -> Dictionary:
+	return _shell_mode_decision(offsurf, h)
+
 ## Gate helper: seed the roof-handoff facet set directly (bypasses the probe pass) so G-SKIN-GATE can drive ready_frac.
 func debug_seed_hold_fids(fids: Array) -> void:
 	_skin_hold_fids.clear()
 	for f in fids:
 		_skin_hold_fids[int(f)] = true
+## G-SKIN-SET (Codex P0) read-back: the size of the emitted-card handoff set (0 after a bare _probe_pass proves the
+## over-broad probe gather was removed; the set is now built only at the real _write_card_inst sink in _rebuild).
+func skin_hold_fids_count() -> int:
+	return _skin_hold_fids.size()
+func skin_hold_has(fid: int) -> bool:
+	return _skin_hold_fids.has(fid)
+## G-SKIN-SET / GAP-A read-back: the DRAWABLE card count actually on the card MultiMesh (the last committed buffer).
+func card_live_count() -> int:
+	return _card_mm.visible_instance_count if _card_mm != null else 0
 func mi_visible() -> bool:
 	return _mi != null and _mi.visible
 ## True iff the zone-B UNLIT vertex-colour material is currently bound (the brown-not-black guarantee).

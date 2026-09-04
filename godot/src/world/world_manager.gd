@@ -3899,16 +3899,21 @@ func update_block_lod_orbit(cam: Vector3) -> void:
 		# backstop — round silhouette + rim — but reads as the plain agreeing FarPalette, no blotch). Restore on descent.
 		if _facet_ring.has_method("set_skin_active"):
 			_facet_ring.set_skin_active(not retire)
-		if _facet_tex != null and _facet_tex.has_method("set_frozen"):
-			# S4 (FP_SKIN_HANDOFF_PREWARM §4.3): un-freeze the page baker at de-orbit COMMITMENT, not at skin handover.
-			# The shipped freeze (=retire) keeps the baker stone-cold through the whole orbit + descent, so the card→skin
-			# handoff at 600/2400 arrives with an empty queue (mechanism M2). Under the flag we never freeze: the skin is
-			# retired/unbound at orbit so the bakes are INVISIBLE (no pop-in) but PREWARM the descent's disc under the
-			# baker's own bounded 5 ms budget — giving the readiness gate (S3) a short hold instead of the 30 s tail.
-			var freeze := retire
-			if CubeSphere.FP_SKIN_HANDOFF_PREWARM:
-				freeze = false
-			_facet_tex.set_frozen(freeze)
+		# Shipped freeze (byte-identical off): the page baker freezes exactly when the skin retires. Under
+		# FP_SKIN_HANDOFF_PREWARM this transition-time set is SKIPPED — the freeze is evaluated every frame from the
+		# altitude window below instead (so a descent through the window un-freezes even while retire stays latched).
+		if not CubeSphere.FP_SKIN_HANDOFF_PREWARM and _facet_tex != null and _facet_tex.has_method("set_frozen"):
+			_facet_tex.set_frozen(retire)
+	# S4 (FP_SKIN_HANDOFF_PREWARM §4.3): un-freeze the page baker on the DESCENT, not at skin handover — but only inside a
+	# BOUNDED altitude window, evaluated EVERY frame (Codex P1: the shipped early-un-freeze flipped freeze=false on the
+	# retire transition alone, with no altitude check, so a camera PARKED in high orbit kept baking invisibly — 72° cap +
+	# progressive coverage + the un-budgeted off-surface fine sweep — through all of engaged orbit). Now: retired AND above
+	# SKIN_PREWARM_MAX_ALT ⇒ FROZEN (no invisible parked-orbit baking); retired but BELOW the ceiling ⇒ un-frozen so the
+	# descent disc (base pages via the budgeted handoff class + fine tiles via the nearest-axis fine cursor) prebakes ahead
+	# of the 600/2400 handoff, giving the readiness gate a short hold; not retired ⇒ un-frozen (the shipped on-surface state).
+	if CubeSphere.FP_SKIN_HANDOFF_PREWARM and _facet_tex != null and _facet_tex.has_method("set_frozen"):
+		var alt := _facet_ring.shell_cam_alt() if _facet_ring.has_method("shell_cam_alt") else 0.0
+		_facet_tex.set_frozen(retire and alt >= CubeSphere.SKIN_PREWARM_MAX_ALT)
 
 ## COSMOS-ORBITAL-SHELL S1/S2 (docs/COSMOS-ORBITAL-SHELL-DESIGN.md §3/§4): drive the far ring's camera-radial
 ## emitted-set law + one-shot prewarm arming from this frame's camera (render frame). No faceted ring (fallback/

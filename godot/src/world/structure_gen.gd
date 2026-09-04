@@ -399,16 +399,26 @@ static func _roof_block(hi: Dictionary, lx: int, lz: int, ly: int, w: int, d: in
 ## The §3-shape GEN record for house `hi` on facet `fid` (fid-lattice bbox). `root` is a NEGATIVE packed site id,
 ## structurally disjoint from tracker roots (edit keys ≥ 0), so the far tier's _baked/_cull keying + _root_hash
 ## (negative-safe mask) need ZERO changes. `rev` is 0 (pristine) — StructGenIndex overlays the damage counter.
-static func make_record(fid: int, hi: Dictionary) -> Dictionary:
-	if not _mat_ready:
-		warm_up()
+## FP_STRUCT_EDIT_DEBOUNCE v2 (docs/COSMOS-FAR-EDIT-DEBOUNCE-REDESIGN.md §3.2) — the house solid-span bbox
+## [bmin, bmax] for descriptor `hi`, EXTRACTED from make_record so the debounce classifier and the GEN record share
+## ONE bbox law (they can never diverge; gate G-SED-CLASSIFY asserts equality). CARVE-TO-MIN: the span is
+## [base_y+1 (floor) .. base_y+1+rtop (roof)] — NO foundation below. Pure / flag-free; make_record calls this.
+static func record_bbox(hi: Dictionary) -> Array:
 	var base: Vector3i = hi["base"]
 	var w: int = hi["w"]
 	var d: int = hi["d"]
 	var rtop := _roof_top_ly(hi)
-	# CARVE-TO-MIN: the house solid span is [base_y+1 (floor) .. base_y+1+rtop (roof)] — NO foundation below.
 	var bmin := Vector3i(base.x, base.y + 1, base.z)
 	var bmax := Vector3i(base.x + w - 1, base.y + 1 + rtop, base.z + d - 1)
+	return [bmin, bmax]
+
+static func make_record(fid: int, hi: Dictionary) -> Dictionary:
+	if not _mat_ready:
+		warm_up()
+	# CARVE-TO-MIN: the house solid span is [base_y+1 (floor) .. base_y+1+rtop (roof)] — via the single-source law.
+	var bb := record_bbox(hi)
+	var bmin: Vector3i = bb[0]
+	var bmax: Vector3i = bb[1]
 	var ex := maxi(maxi(bmax.x - bmin.x + 1, bmax.y - bmin.y + 1), bmax.z - bmin.z + 1)
 	return {
 		"source": SOURCE_GEN,

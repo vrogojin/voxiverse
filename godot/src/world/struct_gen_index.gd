@@ -22,6 +22,15 @@ var _rev: Dictionary = {}           # root -> damage rev (TRUTH: bumped instantl
 var _rev_pub: Dictionary = {}
 var _wanted: PackedInt32Array = PackedInt32Array()
 
+# FP_STRUCT_EDIT_DEBOUNCE v2 (docs/COSMOS-FAR-EDIT-DEBOUNCE-REDESIGN.md §3.1) — the captured-but-unclassified edit
+# queue. Under the flag, note_edit is STRICTLY O(1): it packs (fid,cell) into the edit-key bijection and appends here,
+# then returns. WorldManager's budgeted _sed_classify_step drains it OFF the input frame (position-pure classification).
+# NEVER-DROP: capture is unconditional; at STRUCT_EDIT_UNCLS_MAX the facet is marked wholesale-dirty in _uncls_overflow
+# (the classifier later resolves it by enumerating the facet off-frame + bumping every record — over-invalidate, never
+# drop). Both are empty + never touched off-flag (the OFF note_edit path bumps the truth rev inline) ⇒ byte-identical.
+var _uncls: PackedInt64Array = PackedInt64Array()   # packed edit keys awaiting off-frame classification (LIFO drain)
+var _uncls_overflow: Dictionary = {}                # fid -> true: NEVER-OOM superset marker (facet wholesale-dirty)
+
 var _epoch := 0                     # bumped on crossing (re-selects the wanted band; records themselves are pure)
 var _active_fid := -1
 var _wanted_dirty := true
@@ -121,38 +130,79 @@ func enumerate_facet(fid: int, pcache = null) -> Array:
 	return recs
 
 
-## §12.5 damage rev: a player edit at (fid, cell) bumps the rev of every cached GEN record on that fid whose bbox
-## contains the cell (O(records-on-fid) ≈ a handful). The rev-sum drift re-arms the far tier's delta gate → re-bake →
-## the far model shows the hole within ~1-2 s (exactly the player-build path).
-## FP_STRUCT_EDIT_DEBOUNCE: returns the damaged records `[{root, fid, bmin, bmax}, ...]` (for the WorldManager pending
-## map); [] off-flag / no cache / no hit (GDScript discards the return free off-flag). UNDER the flag it bumps the TRUTH
-## `_rev` only — it does NOT bump `_version` and does NOT write the pending rev into the cached record, so the far tier
-## keeps seeing the PUBLISHED rev (via the _rev_pub overlay) until publish_roots. OFF ⇒ the shipped immediate bump
-## (`_rev` + cached `rec["rev"]` + `_version += 1`) verbatim (byte-identical), and the returned [] is ignored.
+## §12.5 damage rev — the edit-frame producer half.
+## FP_STRUCT_EDIT_DEBOUNCE v2 (docs/COSMOS-FAR-EDIT-DEBOUNCE-REDESIGN.md §3.1): UNDER the flag this is STRICTLY O(1) —
+## it packs (fid,cell) into the edit-key bijection and appends to `_uncls`, then returns []; it NEVER classifies,
+## NEVER enumerates, warm OR cold (the v1 cache-cold `enumerate_facet` fallback that caused the 3.4 s freeze is DELETED).
+## Classification (the truth-rev bump + pending upsert) is deferred to WorldManager._sed_classify_step, off the input
+## frame. NEVER-DROP: capture is unconditional; at STRUCT_EDIT_UNCLS_MAX the facet is marked wholesale-dirty instead.
+## OFF ⇒ the shipped immediate bump (`_rev` + cached `rec["rev"]` + `_version += 1`) verbatim (miss ⇒ []; byte-identical);
+## the returned [] is ignored by the off-flag callers.
 func note_edit(fid: int, cell: Vector3i) -> Array:
+	if CubeSphere.FP_STRUCT_EDIT_DEBOUNCE:
+		# O(1): pack + append. NEVER classify, NEVER enumerate here (warm or cold) — the edit frame can never freeze.
+		if _uncls.size() >= CubeSphere.STRUCT_EDIT_UNCLS_MAX:
+			_uncls_overflow[fid] = true                # NEVER-OOM degrade: whole-facet superset marker (resolved off-frame)
+		else:
+			_uncls.append(FacetAtlas.edit_key(fid, cell))
+		return []                                      # pending upsert happens at classification (§3.2)
+	# OFF: the shipped immediate re-bake — miss ⇒ [] (a cache-cold edit is not recorded), hit ⇒ instant rev + version bump.
 	var recs: Variant = _cache.get(fid)
 	if recs == null:
-		# Codex P0 robustness: a cache-cold in-bbox edit would otherwise never record the damage (far model stays
-		# pristine). Under the flag, lazy-fill the facet so the truth rev is always bumped (never-drop); the enumerate's
-		# own _version bump is a legitimate refill (§4) that materializes PUBLISHED (pristine) revs, so no mid-edit
-		# re-bake leaks. Off ⇒ the shipped early-return verbatim (byte-identical — a cache-cold edit is not recorded).
-		if not CubeSphere.FP_STRUCT_EDIT_DEBOUNCE:
-			return []
-		recs = enumerate_facet(fid)
-	var deb := CubeSphere.FP_STRUCT_EDIT_DEBOUNCE
-	var damaged: Array = []
+		return []
 	for r in (recs as Array):
 		var rec: Dictionary = r
 		if _bbox_has(rec["bmin"], rec["bmax"], cell):
 			var root := int(rec["root"])
 			var nrev := int(_rev.get(root, 0)) + 1
-			_rev[root] = nrev                          # TRUTH: bumped instantly (lossless), both flag states
-			if deb:
-				damaged.append({"root": root, "fid": int(rec["fid"]), "bmin": rec["bmin"], "bmax": rec["bmax"]})
-			else:
-				rec["rev"] = nrev
-				_version += 1                          # FP_STRUCT_REG_EPOCH: a damage rev bumped ⇒ records() changed
-	return damaged
+			_rev[root] = nrev                          # TRUTH: bumped instantly (lossless)
+			rec["rev"] = nrev
+			_version += 1                              # FP_STRUCT_REG_EPOCH: a damage rev bumped ⇒ records() changed
+	return []
+
+
+## FP_STRUCT_EDIT_DEBOUNCE v2 (§3.2): the DEFERRED classifier's TRUTH-rev bump for a damaged house `root`. Bumps ONLY
+## the persistence-class `_rev` (survives LRU eviction) — NO `_version`, NO cache write; the far tier keeps seeing the
+## PUBLISHED rev (via the _rev_pub overlay in enumerate_facet) until publish_roots. Called ONLY under the flag, from
+## WorldManager._classify_edit (the position-pure caller guarantees never-drop). Idempotent-safe (rev is a counter).
+func note_damage(root: int) -> void:
+	_rev[root] = int(_rev.get(root, 0)) + 1
+
+# --- FP_STRUCT_EDIT_DEBOUNCE v2 deferred-classification queue accessors (§3.1/§3.2) ---------------------------------
+func uncls_size() -> int: return _uncls.size()
+func uncls_queue_empty() -> bool: return _uncls.is_empty()
+func has_overflow() -> bool: return not _uncls_overflow.is_empty()
+
+## Pop one captured edit key. LIFO (resize-down, O(1) amortized) — order is IMMATERIAL: classification is position-pure
+## and the queue always drains to empty (the forward-progress floor guarantees it). Caller guards with uncls_queue_empty().
+func uncls_pop() -> int:
+	var n := _uncls.size()
+	var k := _uncls[n - 1]
+	_uncls.resize(n - 1)
+	return k
+
+## Take one overflow facet id (erasing it) for off-frame resolution, or -1 when none. Caller guards with has_overflow().
+func overflow_take() -> int:
+	var keys := _uncls_overflow.keys()
+	if keys.is_empty():
+		return -1
+	var fid := int(keys[0])
+	_uncls_overflow.erase(fid)
+	return fid
+
+## FP_STRUCT_EDIT_DEBOUNCE v2 (§5.4 NEVER-OOM degrade): resolve an overflow-marked facet OFF the input frame — enumerate
+## it (via the persistent ctx the caller threads), bump the TRUTH rev of EVERY record on it, and return
+## `[{root, fid, bmin, bmax}, …]` so WorldManager upserts each into the pending map. Over-invalidation (a bounded extra
+## re-bake per house on the facet), never a drop. Only called under the flag.
+func overflow_resolve(fid: int, pcache = null) -> Array:
+	var recs: Array = enumerate_facet(fid, pcache)
+	var out: Array = []
+	for r in recs:
+		var rec: Dictionary = r
+		var root := int(rec["root"])
+		_rev[root] = int(_rev.get(root, 0)) + 1
+		out.append({"root": root, "fid": int(rec["fid"]), "bmin": rec["bmin"], "bmax": rec["bmax"]})
+	return out
 
 static func _bbox_has(bmin: Vector3i, bmax: Vector3i, c: Vector3i) -> bool:
 	return c.x >= bmin.x and c.x <= bmax.x and c.y >= bmin.y and c.y <= bmax.y and c.z >= bmin.z and c.z <= bmax.z
@@ -261,4 +311,6 @@ func total_bytes() -> int:
 	var recs := 0
 	for fid in _cache:
 		recs += (_cache[fid] as Array).size()
-	return recs * 256 + _rev.size() * 48 + _rev_pub.size() * 48   # FP_STRUCT_EDIT_DEBOUNCE: _rev_pub mirrors _rev (0 off-flag)
+	# FP_STRUCT_EDIT_DEBOUNCE: _rev_pub mirrors _rev (0 off-flag); the v2 un-classified queue is capped at
+	# STRUCT_EDIT_UNCLS_MAX int64 (8 B) + the tiny overflow-facet marker set (both 0 off-flag).
+	return recs * 256 + _rev.size() * 48 + _rev_pub.size() * 48 + _uncls.size() * 8 + _uncls_overflow.size() * 16

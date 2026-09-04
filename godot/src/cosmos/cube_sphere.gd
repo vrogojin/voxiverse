@@ -1563,6 +1563,12 @@ const FP_STRUCT_EDIT_DEBOUNCE := false       # defer far-visible structure revs 
 const STRUCT_EDIT_DEPART_BLK := 16.0         # publish gate: min distance (blocks) from the structure's world AABB (nearest block)
 const STRUCT_EDIT_IDLE_MS := 3000            # publish gate: min ms since the last edit to that structure
 const STRUCT_EDIT_PENDING_MAX := 64          # NEVER-OOM: pending-entry cap (overflow force-publishes the oldest)
+## v2 (docs/COSMOS-FAR-EDIT-DEBOUNCE-REDESIGN.md) — the deferred, budgeted, O(1)-per-entry classifier. The edit input
+## frame only ENQUEUES (STRICTLY O(1), worldgen-free); classification runs off-frame in _sed_classify_step, bounded by
+## a per-frame time box AND a forward-progress floor (so a queue of N drains in ≤ ⌈N/MIN⌉ ticks — never dropped).
+const STRUCT_EDIT_CLASSIFY_US := 500         # per-frame classifier time box (µs) — bounds the DEFERRED drain, never the input frame
+const STRUCT_EDIT_CLASSIFY_MIN := 8          # min entries drained per tick regardless of the time box (guaranteed forward progress)
+const STRUCT_EDIT_UNCLS_MAX := 4096          # NEVER-OOM cap on the un-classified queue (32 KB int64); overflow ⇒ whole-facet superset marker
 
 ## FP_DEM_DEFER (docs/COSMOS-STREAM-PARALLEL-DESIGN.md Phase A — the fresh-reload fix) — the whole-planet coarse
 ## DEM (`FP_GLOBAL_RELIEF_DATA` / `GlobalReliefData.step`) is frame-budget GATED but the admitted unit is UNBOUNDED

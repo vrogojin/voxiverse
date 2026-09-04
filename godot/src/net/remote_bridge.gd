@@ -730,7 +730,8 @@ func _capture_worst_frame_snapshot() -> Dictionary:
 			# (nested StructuralSolver.solve), wf_reclust_ms (tracker _recluster_all, debounced later frame), and the
 			# cumulative wf_ftr_edit_fires (edits that bump edit_count → far-tree rebuild). Absent off-flag ⇒ byte-identical.
 			for _wk in ["wf_ftr_us", "wf_or_us", "wf_ring_disp_us", "wf_ring_swap_us", "ft_flip_defers", "shell_ascent_lazy_arms",
-					"wf_collapse_ms", "wf_solve_ms", "wf_reclust_ms", "wf_ftr_edit_fires"]:
+					"wf_collapse_ms", "wf_solve_ms", "wf_reclust_ms", "wf_ftr_edit_fires",
+					"wf_sed_note_ms", "wf_sed_cls_ms"]:   # FP_STRUCT_EDIT_DEBOUNCE v2 (§6): edit-frame enqueue + deferred-classifier cost
 				if (wm as Dictionary).has(_wk):
 					snap[_wk] = (wm as Dictionary).get(_wk, 0)
 			# FP_STRUCT_EDIT_DEBOUNCE (§7): the far-edit debounce sensors — present only under the flag (absent keys ⇒
@@ -741,6 +742,7 @@ func _capture_worst_frame_snapshot() -> Dictionary:
 				snap["wf_sed_pub"] = (wm as Dictionary).get("sed_pub", 0)
 				snap["wf_sed_oldest_ms"] = (wm as Dictionary).get("sed_oldest_ms", 0)
 				snap["wf_sed_forced"] = (wm as Dictionary).get("sed_forced", 0)
+				snap["wf_sed_uncls"] = (wm as Dictionary).get("sed_uncls", 0)   # v2 (§6): un-classified queue depth
 	# if FP_FALL_TIMING is ALSO on: the in-progress (not-yet-window-flushed) _ft segment maxima — narrows the fall-segment
 	# correlation from 250 ms to "since last new-worst". Empty (no keys) when fall-timing was never on ⇒ nothing stamped.
 	if CubeSphere.FP_FALL_TIMING and is_instance_valid(player) and _has_m(player, "fall_timing_peek"):

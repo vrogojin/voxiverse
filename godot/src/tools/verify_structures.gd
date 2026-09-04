@@ -138,6 +138,10 @@ func _initialize() -> void:
 	_gate_sed_neverdrop()  # randomized edit/publish ⇒ published == truth after the final publish
 	_gate_sed_tracker()    # the tracker half: version()/_make_record held, publish() latches
 	_gate_sed_gate()       # the WorldManager idle+depart gate + NEVER-OOM force-publish
+	# v2 (docs/COSMOS-FAR-EDIT-DEBOUNCE-REDESIGN.md §7) — the re-add's O(1)-edit-frame / deferred-classifier guarantees.
+	_gate_sed_cold()       # NEW: a COLD-cache in-bbox edit does NO enumeration on the input path; classify+publish ⇒ published==truth (never-drop from cold)
+	_gate_sed_classify()   # NEW: mixed batch ⇒ EXACTLY the in-house edit bumps; record_bbox == the enumerated bbox (single-source law)
+	_gate_sed_budget()     # NEW: 100 queued ⇒ drained ≤ ⌈100/MIN⌉ ticks; overflow ⇒ off-frame enumerate (NEVER-OOM superset)
 
 	# COSMOS LOD-DROPOUT S3 (docs/COSMOS-LOD-DROPOUT-DESIGN.md §4, FP_SKIN_READY_GATE): the card→roof-skin hide holds the
 	# card tier until the roof handoff set's fine-map skin is baked, up to STRUCT_CARD_HOLD_MAX_ALT. Flag-aware.
@@ -434,9 +438,12 @@ func _gate_sg_damage() -> void:
 		if int(r["root"]) == root:
 			rev1 = int(r["rev"])
 	if CubeSphere.FP_STRUCT_EDIT_DEBOUNCE:
-		# FP_STRUCT_EDIT_DEBOUNCE: the SERVED (published) rev is HELD; the TRUTH rev bumps instantly (published on departure).
-		_ok(rev1 == rev0 and int(idx._rev.get(root, 0)) == rev0 + 1,
-			"G-SG-DAMAGE(debounce): note_edit HOLDS the served rev + bumps the TRUTH rev (far re-bake deferred to publish)")
+		# FP_STRUCT_EDIT_DEBOUNCE v2: note_edit is STRICTLY O(1) — it ENQUEUES the edit (no truth-rev bump, no enumeration
+		# on the input path); classification (the truth-rev bump) is deferred off-frame to WorldManager._sed_classify_step.
+		_ok(rev1 == rev0 and int(idx._rev.get(root, 0)) == rev0,
+			"G-SG-DAMAGE(debounce): note_edit HOLDS the served rev AND defers the truth bump (O(1) enqueue — no input-frame classify)")
+		_ok(idx.uncls_size() >= 1,
+			"G-SG-DAMAGE(debounce): the edit is captured in the un-classified queue (drained + classified off the input frame)")
 	else:
 		_ok(rev1 == rev0 + 1, "G-SG-DAMAGE: note_edit inside a GEN bbox bumps its rev (re-bake ⇒ the hole shows far)")
 
@@ -1973,19 +1980,32 @@ func _gate_sed_hold() -> void:
 	var root := int(rec["root"])
 	var cell: Vector3i = rec["bmin"]                       # a cell inside the house bbox
 	var v0: int = idx.version()
-	var dmg: Array = idx.note_edit(fid, cell)
 	if on:
-		_ok(idx.version() == v0, "G-SED-HOLD(on): an in-house edit HOLDS the version (no far re-materialize ⇒ no freeze)")
-		_ok(int(idx._rev.get(root, 0)) == 1, "G-SED-HOLD(on): the TRUTH rev bumped instantly (lossless)")
-		_ok(not idx._rev_pub.has(root), "G-SED-HOLD(on): the PUBLISHED rev did NOT bump (the far tier sees pristine)")
+		# v2 EDIT FRAME: STRICTLY O(1) — the enqueue does NO enumeration, NO version drift, NO truth-rev bump.
+		var e0: int = idx.enum_count()
+		var dmg: Array = idx.note_edit(fid, cell)
+		_ok(dmg.is_empty(), "G-SED-HOLD(on): note_edit returns [] (no synchronous classify on the input frame)")
+		_ok(idx.enum_count() == e0, "G-SED-HOLD(on): the edit does NO facet enumeration on the input path (O(1) — the v1 freeze is gone by construction)")
+		_ok(idx.version() == v0, "G-SED-HOLD(on): the enqueue HOLDS the version (no far re-materialize ⇒ no freeze)")
+		_ok(int(idx._rev.get(root, 0)) == 0, "G-SED-HOLD(on): the input path DEFERS the truth-rev bump (no worldgen on the edit frame)")
+		_ok(idx.uncls_size() >= 1, "G-SED-HOLD(on): the edit is captured in the un-classified queue (never-drop)")
+		# v2 DEFERRED CLASSIFY: drive it exactly as verify drives _sed_gate_publish (a bare WorldManager owning the index).
+		var wm = WM.new(); wm._gen_index = idx
+		wm._sed_classify_step()
+		_ok(idx.enum_count() == e0, "G-SED-HOLD(on): the classifier resolves per-column (has_village/house_info) — STILL no facet enumeration")
+		_ok(int(idx._rev.get(root, 0)) == 1, "G-SED-HOLD(on): after one driven classify, the TRUTH rev bumped (lossless)")
+		_ok(not idx._rev_pub.has(root), "G-SED-HOLD(on): the PUBLISHED rev did NOT bump (the far tier still sees pristine)")
+		_ok(idx.version() == v0, "G-SED-HOLD(on): classification bumps the truth ONLY — the version stays held (no far resnapshot)")
 		var served := -1
 		for r in idx.enumerate_facet(fid):
 			if int((r as Dictionary)["root"]) == root:
 				served = int((r as Dictionary)["rev"])
 		_ok(served == 0, "G-SED-HOLD(on): the served record rev is still 0 (published) — the far model holds")
-		_ok(dmg.size() >= 1 and int((dmg[0] as Dictionary)["root"]) == root, "G-SED-HOLD(on): note_edit returns the damaged root(s) for the pending map")
+		_ok(wm._sed_pending.has(root), "G-SED-HOLD(on): the classifier upserted the damaged house into the pending map")
+		wm.free()
 	else:
-		_ok(idx.version() != v0 and int(idx._rev.get(root, 0)) == 1,
+		var dmg2: Array = idx.note_edit(fid, cell)
+		_ok(dmg2.is_empty() and idx.version() != v0 and int(idx._rev.get(root, 0)) == 1,
 			"G-SED-HOLD(off): note_edit bumps the version + advances the served rev (shipped immediate re-bake)")
 
 ## G-SED-PUBLISH (P1 proof, GEN half): publish_roots copies truth→published, bumps the version ONCE for N roots
@@ -2004,10 +2024,11 @@ func _gate_sed_publish() -> void:
 	idx.enumerate_facet(fid)                               # cache the facet
 	var r0 := int((recs[0] as Dictionary)["root"])
 	var r1 := int((recs[1] as Dictionary)["root"])
-	# damage BOTH houses (truth revs advance; version held).
-	idx.note_edit(fid, (recs[0] as Dictionary)["bmin"])
-	idx.note_edit(fid, (recs[0] as Dictionary)["bmin"])   # r0 truth = 2
-	idx.note_edit(fid, (recs[1] as Dictionary)["bmin"])   # r1 truth = 1
+	# v2: the classifier's truth-rev bump is note_damage (note_edit only enqueues). Drive it directly here — the point of
+	# this gate is publish_roots copying truth→published, independent of the enqueue/classify scheduling.
+	idx.note_damage(r0)
+	idx.note_damage(r0)                                   # r0 truth = 2
+	idx.note_damage(r1)                                   # r1 truth = 1
 	var vpre: int = idx.version()
 	idx.publish_roots([r0, r1])                            # COALESCE: one version bump for two roots
 	_ok(idx.version() == vpre + 1, "G-SED-PUBLISH: publish of N roots ⇒ exactly ONE version drift (coalescing)")
@@ -2029,15 +2050,13 @@ func _gate_sed_neverdrop() -> void:
 		_ok(false, "G-SED-NEVERDROP: no house")
 		return
 	var idx = found["idx"]
-	var fid: int = found["fid"]
 	var root := int((found["rec"] as Dictionary)["root"])
-	var cell: Vector3i = (found["rec"] as Dictionary)["bmin"]
 	seed(12345)
 	for i in range(60):
 		if randi() % 3 == 0:
 			idx.publish_roots([root])                     # publish at random points
 		else:
-			idx.note_edit(fid, cell)                      # damage
+			idx.note_damage(root)                         # v2: the classifier's truth-rev bump (note_edit only enqueues)
 	idx.publish_roots([root])                             # final publish
 	_ok(int(idx._rev_pub.get(root, 0)) == int(idx._rev.get(root, 0)) and int(idx._rev.get(root, 0)) > 0,
 		"G-SED-NEVERDROP: after the final publish, published rev == truth rev (no edit lost)")
@@ -2126,3 +2145,135 @@ func _gate_sed_gate() -> void:
 	wm3._sed_gate_publish(Vector3(wmax3.x + dep + 0.001, cy3, cz3), t3 + CubeSphere.STRUCT_EDIT_IDLE_MS + 1000)
 	_ok(wm3._sed_pending.is_empty(), "G-SED-GATE: %.3f blk from the outer voxel face ⇒ PUBLISH (≥ DEPART_BLK; the +1 AABB fix)" % (dep + 0.001))
 	wm3.free()
+
+## G-SED-COLD (v2 §7 — the regression guard for the incident): with a COLD `_cache`, an in-bbox edit does NO facet
+## enumeration on the input path (the v1 3.4 s freeze was exactly a cache-cold `enumerate_facet` on the edit frame);
+## after a driven classify + gate publish, published rev == truth (never-drop FROM COLD, position-pure classification).
+func _gate_sed_cold() -> void:
+	if not CubeSphere.FP_STRUCT_EDIT_DEBOUNCE:
+		_ok(true, "G-SED-COLD: flag off ⇒ no queue/classifier (skipped)")
+		return
+	var found := _find_house()
+	if found.is_empty():
+		_ok(false, "G-SED-COLD: no house fixture")
+		return
+	var fid: int = found["fid"]
+	var rec: Dictionary = found["rec"]
+	var root := int(rec["root"])
+	var cell: Vector3i = rec["bmin"]
+	# A COLD index — the facet is NEVER enumerated. This is the exact v1-freeze condition: a cache-miss edit.
+	var cold = SGI.new()
+	var e0: int = cold.enum_count()
+	cold.note_edit(fid, cell)                                  # the edit input path
+	_ok(cold.enum_count() == e0, "G-SED-COLD: a cold-cache in-bbox edit does NO facet enumeration on the input path (O(1) — the v1 freeze is gone by construction)")
+	_ok(int(cold._rev.get(root, 0)) == 0, "G-SED-COLD: the input path defers the truth-rev bump (no synchronous worldgen)")
+	_ok(cold.uncls_size() == 1, "G-SED-COLD: the edit is captured (never-drop)")
+	# Drive the classifier off-frame (still cold) — per-column has_village/house_info, never enumerate_facet.
+	var wm = WM.new(); wm._gen_index = cold
+	var t0 := Time.get_ticks_msec()
+	wm._sed_classify_step()
+	_ok(cold.enum_count() == e0, "G-SED-COLD: the classifier resolves per-column — STILL no facet enumeration")
+	_ok(int(cold._rev.get(root, 0)) == 1, "G-SED-COLD: the classifier bumped the TRUTH rev (never-drop from cold)")
+	_ok(wm._sed_pending.has(root), "G-SED-COLD: the classifier upserted the pending entry")
+	# Publish (idle + departed) ⇒ published == truth from a cold start (end-to-end never-drop).
+	var abb: Array = wm._sed_world_aabb(fid, rec["bmin"], rec["bmax"])
+	var wmax: Vector3 = abb[1]
+	var far := Vector3(wmax.x + CubeSphere.STRUCT_EDIT_DEPART_BLK + 1.0, wmax.y, wmax.z)
+	wm._sed_gate_publish(far, t0 + CubeSphere.STRUCT_EDIT_IDLE_MS + 5000)
+	_ok(int(cold._rev_pub.get(root, 0)) == int(cold._rev.get(root, 0)) and int(cold._rev.get(root, 0)) > 0,
+		"G-SED-COLD: after a driven classify + gate publish, published rev == truth (never-drop end-to-end from cold)")
+	wm.free()
+
+## G-SED-CLASSIFY (v2 §7): a mixed batch — in-house / plain-terrain (no village) / in-footprint-wrong-Y — drained through
+## the WM classifier ⇒ EXACTLY the in-house edit bumps (root == pack_root), and never a facet enumeration. Plus the
+## single-source bbox-law guard: StructureGen.record_bbox(hi) == the enumerated record's bmin/bmax for the same house.
+func _gate_sed_classify() -> void:
+	if not CubeSphere.FP_STRUCT_EDIT_DEBOUNCE:
+		_ok(true, "G-SED-CLASSIFY: flag off (skipped)")
+		return
+	var found := _find_house()
+	if found.is_empty():
+		_ok(false, "G-SED-CLASSIFY: no house fixture")
+		return
+	var fid: int = found["fid"]
+	var rec: Dictionary = found["rec"]
+	var root := int(rec["root"])
+	var bmin: Vector3i = rec["bmin"]
+	var bmax: Vector3i = rec["bmax"]
+	# single-source bbox law: record_bbox(hi) == the enumerated record bmin/bmax for the SAME house.
+	var ctx = TerrainConfig.GenCtx.new(0, fid)
+	var hx := floori(float(bmin.x) / float(SG.STRUCT_HCELL))
+	var hz := floori(float(bmin.z) / float(SG.STRUCT_HCELL))
+	var hi := SG.house_info(hx, hz, ctx)
+	var bb: Array = SG.record_bbox(hi)
+	_ok(not hi.is_empty() and bb[0] == bmin and bb[1] == bmax,
+		"G-SED-CLASSIFY: record_bbox(hi) == the enumerated record bmin/bmax (single-source bbox law — the G guard)")
+	# Find a guaranteed no-village cell near the house by stepping the village pitch (deterministic; bounded to the key range).
+	var plain := Vector3i(0, bmin.y, 0)
+	var have_plain := false
+	var vz0 := floori(float(bmin.z) / float(SG.STRUCT_V))
+	for step in range(1, 80):
+		var cx := bmin.x + step * SG.STRUCT_V
+		if cx > 120000:
+			break
+		if not SG.has_village(floori(float(cx) / float(SG.STRUCT_V)), vz0, ctx):
+			plain = Vector3i(cx, bmin.y, bmin.z); have_plain = true; break
+	# Mixed batch through the WM classifier on a FRESH index.
+	var fresh = SGI.new()
+	var wm = WM.new(); wm._gen_index = fresh
+	fresh.note_edit(fid, bmin)                                 # in-house (bumps)
+	fresh.note_edit(fid, Vector3i(bmin.x, bmax.y + 50, bmin.z))# in-footprint x/z but WAY above the roof (out of bbox ⇒ no bump)
+	if have_plain:
+		fresh.note_edit(fid, plain)                           # plain terrain / no village (no bump)
+	var e0 := fresh.enum_count()
+	while not fresh.uncls_queue_empty():
+		wm._sed_classify_step()
+	_ok(fresh.enum_count() == e0, "G-SED-CLASSIFY: the classifier never enumerates a facet (per-column O(1))")
+	_ok(fresh._rev.has(root) and int(fresh._rev.get(root, 0)) == 1,
+		"G-SED-CLASSIFY: the in-house edit bumps exactly its house rev; the damaged root == pack_root(fid,hx,hz)")
+	_ok(fresh._rev.size() == 1 and wm._sed_pending.size() == 1 and wm._sed_pending.has(root),
+		"G-SED-CLASSIFY: plain-terrain + in-footprint-wrong-Y edits do NOT bump (exactly the in-house edit damages)")
+	wm.free()
+
+## G-SED-BUDGET (v2 §7): 100 queued entries drain in ≤ ⌈100/STRUCT_EDIT_CLASSIFY_MIN⌉ driven ticks (the forward-progress
+## floor), queue empty. Plus the NEVER-OOM overflow degrade: at STRUCT_EDIT_UNCLS_MAX the facet is marked wholesale-dirty
+## and the classifier resolves it by an OFF-FRAME enumeration (over-invalidate every record — never a drop).
+func _gate_sed_budget() -> void:
+	if not CubeSphere.FP_STRUCT_EDIT_DEBOUNCE:
+		_ok(true, "G-SED-BUDGET: flag off (skipped)")
+		return
+	var found := _find_house()
+	if found.is_empty():
+		_ok(false, "G-SED-BUDGET: no house fixture")
+		return
+	var fid: int = found["fid"]
+	var cell: Vector3i = found["rec"]["bmin"]
+	var idx = SGI.new()
+	for i in range(100):
+		idx.note_edit(fid, cell + Vector3i(0, i % 3, 0))       # 100 O(1) enqueues (input frame never classifies)
+	_ok(idx.uncls_size() == 100, "G-SED-BUDGET: 100 edits enqueue O(1) (the input frame never classifies)")
+	var wm = WM.new(); wm._gen_index = idx
+	var cap := int(ceil(100.0 / float(CubeSphere.STRUCT_EDIT_CLASSIFY_MIN)))
+	var ticks := 0
+	while not idx.uncls_queue_empty() and ticks < cap + 1:
+		wm._sed_classify_step()
+		ticks += 1
+	_ok(idx.uncls_queue_empty(), "G-SED-BUDGET: the queue drains fully")
+	_ok(ticks <= cap, "G-SED-BUDGET: 100 entries drained in ≤ ⌈100/MIN⌉ = %d driven ticks (forward-progress floor)" % cap)
+	wm.free()
+	# NEVER-OOM overflow: enqueue past the cap ⇒ the facet is marked wholesale-dirty; the classifier resolves it off-frame.
+	var root := int(found["rec"]["root"])
+	var ov = SGI.new()
+	for i in range(CubeSphere.STRUCT_EDIT_UNCLS_MAX + 5):
+		ov.note_edit(fid, cell)
+	_ok(ov.has_overflow(), "G-SED-BUDGET: queue overflow marks the facet wholesale-dirty (NEVER-OOM superset)")
+	var wmo = WM.new(); wmo._gen_index = ov
+	var eo0 := ov.enum_count()
+	var guard := 0
+	while ov.has_overflow() and guard < 8:
+		wmo._sed_classify_step()
+		guard += 1
+	_ok(not ov.has_overflow() and ov.enum_count() > eo0,
+		"G-SED-BUDGET: the overflow facet is resolved by an OFF-FRAME enumeration (bounded over-invalidate)")
+	_ok(int(ov._rev.get(root, 0)) >= 1, "G-SED-BUDGET: every record on the dirty facet is re-damaged (never drop)")
+	wmo.free()

@@ -37,6 +37,12 @@ var _reg: Dictionary = {}                     # root edit_key → registry recor
 
 var _snow_ids: Dictionary = {}               # material ids the snowfall sim writes — EXCLUDED from clustering (§4.1)
 var _rev_counter := 0                         # monotone rev source (bumped per cluster mutation — the far delta signal)
+# FP_STRUCT_EDIT_DEBOUNCE: the PUBLISHED (far-visible) version + per-root revs. version()/_make_record serve these
+# under the flag; publish() latches them from the truth (`_rev_counter`/`cl["rev"]`). `_last_noted_root` is the cluster
+# root the most recent note_cell/note_removed touched (−1 if none) — WorldManager reads it to upsert its pending map.
+var _version_pub := 0
+var _rev_pub: Dictionary = {}
+var _last_noted_root := -1
 var _dirty := false                           # a removal happened; a recluster is pending
 var _dirty_at_ms := 0                         # Time.get_ticks_msec() when _dirty was first set (debounce anchor)
 var _saturated := false                       # hit STRUCT_TRACK_MAX (telemetry-degrade, log-once)
@@ -64,6 +70,8 @@ func _qualifies_mat(mat: int) -> bool:
 ## `_write_cell` tail: the cell now carries `packed`. Place (qualifying, newly tracked), material-swap (qualifying,
 ## already tracked), or remove (non-qualifying — dug air / snow — over a tracked cell).
 func note_cell(ek: int, packed: int) -> void:
+	if CubeSphere.FP_STRUCT_EDIT_DEBOUNCE:
+		_last_noted_root = -1                    # reset; set below to the affected clustered root (WorldManager reads it)
 	var mat := CellCodec.mat(packed)
 	var qual := _qualifies_mat(mat)
 	var tracked: bool = _cell_mat.has(ek)
@@ -75,6 +83,8 @@ func note_cell(ek: int, packed: int) -> void:
 			return                               # degrade, never grow
 		_cell_mat[ek] = mat
 		_add_cell(ek, mat)
+		if CubeSphere.FP_STRUCT_EDIT_DEBOUNCE:
+			_last_noted_root = _find(ek)
 	elif qual and tracked:
 		if _cell_mat[ek] != mat:                 # material swap in place — connectivity unchanged, histogram + rev shift
 			var old_mat: int = _cell_mat[ek]
@@ -86,6 +96,8 @@ func note_cell(ek: int, packed: int) -> void:
 				_histo_inc(cl["mats"], mat)
 				cl["rev"] = _bump_rev()
 				_sync_registration(root)
+				if CubeSphere.FP_STRUCT_EDIT_DEBOUNCE:
+					_last_noted_root = root
 	elif tracked:                                # non-qualifying over a tracked cell ⇒ removal
 		note_removed(ek)
 
@@ -93,6 +105,8 @@ func note_cell(ek: int, packed: int) -> void:
 ## `sim_revert_cell` (the ONLY `_edits` erase) + the removal path of `note_cell`: the cell is no longer a placed
 ## structure cell. Erase it; mark DIRTY (a removal can split a component) for the debounced recluster (§4.2).
 func note_removed(ek: int) -> void:
+	if CubeSphere.FP_STRUCT_EDIT_DEBOUNCE:
+		_last_noted_root = -1
 	if not _cell_mat.has(ek):
 		return
 	var root := _find(ek)
@@ -104,6 +118,8 @@ func note_removed(ek: int) -> void:
 		_histo_dec(cl["mats"], mat)
 		cl["rev"] = _bump_rev()
 		_sync_registration(root)
+		if CubeSphere.FP_STRUCT_EDIT_DEBOUNCE:
+			_last_noted_root = root               # the removed cell's cluster — pending gate uses its (over-covering) bbox
 	if not _dirty:
 		_dirty = true
 		_dirty_at_ms = Time.get_ticks_msec()
@@ -266,13 +282,17 @@ func _sync_registration(root: int) -> void:
 ## §3 record shape (source-agnostic — P1 GEN villages produce the same). Fresh dict each call (the far tier snapshots).
 func _make_record(root: int) -> Dictionary:
 	var cl: Dictionary = _clusters[root]
+	# FP_STRUCT_EDIT_DEBOUNCE (§3.2): serve the PUBLISHED rev (masking REV only — bbox/count are current) so a legitimate
+	# GEN-side version bump (a crossing) that resnapshots mid-build re-materializes the record with the pre-edit rev ⇒
+	# _ensure_bake (keyed (root, rev)) keeps the cached pre-edit bake, no re-decimate. Off ⇒ `cl["rev"]` verbatim.
+	var rev := int(_rev_pub.get(root, 0)) if CubeSphere.FP_STRUCT_EDIT_DEBOUNCE else int(cl["rev"])
 	return {
 		"source": SOURCE_PLAYER,
 		"root": root,
 		"fid": int(cl["fid"]),
 		"bmin": cl["bmin"],
 		"bmax": cl["bmax"],
-		"rev": int(cl["rev"]),
+		"rev": rev,
 		"count": int(cl["count"]),
 		"mats": (cl["mats"] as Dictionary).duplicate(),
 		"max_extent": _max_extent(cl["bmin"], cl["bmax"]),
@@ -329,7 +349,29 @@ func rev_sum() -> int:
 ## and bumped on every cluster mutation (make-set/union/note_cell/note_removed/recluster); folding in `_reg.size()`
 ## (bounded < STRUCT_REG_MAX) also catches a pure add/remove that keeps the rev-sum. Avoids the O(N) rev_sum() scan.
 func version() -> int:
+	if CubeSphere.FP_STRUCT_EDIT_DEBOUNCE:
+		return _version_pub                       # far-visible version advances only at publish() (player departed + idle)
 	return _rev_counter * 1024 + _reg.size()
+
+## FP_STRUCT_EDIT_DEBOUNCE: the cluster root the most recent note_cell/note_removed touched (−1 if the edit did not
+## affect a clustered structure). WorldManager reads this at the choke tail to key its pending debounce map.
+func last_noted_root() -> int:
+	return _last_noted_root
+
+## FP_STRUCT_EDIT_DEBOUNCE: {fid, bmin, bmax} for a live cluster root (for the pending map's world-AABB); {} if absent.
+func structure_bbox(root: int) -> Dictionary:
+	if not _clusters.has(root):
+		return {}
+	var cl: Dictionary = _clusters[root]
+	return {"fid": int(cl["fid"]), "bmin": cl["bmin"], "bmax": cl["bmax"]}
+
+## FP_STRUCT_EDIT_DEBOUNCE (§3.2): latch the PUBLISHED version + per-root revs from the truth (whole-tracker granularity,
+## §6 R3). Called from WorldManager._sed_publish when any tracker structure's debounce gate opens. After this,
+## version()/_make_record serve the current revs so the far tier re-bakes the changed player build exactly once.
+func publish() -> void:
+	_version_pub = _rev_counter * 1024 + _reg.size()
+	for root in _clusters:
+		_rev_pub[root] = int((_clusters[root] as Dictionary)["rev"])
 
 func tracked_count() -> int: return _cell_mat.size()
 func registry_count() -> int: return _reg.size()
@@ -345,4 +387,4 @@ func total_bytes() -> int:
 	var parent_b := _parent.size() * 48
 	var cluster_b := _clusters.size() * 160
 	var reg_b := _reg.size() * 224
-	return cell_b + parent_b + cluster_b + reg_b
+	return cell_b + parent_b + cluster_b + reg_b + _rev_pub.size() * 48   # FP_STRUCT_EDIT_DEBOUNCE: published revs (0 off-flag)

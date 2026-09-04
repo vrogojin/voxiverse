@@ -311,6 +311,14 @@ var _structure_tracker = null
 # of StructureGen's village hash. Constructed in setup() under the flag; null off ⇒ the structure_registry concat +
 # the structure_cell_at GEN branch + the rev-bump hooks are all one null test (byte-identical). See struct_gen_index.gd.
 var _gen_index = null
+# FP_STRUCT_EDIT_DEBOUNCE (docs/COSMOS-FAR-EDIT-DEBOUNCE-DESIGN.md §3): the ONE pending-edit debounce map (both producers).
+# key:int (GEN negative root / tracker cluster root) → {last_edit_ms, wmin:Vector3, wmax:Vector3 (cached world AABB —
+# crossing-safe), gen_roots:Dictionary(root→true), trk:bool}. Filled at the two edit choke tails; drained by _sed_tick
+# once the player departs STRUCT_EDIT_DEPART_BLK + idles STRUCT_EDIT_IDLE_MS. Never allocated / read off-flag (byte-off).
+var _sed_pending: Dictionary = {}
+var _sed_pub_rev := 0                          # §3.4: the far-structure edits-rev term — bumps only at publish (not every dig)
+var _sed_publishes := 0                        # telemetry: total publish ticks
+var _sed_forced := 0                           # telemetry: overflow force-publishes (NEVER-OOM cap)
 # COSMOS STRUCTURES P1 (§12.5): a 1-entry per-fid GenCtx cache the structure_cell_at GEN sampler reuses across the
 # decimator's contiguous per-structure scan (shares the column memo). Rebuilt when the sampled fid changes.
 var _struct_gen_ctx = null
@@ -501,7 +509,12 @@ func _ready() -> void:
 			if CubeSphere.FP_STRUCT_FAR:
 				_facet_ring.set_far_structures_registry_query(Callable(self, "structure_registry"))
 				_facet_ring.set_far_structures_sampler(Callable(self, "structure_cell_at"))
-				_facet_ring.set_far_structures_edits_rev_query(Callable(self, "edit_count"))
+				# §3.4 FP_STRUCT_EDIT_DEBOUNCE: the far-structure edits-rev term bumps only at PUBLISH, not on every dig
+				# (plain-terrain digs otherwise churn the far tier at 250 ms). Off ⇒ raw `edit_count` verbatim (byte-off).
+				if CubeSphere.FP_STRUCT_EDIT_DEBOUNCE:
+					_facet_ring.set_far_structures_edits_rev_query(Callable(self, "struct_edits_rev_pub"))
+				else:
+					_facet_ring.set_far_structures_edits_rev_query(Callable(self, "edit_count"))
 				_facet_ring.set_far_structures_near_query(Callable(self, "far_tree_near_presence"))
 				# FP_STRUCT_REG_EPOCH: the O(1) registry version so the tier's prelude re-materializes its snapshot
 				# only on a real change. Stored like the other queries; only consulted under the flag ⇒ byte-off.
@@ -965,6 +978,10 @@ func _process(delta: float) -> void:
 	# dirtied cluster re-floods once the removal burst settles). Cheap no-op when nothing is dirty; null off (byte-off).
 	if _structure_tracker != null:
 		_structure_tracker.tick(Time.get_ticks_msec())
+	# FP_STRUCT_EDIT_DEBOUNCE (§3.3): drain the pending far-rev debounce — publish structures the player has departed +
+	# idled from. One is_empty() check when nothing pends (the tracker-tick idiom). Off ⇒ never called (byte-off).
+	if CubeSphere.FP_STRUCT_EDIT_DEBOUNCE:
+		_sed_tick()
 	# docs/COSMOS-STRUCTURES-DESIGN.md (P1, §12.5): refresh the GEN registry's wanted-facet band (active facet +
 	# facets within STRUCT_FAR_MAX). The 3,456-facet scan only fires on a facet crossing; a still player costs one int
 	# compare. Null off ⇒ never runs (byte-identical).
@@ -2286,11 +2303,19 @@ func _write_cell(cell: Vector3i, packed: int, meta: Variant = null, paint: bool 
 	# null tracker (flag off) ⇒ one branch skip (byte-identical).
 	if _structure_tracker != null and CubeSphere.FACETED and _chart == null:
 		_structure_tracker.note_cell(ek, packed)
+		# FP_STRUCT_EDIT_DEBOUNCE (§3.1): if the edit touched a clustered player build, upsert it into the pending map
+		# (the tracker version is now held; publish on departure). Off ⇒ never called (byte-off).
+		if CubeSphere.FP_STRUCT_EDIT_DEBOUNCE:
+			_sed_note_tracker(int(ek))
 	# docs/COSMOS-STRUCTURES-DESIGN.md (P1, §12.5): an edit inside a GEN village bbox damages it — bump that record's
 	# rev so the far tier re-bakes and shows the hole (the player-build path). Null off ⇒ one branch skip (byte-off).
 	if _gen_index != null and CubeSphere.FACETED and _chart == null:
 		var _gu: Array = FacetAtlas.edit_key_unpack(int(ek))
-		_gen_index.note_edit(int(_gu[0]), _gu[1])
+		var _dmg: Array = _gen_index.note_edit(int(_gu[0]), _gu[1])
+		# FP_STRUCT_EDIT_DEBOUNCE (§3.1): the GEN rev is held (truth-only); upsert the damaged houses into the pending
+		# map keyed by root. Off ⇒ _dmg is [] and this is skipped (byte-off; the return is discarded).
+		if CubeSphere.FP_STRUCT_EDIT_DEBOUNCE and not _dmg.is_empty():
+			_sed_note_gen(_dmg)
 	# docs/COSMOS-FARTREE-CHOP-DESIGN.md §4.3 (FP_FT_SKIN_CHOP): if this edit is the trunk-base cell of its column's
 	# procedural tree, the tree's chopped state just toggled — the facet's baked band/fine far-skin tiles are stale.
 	# O(1) detect (one tree_info); the rung-3 analogue of FacetFarTrees' edits-rev rebuild re-arm. Off / no baker ⇒ no-op.
@@ -2338,11 +2363,15 @@ func sim_revert_cell(cell: Vector3i) -> void:
 		# removed so the tracker debounces a bounded recluster (a removal can split a component). FACETED ⇒ ek is int.
 		if _structure_tracker != null and CubeSphere.FACETED and _chart == null:
 			_structure_tracker.note_removed(int(ek))
+			if CubeSphere.FP_STRUCT_EDIT_DEBOUNCE:       # §3.1: a removal on a player build ⇒ pending (symmetric)
+				_sed_note_tracker(int(ek))
 		# docs/COSMOS-STRUCTURES-DESIGN.md (P1, §12.5): a reverted cell over a GEN house un-damages/re-damages it —
 		# bump the record rev so the far model re-bakes (symmetric with the _write_cell hook). Null off ⇒ byte-off.
 		if _gen_index != null and CubeSphere.FACETED and _chart == null:
 			var _gu: Array = FacetAtlas.edit_key_unpack(int(ek))
-			_gen_index.note_edit(int(_gu[0]), _gu[1])
+			var _dmg: Array = _gen_index.note_edit(int(_gu[0]), _gu[1])
+			if CubeSphere.FP_STRUCT_EDIT_DEBOUNCE and not _dmg.is_empty():
+				_sed_note_gen(_dmg)
 		# docs/COSMOS-FARTREE-CHOP-DESIGN.md §4.3 (FP_FT_SKIN_CHOP): the ONLY `_edits` erase — an erased trunk-base
 		# edit UN-chops the tree; re-bake the facet's far skin so the tree returns (symmetric with _write_cell above).
 		if CubeSphere.FP_FT_SKIN_CHOP and _facet_tex != null and CubeSphere.FACETED and _chart == null:
@@ -3996,6 +4025,154 @@ func structure_registry_version() -> int:
 	var tv: int = _structure_tracker.version() if _structure_tracker != null else 0
 	var gv: int = _gen_index.version() if _gen_index != null else 0
 	return tv ^ (gv * 2654435761)
+
+# =====================================================================================================================
+# FP_STRUCT_EDIT_DEBOUNCE (docs/COSMOS-FAR-EDIT-DEBOUNCE-DESIGN.md §3) — the far-visible-rev debounce. All functions
+# below are called ONLY under the flag; off ⇒ never reached (byte-off), so no null-guard clutter on the flag.
+# =====================================================================================================================
+
+## §3.4: the far-structure edits-rev term — bumps ONLY at publish (not on every first-write dig). Wired to the far tier
+## under the flag; off-flag the tier keeps `edit_count` (raw overlay size) verbatim. Removes the plain-terrain churn.
+func struct_edits_rev_pub() -> int:
+	return _sed_pub_rev
+
+## §3.1: upsert damaged GEN houses `[{root, fid, bmin, bmax}, …]` into the pending map (keyed by the negative GEN root).
+func _sed_note_gen(damaged: Array) -> void:
+	var now := Time.get_ticks_msec()
+	for d in damaged:
+		var dd: Dictionary = d
+		var root := int(dd["root"])
+		_sed_upsert(root, int(dd["fid"]), dd["bmin"], dd["bmax"], now, root, false)
+
+## §3.1: upsert a tracker player-build edit — the affected cluster root (from last_noted_root) + its world AABB.
+func _sed_note_tracker(_ek: int) -> void:
+	var root: int = _structure_tracker.last_noted_root()
+	if root == -1:
+		return
+	var bb: Dictionary = _structure_tracker.structure_bbox(root)
+	if bb.is_empty():
+		return
+	_sed_upsert(root, int(bb["fid"]), bb["bmin"], bb["bmax"], Time.get_ticks_msec(), -1, true)
+
+## Cache/union one pending entry's world AABB (crossing-safe), refresh last_edit_ms, record its producer. NEVER-OOM cap.
+func _sed_upsert(key: int, fid: int, bmin: Vector3i, bmax: Vector3i, now: int, gen_root: int, trk: bool) -> void:
+	var aabb := _sed_world_aabb(fid, bmin, bmax)
+	var wmin: Vector3 = aabb[0]
+	var wmax: Vector3 = aabb[1]
+	var e: Variant = _sed_pending.get(key)
+	if e == null:
+		if _sed_pending.size() >= CubeSphere.STRUCT_EDIT_PENDING_MAX:
+			_sed_force_publish_oldest()            # NEVER-OOM: bounded, still never-drop
+		var gr := {}
+		if gen_root != -1:
+			gr[gen_root] = true
+		_sed_pending[key] = {"last_edit_ms": now, "wmin": wmin, "wmax": wmax, "gen_roots": gr, "trk": trk}
+	else:
+		var ed: Dictionary = e
+		ed["last_edit_ms"] = now
+		var owmin: Vector3 = ed["wmin"]
+		var owmax: Vector3 = ed["wmax"]
+		ed["wmin"] = Vector3(minf(owmin.x, wmin.x), minf(owmin.y, wmin.y), minf(owmin.z, wmin.z))
+		ed["wmax"] = Vector3(maxf(owmax.x, wmax.x), maxf(owmax.y, wmax.y), maxf(owmax.z, wmax.z))
+		if gen_root != -1:
+			(ed["gen_roots"] as Dictionary)[gen_root] = true
+		if trk:
+			ed["trk"] = true
+
+## The world AABB enclosing a structure's lattice bbox — 8 corners through lattice_to_world64 (the SAME law the far
+## tier's _structure_centre uses), cached at note time so the gate is crossing-safe (no per-tick lattice reframing).
+func _sed_world_aabb(fid: int, bmin: Vector3i, bmax: Vector3i) -> Array:
+	var wmin := Vector3(INF, INF, INF)
+	var wmax := Vector3(-INF, -INF, -INF)
+	for cx in [bmin.x, bmax.x]:
+		for cy in [bmin.y, bmax.y]:
+			for cz in [bmin.z, bmax.z]:
+				var w := FacetAtlas.lattice_to_world64(fid, float(cx), float(cy), float(cz))
+				var p := Vector3(float(w[0]), float(w[1]), float(w[2]))
+				wmin = Vector3(minf(wmin.x, p.x), minf(wmin.y, p.y), minf(wmin.z, p.z))
+				wmax = Vector3(maxf(wmax.x, p.x), maxf(wmax.y, p.y), maxf(wmax.z, p.z))
+	return [wmin, wmax]
+
+## §3.3: the per-frame debounce tick (from _process, beside the tracker tick). No-op when idle. Publishes every entry
+## whose gate opened: idle ≥ STRUCT_EDIT_IDLE_MS AND player-to-world-AABB distance ≥ STRUCT_EDIT_DEPART_BLK.
+func _sed_tick() -> void:
+	if _sed_pending.is_empty():
+		return
+	if not _have_player_pos:
+		return
+	# no valid active facet (off-surface / space) ⇒ can't map a player world pos; the pending entries hold harmlessly.
+	var afid := TerrainConfig.active_facet()
+	if afid < 0:
+		return
+	var pw := FacetAtlas.lattice_to_world64(afid, _last_player_pos.x, _last_player_pos.y, _last_player_pos.z)
+	_sed_gate_publish(Vector3(float(pw[0]), float(pw[1]), float(pw[2])), Time.get_ticks_msec())
+
+## The gate + publish, extracted so a verify gate can drive it with an INJECTED player world pos + clock (no
+## active_facet / Time dependency). Publishes every pending entry whose idle + depart gate is open.
+func _sed_gate_publish(player_world: Vector3, now: int) -> void:
+	var gate_keys: Array = []
+	for key in _sed_pending:
+		var ed: Dictionary = _sed_pending[key]
+		if now - int(ed["last_edit_ms"]) < CubeSphere.STRUCT_EDIT_IDLE_MS:
+			continue
+		if _sed_aabb_dist(player_world, ed["wmin"], ed["wmax"]) < CubeSphere.STRUCT_EDIT_DEPART_BLK:
+			continue
+		gate_keys.append(key)
+	if not gate_keys.is_empty():
+		_sed_publish(gate_keys)
+
+## Point-to-AABB distance (0 when the point is inside — i.e. the player standing in the building never gates).
+func _sed_aabb_dist(p: Vector3, wmin: Vector3, wmax: Vector3) -> float:
+	var c := Vector3(clampf(p.x, wmin.x, wmax.x), clampf(p.y, wmin.y, wmax.y), clampf(p.z, wmin.z, wmax.z))
+	return p.distance_to(c)
+
+## §3.3: publish the gated entries — ONE combined GEN publish (one _version bump for all gated GEN roots = coalescing)
+## + a tracker publish if any tracker entry gated, bump the edits-rev term, erase. Deferred but never dropped.
+func _sed_publish(keys: Array) -> void:
+	var gen_roots: Array = []
+	var any_trk := false
+	for key in keys:
+		var ed: Dictionary = _sed_pending[key]
+		for gr in (ed["gen_roots"] as Dictionary):
+			gen_roots.append(gr)
+		if bool(ed["trk"]):
+			any_trk = true
+		_sed_pending.erase(key)
+	if _gen_index != null and not gen_roots.is_empty():
+		_gen_index.publish_roots(gen_roots)
+	if _structure_tracker != null and any_trk:
+		_structure_tracker.publish()
+	_sed_pub_rev += 1                              # §3.4: bump the far edits-rev term at publish
+	_sed_publishes += 1
+
+## NEVER-OOM: at the pending cap, force-publish the OLDEST entry (one bounded resnapshot; still never-drop).
+func _sed_force_publish_oldest() -> void:
+	var oldest_key := 0
+	var oldest_ms := 0x7fffffffffffffff
+	var found := false
+	for key in _sed_pending:
+		var ms := int((_sed_pending[key] as Dictionary)["last_edit_ms"])
+		if ms < oldest_ms:
+			oldest_ms = ms
+			oldest_key = key
+			found = true
+	if found:
+		_sed_publish([oldest_key])
+		_sed_forced += 1
+
+## FP_STRUCT_EDIT_DEBOUNCE telemetry ({} off-flag — the bake_stage_state convention). sed_oldest_ms = age of the oldest
+## pending entry (how long the far model has been held); sed_forced = overflow force-publishes.
+func struct_debounce_state() -> Dictionary:
+	if not CubeSphere.FP_STRUCT_EDIT_DEBOUNCE:
+		return {}
+	var oldest_age := 0
+	if not _sed_pending.is_empty():
+		var now := Time.get_ticks_msec()
+		var oldest := now
+		for key in _sed_pending:
+			oldest = mini(oldest, int((_sed_pending[key] as Dictionary)["last_edit_ms"]))
+		oldest_age = now - oldest
+	return {"sed_pend": _sed_pending.size(), "sed_pub": _sed_publishes, "sed_oldest_ms": oldest_age, "sed_forced": _sed_forced}
 
 ## docs/COSMOS-STRUCTURES-DESIGN.md (P0, §6.1): the decimator's cell sampler — the PLACED overlay material at
 ## (fid, cell), or 0 for air / non-placed. Reads the overlay DIRECTLY by (fid, cell) edit key (fid-agnostic, unlike

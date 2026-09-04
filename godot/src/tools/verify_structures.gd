@@ -125,6 +125,15 @@ func _initialize() -> void:
 	_gate_card_snapstage() # S4/§6 staged double-buffered snapshot + churn-starvation (FP_STRUCT_CARD_STAGE)
 	_gate_card_wake()      # S4/§8 wake fade-in — atomic, empty-only, no resident blink, zones S+B
 
+	# COSMOS FAR-EDIT-DEBOUNCE (docs/COSMOS-FAR-EDIT-DEBOUNCE-DESIGN.md, FP_STRUCT_EDIT_DEBOUNCE) — defer far-visible
+	# structure revs until the player departs + idles. Flag-aware: OFF asserts the shipped immediate re-bake; ON asserts
+	# the hold, the coalesced publish, never-drop, the tracker half, and the WorldManager idle+depart gate.
+	_gate_sed_hold()       # P2: an in-house edit HOLDS the version + published rev (no far re-materialize)
+	_gate_sed_publish()    # P1: publish ⇒ ONE version drift for N roots (coalescing); served rev == truth
+	_gate_sed_neverdrop()  # randomized edit/publish ⇒ published == truth after the final publish
+	_gate_sed_tracker()    # the tracker half: version()/_make_record held, publish() latches
+	_gate_sed_gate()       # the WorldManager idle+depart gate + NEVER-OOM force-publish
+
 	print("=== VERIFY structures: ", _pass, " passed, ", _fail, " failed ===")
 	quit(1 if _fail > 0 else 0)
 
@@ -133,6 +142,7 @@ func _initialize() -> void:
 # =====================================================================================================================
 const SG := preload("res://src/world/structure_gen.gd")
 const SGI := preload("res://src/world/struct_gen_index.gd")
+const WM := preload("res://src/world/world_manager.gd")
 
 ## The first Earth facet with ≥ 1 generated house, as {idx, fid, recs, rec}. {} if none within the scan cap.
 func _find_house() -> Dictionary:
@@ -414,7 +424,12 @@ func _gate_sg_damage() -> void:
 	for r in recs2:
 		if int(r["root"]) == root:
 			rev1 = int(r["rev"])
-	_ok(rev1 == rev0 + 1, "G-SG-DAMAGE: note_edit inside a GEN bbox bumps its rev (re-bake ⇒ the hole shows far)")
+	if CubeSphere.FP_STRUCT_EDIT_DEBOUNCE:
+		# FP_STRUCT_EDIT_DEBOUNCE: the SERVED (published) rev is HELD; the TRUTH rev bumps instantly (published on departure).
+		_ok(rev1 == rev0 and int(idx._rev.get(root, 0)) == rev0 + 1,
+			"G-SG-DAMAGE(debounce): note_edit HOLDS the served rev + bumps the TRUTH rev (far re-bake deferred to publish)")
+	else:
+		_ok(rev1 == rev0 + 1, "G-SG-DAMAGE: note_edit inside a GEN bbox bumps its rev (re-bake ⇒ the hole shows far)")
 
 # =====================================================================================================================
 # G-SG-PHYS — the BLOCK-LEVEL physical preconditions (the live floor_under / collapse / walk-in is the P1c A/B):
@@ -1887,3 +1902,147 @@ func _collect_gen_records(target: int) -> Array:
 			if out.size() >= target:
 				return out
 	return out
+
+# =====================================================================================================================
+# G-SED-* (FP_STRUCT_EDIT_DEBOUNCE — docs/COSMOS-FAR-EDIT-DEBOUNCE-DESIGN.md) — the debounced far-visible re-bake.
+# =====================================================================================================================
+
+## G-SED-HOLD (P2 proof, GEN half): an in-house edit bumps the TRUTH rev instantly but HOLDS the version + published
+## rev, so the far tier's snapshot is unchanged (no synchronous re-materialize = no freeze). OFF ⇒ the shipped bump.
+func _gate_sed_hold() -> void:
+	var on := CubeSphere.FP_STRUCT_EDIT_DEBOUNCE
+	var found := _find_house()
+	if found.is_empty():
+		_ok(false, "G-SED-HOLD: no generated house fixture")
+		return
+	var idx = found["idx"]
+	var fid: int = found["fid"]
+	var rec: Dictionary = found["rec"]
+	var root := int(rec["root"])
+	var cell: Vector3i = rec["bmin"]                       # a cell inside the house bbox
+	var v0: int = idx.version()
+	var dmg: Array = idx.note_edit(fid, cell)
+	if on:
+		_ok(idx.version() == v0, "G-SED-HOLD(on): an in-house edit HOLDS the version (no far re-materialize ⇒ no freeze)")
+		_ok(int(idx._rev.get(root, 0)) == 1, "G-SED-HOLD(on): the TRUTH rev bumped instantly (lossless)")
+		_ok(not idx._rev_pub.has(root), "G-SED-HOLD(on): the PUBLISHED rev did NOT bump (the far tier sees pristine)")
+		var served := -1
+		for r in idx.enumerate_facet(fid):
+			if int((r as Dictionary)["root"]) == root:
+				served = int((r as Dictionary)["rev"])
+		_ok(served == 0, "G-SED-HOLD(on): the served record rev is still 0 (published) — the far model holds")
+		_ok(dmg.size() >= 1 and int((dmg[0] as Dictionary)["root"]) == root, "G-SED-HOLD(on): note_edit returns the damaged root(s) for the pending map")
+	else:
+		_ok(idx.version() != v0 and int(idx._rev.get(root, 0)) == 1,
+			"G-SED-HOLD(off): note_edit bumps the version + advances the served rev (shipped immediate re-bake)")
+
+## G-SED-PUBLISH (P1 proof, GEN half): publish_roots copies truth→published, bumps the version ONCE for N roots
+## (coalescing), and the served record now shows the damage (the far model re-bakes the hole). ON-only.
+func _gate_sed_publish() -> void:
+	if not CubeSphere.FP_STRUCT_EDIT_DEBOUNCE:
+		_ok(true, "G-SED-PUBLISH: flag off ⇒ no publish path (skipped)")
+		return
+	var found := _find_houses(2)
+	if found.is_empty():
+		_ok(false, "G-SED-PUBLISH: no facet with ≥2 GEN houses")
+		return
+	var recs: Array = found["recs"]
+	var fid: int = found["fid"]
+	var idx = SGI.new()
+	idx.enumerate_facet(fid)                               # cache the facet
+	var r0 := int((recs[0] as Dictionary)["root"])
+	var r1 := int((recs[1] as Dictionary)["root"])
+	# damage BOTH houses (truth revs advance; version held).
+	idx.note_edit(fid, (recs[0] as Dictionary)["bmin"])
+	idx.note_edit(fid, (recs[0] as Dictionary)["bmin"])   # r0 truth = 2
+	idx.note_edit(fid, (recs[1] as Dictionary)["bmin"])   # r1 truth = 1
+	var vpre: int = idx.version()
+	idx.publish_roots([r0, r1])                            # COALESCE: one version bump for two roots
+	_ok(idx.version() == vpre + 1, "G-SED-PUBLISH: publish of N roots ⇒ exactly ONE version drift (coalescing)")
+	_ok(int(idx._rev_pub.get(r0, 0)) == 2 and int(idx._rev_pub.get(r1, 0)) == 1,
+		"G-SED-PUBLISH: published revs == truth after publish (r0=2, r1=1)")
+	var served0 := -1
+	for r in idx.enumerate_facet(fid):
+		if int((r as Dictionary)["root"]) == r0:
+			served0 = int((r as Dictionary)["rev"])
+	_ok(served0 == 2, "G-SED-PUBLISH: the served record now shows the damage (rev 2 ⇒ the far model re-bakes the hole)")
+
+## G-SED-NEVERDROP: randomized edit/publish sequences ⇒ after the final publish, every published rev == truth. ON-only.
+func _gate_sed_neverdrop() -> void:
+	if not CubeSphere.FP_STRUCT_EDIT_DEBOUNCE:
+		_ok(true, "G-SED-NEVERDROP: flag off (skipped)")
+		return
+	var found := _find_house()
+	if found.is_empty():
+		_ok(false, "G-SED-NEVERDROP: no house")
+		return
+	var idx = found["idx"]
+	var fid: int = found["fid"]
+	var root := int((found["rec"] as Dictionary)["root"])
+	var cell: Vector3i = (found["rec"] as Dictionary)["bmin"]
+	seed(12345)
+	for i in range(60):
+		if randi() % 3 == 0:
+			idx.publish_roots([root])                     # publish at random points
+		else:
+			idx.note_edit(fid, cell)                      # damage
+	idx.publish_roots([root])                             # final publish
+	_ok(int(idx._rev_pub.get(root, 0)) == int(idx._rev.get(root, 0)) and int(idx._rev.get(root, 0)) > 0,
+		"G-SED-NEVERDROP: after the final publish, published rev == truth rev (no edit lost)")
+
+## G-SED-TRACKER: the player-build half — version()/_make_record are HELD through an edit AND a mid-hold recluster;
+## publish() latches the truth. OFF ⇒ the shipped immediate version bump.
+func _gate_sed_tracker() -> void:
+	var on := CubeSphere.FP_STRUCT_EDIT_DEBOUNCE
+	var g := _grass()
+	if g <= 0:
+		_ok(false, "G-SED-TRACKER: grass id unavailable")
+		return
+	var tr = ST.new()
+	_place_box(tr, g, 0, 5, 0, 5, 0, 5)                   # a 6³ build ⇒ registers
+	var reg: Array = tr.registry()
+	if reg.is_empty():
+		_ok(false, "G-SED-TRACKER: the build did not register")
+		return
+	var root := int((reg[0] as Dictionary)["root"])
+	var v0: int = tr.version()
+	tr.note_removed(FA.edit_key(0, Vector3i(2, 2, 2)))    # break a cell ⇒ truth rev bumps + marks dirty
+	if on:
+		_ok(tr.version() == v0, "G-SED-TRACKER(on): the tracker version is HELD after an edit (no far re-bake)")
+		_ok(int(tr._make_record(root)["rev"]) == 0, "G-SED-TRACKER(on): _make_record serves the PUBLISHED rev (0) — held")
+		tr.tick(Time.get_ticks_msec() + CubeSphere.STRUCT_RECLUSTER_MS + 100)   # force the mid-hold recluster
+		_ok(tr.version() == v0, "G-SED-TRACKER(on): a mid-hold _recluster_all does NOT leak a version drift (rev storm held)")
+		tr.publish()
+		_ok(tr.version() != v0, "G-SED-TRACKER(on): publish() latches the version (the far tier re-bakes on departure)")
+	else:
+		_ok(tr.version() != v0, "G-SED-TRACKER(off): the version bumps on the edit (shipped immediate)")
+
+## G-SED-GATE: the WorldManager idle+depart publish gate + the NEVER-OOM force-publish. ON-only (drives _sed_note_gen /
+## _sed_gate_publish with an injected player world pos + clock).
+func _gate_sed_gate() -> void:
+	if not CubeSphere.FP_STRUCT_EDIT_DEBOUNCE:
+		_ok(true, "G-SED-GATE: flag off ⇒ pending map never allocated (skipped)")
+		return
+	var wm = WM.new()
+	wm._gen_index = SGI.new()
+	var t0 := Time.get_ticks_msec()
+	wm._sed_note_gen([{"root": -1234, "fid": 0, "bmin": Vector3i(100, 40, 100), "bmax": Vector3i(106, 46, 106)}])
+	_ok(wm._sed_pending.size() == 1, "G-SED-GATE: an edit upserts ONE pending entry")
+	var np := FA.lattice_to_world64(0, 108.0, 43.0, 103.0)   # ~2 blocks from the AABB
+	var near_w := Vector3(float(np[0]), float(np[1]), float(np[2]))
+	var fp := FA.lattice_to_world64(0, 140.0, 43.0, 103.0)   # ~34 blocks
+	var far_w := Vector3(float(fp[0]), float(fp[1]), float(fp[2]))
+	wm._sed_gate_publish(far_w, t0)                        # departed but NOT idle
+	_ok(wm._sed_pending.size() == 1, "G-SED-GATE: departed but not idle (Δt < IDLE_MS) ⇒ HELD")
+	wm._sed_gate_publish(near_w, t0 + CubeSphere.STRUCT_EDIT_IDLE_MS + 1000)   # idle but too close
+	_ok(wm._sed_pending.size() == 1, "G-SED-GATE: idle but player too close (< DEPART_BLK) ⇒ HELD")
+	wm._sed_gate_publish(far_w, t0 + CubeSphere.STRUCT_EDIT_IDLE_MS + 1000)    # idle AND departed
+	_ok(wm._sed_pending.is_empty() and wm._sed_publishes == 1, "G-SED-GATE: idle + departed ≥ DEPART_BLK ⇒ PUBLISH (gate opens)")
+	wm.free()
+	# NEVER-OOM: overflow force-publishes the oldest.
+	var wm2 = WM.new(); wm2._gen_index = SGI.new()
+	for k in range(CubeSphere.STRUCT_EDIT_PENDING_MAX + 5):
+		wm2._sed_note_gen([{"root": -(1000 + k), "fid": 0, "bmin": Vector3i(100 + k, 40, 100), "bmax": Vector3i(103 + k, 43, 103)}])
+	_ok(wm2._sed_pending.size() <= CubeSphere.STRUCT_EDIT_PENDING_MAX and wm2._sed_forced >= 1,
+		"G-SED-GATE: pending cap respected — overflow force-publishes the oldest (NEVER-OOM)")
+	wm2.free()

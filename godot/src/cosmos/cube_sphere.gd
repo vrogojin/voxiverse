@@ -1240,6 +1240,19 @@ const FP_FT_TEXMEAN_COLOR := false           # §3: far-tree leaf/trunk colour =
 ## overloaded client — hence a live perf A/B before default-on; ship byte-off (credit gate exactly as shipped when off).
 const FP_FT_STALE_REBUILD := false           # §4.1: ≤0.5Hz staleness floor — rebuild-while-moving despite credit 0 (converse of the guard)
 
+## FP_FT_STALE_PARKED (docs/COSMOS-LOD-DROPOUT-DESIGN.md §3, Stage S1) — the PARKED-camera blind spot in FP_FT_STALE_REBUILD.
+## The shipped floor (above) needs the camera to have MOVED > FT_STALE_MOVE (32 blk) AND ≥ FT_STALE_MS since the last
+## rebuild before a credit-0 rebuild is admitted; a de-orbit where the player STOPS to look with the tier stale + stream
+## credit starved never satisfies the move conjunct ⇒ trees stay VANISHED until credit returns (unbounded, up to ~30 s).
+## Under this flag the credit-0 override drops the FT_STALE_MOVE conjunct and fires on the WALL-CLOCK floor ALONE, but
+## gated on (moved > FT_STALE_MOVE ∨ _stale ∨ _ft_cull_pending) so a fully-SETTLED parked camera (not stale, no pending
+## cull-restore) re-admits NO rebuilds — the cost bound. `_ft_cull_pending` is the trees' pending-restore latch (the
+## converse of the cull-only FP_FT_NEAR_GUARD): set when a near-presence probe disagrees with the committed visibility,
+## so a frozen cull streak (#130-class M3) drains at the ≤0.5 Hz floor even while parked. The 250 ms rate cap + the DELTA
+## gate still apply (at most one REAL rebuild per FT_STALE_MS, only when an input actually drifted). Requires
+## FP_FT_STALE_REBUILD. Off ⇒ the shipped move-AND-time override verbatim (byte-identical credit gate).
+const FP_FT_STALE_PARKED := false            # §3 (S1): wall-clock-only credit-0 floor + pending-restore latch (needs FP_FT_STALE_REBUILD)
+
 ## FP_FT_SHELL_BAND (docs/COSMOS-FARTREE-ORBIT-DESIGN.md, far-tree orbit dropout) — the far trees hard-suspend the whole
 ## tier above OFFSURFACE_Y (256) though the cards are built to FAR_TREES_CARD_MAX (2400): 3D trees vanish flying up ~350
 ## blocks BELOW where a tree becomes sub-pixel (~600). Fix = a three-zone altitude law (h = camera radial altitude):
@@ -1480,6 +1493,20 @@ const STRUCT_SNAP_STAGE_MS := 2.0            # staged-snapshot per-pass time box
 const STRUCT_SNAP_STAGE_MIN := 32            # min records precomputed per pass — guaranteed forward progress ⇒ convergence
 const STRUCT_WAKE_FADE_S := 0.7              # §8 wake fade-in duration (s) when a swap lands a large card set
 const STRUCT_WAKE_JUMP := 64                 # §8 min _live_cards jump (from empty/frozen) that latches a wake fade
+
+## FP_STRUCT_EDIT_DEBOUNCE (docs/COSMOS-FAR-EDIT-DEBOUNCE-DESIGN.md) — defer the FAR-visible structure re-bake until the
+## player STOPS editing a building, DEPARTS ~16 blocks from its nearest block, and is IDLE-from-it a few seconds. Fixes
+## BOTH the freeze-on-break (P2 — every in-bbox edit synchronously re-materializes the whole far snapshot + re-bakes at
+## the 250 ms cadence) and the far-edit timing (P1 — the far hole should show on DEPARTURE, not ~1-2 s after the dig).
+## Mechanism: producers track damage instantly + losslessly (TRUTH rev), but the version token + the record `rev` fields
+## the far tier SEES are a PUBLISHED copy that advances only when a per-structure debounce gate opens (idle ≥ IDLE_MS AND
+## dist ≥ DEPART_BLK from the structure's world AABB). Publish is atomic + coalescing (all gated structures → ONE version
+## bump → one resnapshot → one rebuild), deferred but NEVER dropped. Off ⇒ the shipped immediate re-bake verbatim
+## (byte-identical; FLAT 6042/0). Composes with FP_STRUCT_REG_EPOCH / FP_STRUCT_CARD_STAGE / FP_STRUCT_GATE_MEMO.
+const FP_STRUCT_EDIT_DEBOUNCE := false       # defer far-visible structure revs until the player departs + idles
+const STRUCT_EDIT_DEPART_BLK := 16.0         # publish gate: min distance (blocks) from the structure's world AABB (nearest block)
+const STRUCT_EDIT_IDLE_MS := 3000            # publish gate: min ms since the last edit to that structure
+const STRUCT_EDIT_PENDING_MAX := 64          # NEVER-OOM: pending-entry cap (overflow force-publishes the oldest)
 
 ## FP_DEM_DEFER (docs/COSMOS-STREAM-PARALLEL-DESIGN.md Phase A — the fresh-reload fix) — the whole-planet coarse
 ## DEM (`FP_GLOBAL_RELIEF_DATA` / `GlobalReliefData.step`) is frame-budget GATED but the admitted unit is UNBOUNDED

@@ -15,7 +15,11 @@ const _FACET_CAP := 96              # LRU cap on cached facets (never-OOM; ≫ t
 
 var _cache: Dictionary = {}         # fid -> Array of GEN records (pure enumeration, rev overlaid from _rev)
 var _lru: Array = []                # fids in recency order (front = most recent) for the eviction bound
-var _rev: Dictionary = {}           # root -> damage rev (persists across enumeration eviction; 0-default is pristine)
+var _rev: Dictionary = {}           # root -> damage rev (TRUTH: bumped instantly on every in-bbox edit; 0-default pristine)
+# FP_STRUCT_EDIT_DEBOUNCE: root -> PUBLISHED damage rev — what enumerate_facet/records() serve the far tier. Advances
+# ONLY at publish_roots (player departed + idle). Same persistence class as _rev (survives LRU eviction). Off ⇒ never
+# written; the overlay reads _rev verbatim (byte-identical).
+var _rev_pub: Dictionary = {}
 var _wanted: PackedInt32Array = PackedInt32Array()
 
 var _epoch := 0                     # bumped on crossing (re-selects the wanted band; records themselves are pure)
@@ -106,8 +110,12 @@ func enumerate_facet(fid: int, pcache = null) -> Array:
 						continue
 					var rec := StructureGen.make_record(fid, hi)
 					var root := int(rec["root"])
-					if _rev.has(root):
-						rec["rev"] = int(_rev[root])   # overlay the damage counter onto the pristine record
+					# FP_STRUCT_EDIT_DEBOUNCE: a fresh (crossing-refill) enumeration serves the PUBLISHED rev, not the
+					# truth rev — else a crossing mid-edit would materialize the damaged model before the player departs.
+					# Off ⇒ `_rev` verbatim (byte-identical).
+					var rsrc: Dictionary = _rev_pub if CubeSphere.FP_STRUCT_EDIT_DEBOUNCE else _rev
+					if rsrc.has(root):
+						rec["rev"] = int(rsrc[root])   # overlay the (published/truth) damage counter onto the pristine record
 					recs.append(rec)
 	_store(fid, recs)
 	return recs
@@ -116,21 +124,53 @@ func enumerate_facet(fid: int, pcache = null) -> Array:
 ## §12.5 damage rev: a player edit at (fid, cell) bumps the rev of every cached GEN record on that fid whose bbox
 ## contains the cell (O(records-on-fid) ≈ a handful). The rev-sum drift re-arms the far tier's delta gate → re-bake →
 ## the far model shows the hole within ~1-2 s (exactly the player-build path).
-func note_edit(fid: int, cell: Vector3i) -> void:
+## FP_STRUCT_EDIT_DEBOUNCE: returns the damaged records `[{root, fid, bmin, bmax}, ...]` (for the WorldManager pending
+## map); [] off-flag / no cache / no hit (GDScript discards the return free off-flag). UNDER the flag it bumps the TRUTH
+## `_rev` only — it does NOT bump `_version` and does NOT write the pending rev into the cached record, so the far tier
+## keeps seeing the PUBLISHED rev (via the _rev_pub overlay) until publish_roots. OFF ⇒ the shipped immediate bump
+## (`_rev` + cached `rec["rev"]` + `_version += 1`) verbatim (byte-identical), and the returned [] is ignored.
+func note_edit(fid: int, cell: Vector3i) -> Array:
 	var recs: Variant = _cache.get(fid)
 	if recs == null:
-		return
+		return []
+	var deb := CubeSphere.FP_STRUCT_EDIT_DEBOUNCE
+	var damaged: Array = []
 	for r in (recs as Array):
 		var rec: Dictionary = r
 		if _bbox_has(rec["bmin"], rec["bmax"], cell):
 			var root := int(rec["root"])
 			var nrev := int(_rev.get(root, 0)) + 1
-			_rev[root] = nrev
-			rec["rev"] = nrev
-			_version += 1                              # FP_STRUCT_REG_EPOCH: a damage rev bumped ⇒ records() changed
+			_rev[root] = nrev                          # TRUTH: bumped instantly (lossless), both flag states
+			if deb:
+				damaged.append({"root": root, "fid": int(rec["fid"]), "bmin": rec["bmin"], "bmax": rec["bmax"]})
+			else:
+				rec["rev"] = nrev
+				_version += 1                          # FP_STRUCT_REG_EPOCH: a damage rev bumped ⇒ records() changed
+	return damaged
 
 static func _bbox_has(bmin: Vector3i, bmax: Vector3i, c: Vector3i) -> bool:
 	return c.x >= bmin.x and c.x <= bmax.x and c.y >= bmin.y and c.y <= bmax.y and c.z >= bmin.z and c.z <= bmax.z
+
+
+## FP_STRUCT_EDIT_DEBOUNCE (§3.2): publish the accumulated TRUTH revs of `roots` to the far-visible PUBLISHED revs —
+## copy _rev → _rev_pub, patch any cached record's `rev`, and bump `_version` ONCE for the whole batch (coalescing: all
+## structures whose gates open the same tick land in one version drift ⇒ one resnapshot ⇒ one rebuild). Deferred but
+## never dropped: after this, records() serve the damaged rev and the far tier re-bakes the hole. Only called under the
+## flag (from WorldManager._sed_publish). A root with no truth entry (never damaged) is a no-op.
+func publish_roots(roots: Array) -> void:
+	if roots.is_empty():
+		return
+	for root in roots:
+		var r := int(root)
+		if _rev.has(r):
+			_rev_pub[r] = int(_rev[r])
+	# patch any CACHED records so records() reflects the published rev without waiting for a re-enumeration.
+	for fid in _cache:
+		for rec in (_cache[fid] as Array):
+			var root2 := int((rec as Dictionary)["root"])
+			if _rev_pub.has(root2):
+				(rec as Dictionary)["rev"] = int(_rev_pub[root2])
+	_version += 1                                  # FP_STRUCT_REG_EPOCH: ONE drift for the whole published batch
 
 
 # --- wanted-facet band (§12.5) --------------------------------------------------------------------------------------
@@ -215,4 +255,4 @@ func total_bytes() -> int:
 	var recs := 0
 	for fid in _cache:
 		recs += (_cache[fid] as Array).size()
-	return recs * 256 + _rev.size() * 48
+	return recs * 256 + _rev.size() * 48 + _rev_pub.size() * 48   # FP_STRUCT_EDIT_DEBOUNCE: _rev_pub mirrors _rev (0 off-flag)

@@ -101,6 +101,14 @@ var _sampler: Callable = Callable()           # (fid, Vector3i) -> placed block 
 var _near_query: Callable = Callable()        # (fid, AABB) -> NearPresence COVERED|NOT_COVERED|UNKNOWABLE
 var _edits_rev_query: Callable = Callable()   # () -> int (WorldManager.edit_count) — a chop re-arms within one step
 var _version_query: Callable = Callable()     # FP_STRUCT_REG_EPOCH: () -> int registry version (WorldManager.structure_registry_version)
+## FP_SKIN_READY_GATE (docs/COSMOS-LOD-DROPOUT-DESIGN.md §4, Stage S3): the card→skin roof-handoff readiness query
+## (WorldManager → FacetTexBaker.ready_frac). Only meaningful under FP_STRUCT_LOD (the house roof lives in the fine-map
+## skin). `_skin_hold_fids` is the distinct fid set of the card instances the last rebuild emitted (the exact facets
+## about to hand off to the skin); ready_frac over it drives the hold. Unset query ⇒ 1.0 ⇒ no hold ⇒ byte-identical.
+var _skin_ready_query: Callable = Callable()  # (Array[int]) -> float baked fraction
+var _skin_hold_fids: Dictionary = {}          # fid -> true: distinct facets of emitted cards (the roof handoff set)
+var _dbg_skin_hold := false                   # S3 gate read-back: the card→skin hold was active last step
+var _dbg_skin_ready_frac := 1.0               # S3 gate read-back: the roof handoff set's baked fraction last step
 
 # per-structure baked models: root -> {rev, verts:PackedVector3Array (ring-local), colors:PackedColorArray, tris, bytes}
 var _baked: Dictionary = {}
@@ -440,7 +448,7 @@ func set_active(new_fid: int) -> void:
 ## byte-identical. ZONE S (on-surface): visible, radial voxi_shade `_material`. ZONE B (offsurf, h<HIDE): visible +
 ## LIVE under the UNLIT `_shell_material` (voxi_shade renders BLACK off-surface) with the tier_fade dissolve ramped
 ## over [FADE_ALT, HIDE_ALT]. ZONE O (h≥HIDE): hidden (the fine-map roof skin owns it). Returns the zone (0/1/2; -1 off).
-func _apply_shell_visibility(offsurf: bool, h := -1.0) -> int:
+func _apply_shell_visibility(offsurf: bool, h := -1.0, card_hold := false) -> int:
 	if not (CubeSphere.FP_STRUCT_SHELL_BAND and h >= 0.0):
 		if _mi != null:
 			_mi.visible = not offsurf
@@ -472,6 +480,10 @@ func _apply_shell_visibility(offsurf: bool, h := -1.0) -> int:
 	if _card_mmi != null:
 		var card_hide := CubeSphere.STRUCT_CARD_HIDE_ALT if CubeSphere.FP_STRUCT_CARD_ALT_BAND else CubeSphere.FT_SHELL_HIDE_ALT
 		var card_fade_lo := CubeSphere.STRUCT_CARD_FADE_ALT if CubeSphere.FP_STRUCT_CARD_ALT_BAND else CubeSphere.FT_SHELL_FADE_ALT
+		# FP_SKIN_READY_GATE §4.2 (S3): while the roof-skin handoff is un-ready, extend the card zone-O boundary to
+		# STRUCT_CARD_HOLD_MAX_ALT so the cards keep rendering above the hide line until the roofs bake underneath.
+		if card_hold:
+			card_hide = CubeSphere.STRUCT_CARD_HOLD_MAX_ALT
 		var czone := 0 if not offsurf else (1 if h < card_hide else 2)
 		_card_zone = czone if CubeSphere.FP_STRUCT_CARD_ALT_BAND else -1
 		if czone == 0:
@@ -485,6 +497,10 @@ func _apply_shell_visibility(offsurf: bool, h := -1.0) -> int:
 			_card_mmi.visible = true
 			# S4 (§8): the wake fade-in multiplies the altitude term (1.0 unless a large set just swapped from empty).
 			var ctf := (1.0 - smoothstep(card_fade_lo, card_hide, h)) * _wake_fade()
+			# FP_SKIN_READY_GATE §4.2: clamp the dissolve to SKIN_HOLD_FADE while holding (roofs not baked) so the cards
+			# stay clearly present over the fade band + extended hold. Released the step the skin becomes ready.
+			if card_hold:
+				ctf = maxf(ctf, CubeSphere.SKIN_HOLD_FADE)
 			_dbg_card_fade = ctf
 			if _card_material != null:
 				_card_material.set_shader_parameter("tier_fade", ctf)
@@ -526,6 +542,14 @@ func set_sampler(q: Callable) -> void: _sampler = q
 func set_near_query(q: Callable) -> void: _near_query = q
 func set_edits_rev_query(q: Callable) -> void: _edits_rev_query = q
 func set_version_query(q: Callable) -> void: _version_query = q   # FP_STRUCT_REG_EPOCH
+## FP_SKIN_READY_GATE §4.2: wire the roof-skin readiness query. Only read under the flag (byte-identical off).
+func set_skin_ready_query(q: Callable) -> void: _skin_ready_query = q
+
+## FP_SKIN_READY_GATE §4.2: the baked fraction of the emitted-card handoff set (`_skin_hold_fids`). Unwired ⇒ 1.0.
+func _skin_ready_frac() -> float:
+	if not _skin_ready_query.is_valid() or _skin_hold_fids.is_empty():
+		return 1.0
+	return float(_skin_ready_query.call(_skin_hold_fids.keys()))
 
 ## FP_STRUCT_REG_EPOCH: last step() prelude cost (µs). Present in all flag states (0 until step() runs) — a leaf int.
 func step_us() -> int: return _dbg_step_us
@@ -551,8 +575,21 @@ func step(settled := true, credit_ok := true, cam_render := Vector3.ZERO) -> voi
 	var hide_alt := CubeSphere.FT_SHELL_HIDE_ALT
 	if CubeSphere.FP_STRUCT_CARD_ALT_BAND:
 		hide_alt = CubeSphere.STRUCT_CARD_HIDE_ALT
+	# FP_SKIN_READY_GATE §4.2 (S3): the card→roof-skin HOLD — keep the card tier rendering above STRUCT_CARD_HIDE_ALT
+	# until the roof handoff set's fine-map skin is baked (ready_frac ≥ SKIN_READY_MIN), up to STRUCT_CARD_HOLD_MAX_ALT.
+	# Only meaningful with the extended card band (ALT_BAND) + a roof skin (STRUCT_LOD). Unwired baker ⇒ frac 1.0 ⇒ no
+	# hold ⇒ byte-identical. While holding the freeze line moves to the ceiling so the prelude keeps the cards live.
+	var card_hold := false
+	if CubeSphere.FP_SKIN_READY_GATE and CubeSphere.FP_STRUCT_LOD and CubeSphere.FP_STRUCT_CARD_ALT_BAND and offsurf \
+			and h >= (CubeSphere.STRUCT_CARD_FADE_ALT - CubeSphere.SKIN_HANDOFF_MARGIN_ALT) \
+			and h < CubeSphere.STRUCT_CARD_HOLD_MAX_ALT:
+		_dbg_skin_ready_frac = _skin_ready_frac()
+		card_hold = _dbg_skin_ready_frac < CubeSphere.SKIN_READY_MIN
+	_dbg_skin_hold = card_hold
+	if card_hold:
+		hide_alt = CubeSphere.STRUCT_CARD_HOLD_MAX_ALT
 	var shell_mode := CubeSphere.FP_STRUCT_SHELL_BAND and offsurf and h < hide_alt
-	_dbg_shell_zone = _apply_shell_visibility(offsurf, h)
+	_dbg_shell_zone = _apply_shell_visibility(offsurf, h, card_hold)
 	_dbg_shell_h = h
 	_dbg_shell_offsurf = offsurf
 	if offsurf and not shell_mode:
@@ -874,6 +911,11 @@ func _probe_pass(reg: Array, cam_abs: Vector3, centres := PackedVector3Array()) 
 	_probe_cache.clear()
 	_cull_pending = false
 	_annulus_empty_last = true                    # FP_STRUCT_REG_EPOCH: set false below iff a structure is annulus-probed
+	# FP_SKIN_READY_GATE §4.2 (S3): recompute the roof-handoff facet set this pass (distinct fids of in-card-band
+	# structures). Only under the flag ∧ FP_STRUCT_LOD (there is a roof skin to wait for). Off ⇒ never touched / read.
+	var gather_hold := CubeSphere.FP_SKIN_READY_GATE and CubeSphere.FP_STRUCT_LOD
+	if gather_hold:
+		_skin_hold_fids.clear()
 	if not _near_query.is_valid():
 		return 0
 	var r0 := float(TerrainConfig.near_render_radius())
@@ -891,6 +933,10 @@ func _probe_pass(reg: Array, cam_abs: Vector3, centres := PackedVector3Array()) 
 		var rec: Dictionary = reg[i]
 		var fid: int = int(rec["fid"])
 		var dist := (cam_abs.distance_to(centres[i]) if use_centres else _structure_dist(rec, cam_abs))
+		# S3 roof-handoff set: the facets holding cards in the emitted band [r0, card-hide]. Conservative (all in-band
+		# structures, a superset of the capped card set) ⇒ the hold releases only when the whole band's roof skin is in.
+		if gather_hold and dist >= r0 and dist <= CubeSphere.STRUCT_CARD_HIDE_ALT:
+			_skin_hold_fids[fid] = true
 		if CubeSphere.FP_STRUCT_WALK_CALM:
 			var root_b := int(rec["root"])
 			var code := _band_code(dist, r0, int(_band.get(root_b, -1)))
@@ -1492,8 +1538,35 @@ func shell_band_state() -> Dictionary:
 	}
 
 ## Gate hook (G-ST-SHELL): drive the zone-law visibility without a ring (mirror of the trees' debug_apply_visibility).
-func debug_apply_shell_visibility(offsurf: bool, h := -1.0) -> int:
-	return _apply_shell_visibility(offsurf, h)
+func debug_apply_shell_visibility(offsurf: bool, h := -1.0, card_hold := false) -> int:
+	return _apply_shell_visibility(offsurf, h, card_hold)
+
+## FP_SKIN_READY_GATE gate hook (G-SKIN-GATE structures): replicate step()'s card-hold decision + card visibility +
+## card tier_fade for a scripted altitude sweep (no live ring). Populate _skin_hold_fids first (a gate helper), wire a
+## _skin_ready_query stub, then call this. Returns {skin_hold, skin_ready_frac, card_hide, st_cards, card_fade}.
+func debug_skin_gate(offsurf: bool, h: float) -> Dictionary:
+	var card_hold := false
+	if CubeSphere.FP_SKIN_READY_GATE and CubeSphere.FP_STRUCT_LOD and CubeSphere.FP_STRUCT_CARD_ALT_BAND and offsurf \
+			and h >= (CubeSphere.STRUCT_CARD_FADE_ALT - CubeSphere.SKIN_HANDOFF_MARGIN_ALT) \
+			and h < CubeSphere.STRUCT_CARD_HOLD_MAX_ALT:
+		_dbg_skin_ready_frac = _skin_ready_frac()
+		card_hold = _dbg_skin_ready_frac < CubeSphere.SKIN_READY_MIN
+	_dbg_skin_hold = card_hold
+	_apply_shell_visibility(offsurf, h, card_hold)
+	var card_hide := CubeSphere.STRUCT_CARD_HOLD_MAX_ALT if card_hold else CubeSphere.STRUCT_CARD_HIDE_ALT
+	return {
+		"skin_hold": card_hold,
+		"skin_ready_frac": _dbg_skin_ready_frac,
+		"card_hide": card_hide,
+		"st_cards": (_card_mmi != null and _card_mmi.visible),
+		"card_fade": _dbg_card_fade,
+	}
+
+## Gate helper: seed the roof-handoff facet set directly (bypasses the probe pass) so G-SKIN-GATE can drive ready_frac.
+func debug_seed_hold_fids(fids: Array) -> void:
+	_skin_hold_fids.clear()
+	for f in fids:
+		_skin_hold_fids[int(f)] = true
 func mi_visible() -> bool:
 	return _mi != null and _mi.visible
 ## True iff the zone-B UNLIT vertex-colour material is currently bound (the brown-not-black guarantee).

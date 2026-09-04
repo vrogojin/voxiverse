@@ -58,6 +58,11 @@ func _ok(c: bool, m: String) -> void:
 		_fail += 1
 		print("  FAIL: ", m)
 
+## G-SKIN-GATE (S3) roof-skin readiness stub: the tier's _skin_ready_query calls this; returns a controllable fraction.
+var _fake_skin_frac := 1.0
+func _fake_skin_ready(_fids) -> float:
+	return _fake_skin_frac
+
 func _initialize() -> void:
 	print("=== verify_structures (task #121 P0 — FP_STRUCT_DETECT + FP_STRUCT_FAR) ===")
 	FA.warm_up()
@@ -133,6 +138,10 @@ func _initialize() -> void:
 	_gate_sed_neverdrop()  # randomized edit/publish ⇒ published == truth after the final publish
 	_gate_sed_tracker()    # the tracker half: version()/_make_record held, publish() latches
 	_gate_sed_gate()       # the WorldManager idle+depart gate + NEVER-OOM force-publish
+
+	# COSMOS LOD-DROPOUT S3 (docs/COSMOS-LOD-DROPOUT-DESIGN.md §4, FP_SKIN_READY_GATE): the card→roof-skin hide holds the
+	# card tier until the roof handoff set's fine-map skin is baked, up to STRUCT_CARD_HOLD_MAX_ALT. Flag-aware.
+	_gate_skin_gate()
 
 	print("=== VERIFY structures: ", _pass, " passed, ", _fail, " failed ===")
 	quit(1 if _fail > 0 else 0)
@@ -867,6 +876,49 @@ func _gate_shell() -> void:
 		_ok(not tier.mi_visible(), "G-ST-SHELL(off): off-surface still hidden at h=650 (byte-identical)")
 		_ok(tier._shell_material == null and tier.shell_band_state().is_empty(),
 			"G-ST-SHELL(off): no shell material + empty telemetry (byte-identical off)")
+
+# =====================================================================================================================
+# G-SKIN-GATE (FP_SKIN_READY_GATE — docs/COSMOS-LOD-DROPOUT-DESIGN.md §4, Stage S3) — the card→roof-skin handoff hold.
+# The structure card tier holds (visible, tier_fade ≥ SKIN_HOLD_FADE) above STRUCT_CARD_HIDE_ALT until the roof handoff
+# set's fine-map skin is baked (ready_frac ≥ SKIN_READY_MIN), OR the camera passes STRUCT_CARD_HOLD_MAX_ALT (the hard
+# ceiling). Only under FP_STRUCT_LOD (a roof skin exists) + FP_STRUCT_CARD_ALT_BAND (the extended card band). A stub
+# ready query + a seeded handoff set prove the hold law without a live baker. Off ⇒ the shipped card hide verbatim.
+# =====================================================================================================================
+func _gate_skin_gate() -> void:
+	if not CubeSphere.FP_STRUCT_CARDS:
+		print("  (G-SKIN-GATE skipped — needs FP_STRUCT_CARDS sed-toggled true)")
+		return
+	var on := CubeSphere.FP_SKIN_READY_GATE and CubeSphere.FP_STRUCT_LOD and CubeSphere.FP_STRUCT_CARD_ALT_BAND
+	if on:
+		# roof skin un-ready at h=2500 (∈ (HIDE 2400, HOLD_MAX 2800)) ⇒ cards HELD visible, faded ≥ floor.
+		var t1 = FS.new(); t1.setup_instance(Node3D.new(), 0); t1.set_skin_ready_query(Callable(self, "_fake_skin_ready"))
+		t1.debug_seed_hold_fids([0, 1, 2])
+		_fake_skin_frac = 0.0
+		var rh := t1.debug_skin_gate(true, 2500.0)
+		_ok(rh["skin_hold"] and rh["st_cards"] and rh["card_fade"] >= CubeSphere.SKIN_HOLD_FADE,
+			"G-SKIN-GATE(on): roof skin un-ready at h=2500 ⇒ cards HELD (visible, fade %.2f ≥ %.2f)" % [rh["card_fade"], CubeSphere.SKIN_HOLD_FADE])
+		# ready ⇒ the hand-off completes (card zone-O hide) — the shipped behaviour, within one step.
+		var t2 = FS.new(); t2.setup_instance(Node3D.new(), 0); t2.set_skin_ready_query(Callable(self, "_fake_skin_ready"))
+		t2.debug_seed_hold_fids([0, 1, 2])
+		_fake_skin_frac = 1.0
+		var rr := t2.debug_skin_gate(true, 2500.0)
+		_ok(not rr["skin_hold"] and not rr["st_cards"], "G-SKIN-GATE(on): roof skin ready at h=2500 ⇒ cards hidden (hand-off)")
+		# ceiling: un-ready but above STRUCT_CARD_HOLD_MAX_ALT ⇒ the hold RELEASES.
+		var t3 = FS.new(); t3.setup_instance(Node3D.new(), 0); t3.set_skin_ready_query(Callable(self, "_fake_skin_ready"))
+		t3.debug_seed_hold_fids([0, 1, 2])
+		_fake_skin_frac = 0.0
+		var rc := t3.debug_skin_gate(true, 2900.0)
+		_ok(not rc["skin_hold"] and not rc["st_cards"], "G-SKIN-GATE(on): above STRUCT_CARD_HOLD_MAX_ALT the hold releases (ceiling)")
+		# empty handoff set ⇒ frac degrades to 1.0 ⇒ no hold (degrade-safe).
+		var t4 = FS.new(); t4.setup_instance(Node3D.new(), 0); t4.set_skin_ready_query(Callable(self, "_fake_skin_ready"))
+		_fake_skin_frac = 0.0
+		_ok(not t4.debug_skin_gate(true, 2500.0)["skin_hold"], "G-SKIN-GATE(on): empty handoff set ⇒ no hold (degrade-safe)")
+	else:
+		var t0 = FS.new(); t0.setup_instance(Node3D.new(), 0); t0.set_skin_ready_query(Callable(self, "_fake_skin_ready"))
+		t0.debug_seed_hold_fids([0, 1, 2])
+		_fake_skin_frac = 0.0
+		_ok(not t0.debug_skin_gate(true, 2500.0)["skin_hold"],
+			"G-SKIN-GATE(off): FP_SKIN_READY_GATE (or STRUCT_LOD/ALT_BAND) off ⇒ never holds (byte-identical)")
 
 # =====================================================================================================================
 # G-ST-HOLD (FP_STRUCT_NEAR_HOLD — docs/COSMOS-DEORBIT-STRUCT-STAGING-DESIGN.md §3.5/§6) — the hold-until-covered band

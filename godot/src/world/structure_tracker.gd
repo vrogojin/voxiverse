@@ -48,6 +48,13 @@ var _dirty_at_ms := 0                         # Time.get_ticks_msec() when _dirt
 var _saturated := false                       # hit STRUCT_TRACK_MAX (telemetry-degrade, log-once)
 var _reg_saturated := false                   # hit STRUCT_REG_MAX (telemetry-degrade, log-once)
 var _dbg_recluster_count := 0                 # gate read-back: number of reclusters run
+# FP_WORST_FRAME_ATTR (docs/COSMOS-FAR-EDIT-DEBOUNCE-DESIGN.md §5): the last _recluster_all() self-time (µs), FRAME-STAMPED
+# so the worst-frame snapshot attributes the debounced full re-flood to the frame it actually ran on (a later frame than the
+# break — the recluster is STRUCT_RECLUSTER_MS-debounced). Timed unconditionally (cheap get_ticks_usec pair); only READ under
+# the flag via wf_reclust_us(). _recluster_all BFS-floods ALL tracked cells (every near village cell), so this is the O(total
+# tracked) term — the prime freeze suspect the marker isolates.
+var _wf_reclust_us := 0
+var _wf_reclust_frame := -1
 
 
 func _init() -> void:
@@ -132,7 +139,12 @@ func tick(now_ms: int) -> void:
 		return
 	if now_ms - _dirty_at_ms < CubeSphere.STRUCT_RECLUSTER_MS:
 		return
+	# FP_WORST_FRAME_ATTR §5: self-time the full re-flood + stamp the frame it ran, so RemoteBridge attributes the spike
+	# to THIS frame (the recluster lands on a later frame than the break). Unconditional (the _dbg_recluster_count precedent).
+	var _wf_t0 := Time.get_ticks_usec()
 	_recluster_all()
+	_wf_reclust_us = Time.get_ticks_usec() - _wf_t0
+	_wf_reclust_frame = Engine.get_frames_drawn()
 	_dirty = false
 
 
@@ -394,6 +406,9 @@ func registry_count() -> int: return _reg.size()
 func is_saturated() -> bool: return _saturated
 func is_reg_saturated() -> bool: return _reg_saturated
 func recluster_count() -> int: return _dbg_recluster_count
+## FP_WORST_FRAME_ATTR §5: the last _recluster_all() self-time (µs), reported ONLY on the frame it actually ran (frame-
+## stamped) so a later worst frame that carried no recluster reads 0, not a stale spike. Cheap leaf; only READ under the flag.
+func wf_reclust_us() -> int: return _wf_reclust_us if _wf_reclust_frame == Engine.get_frames_drawn() else 0
 func is_dirty() -> bool: return _dirty
 
 ## NEVER-OOM ledger (§8): dict-entry arithmetic across the tracked-cell store + union-find + cluster records + registry.

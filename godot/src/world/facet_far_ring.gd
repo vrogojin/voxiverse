@@ -6431,6 +6431,17 @@ func set_far_structures_version_query(q: Callable) -> void:
 func far_structures() -> Object:
 	return _far_structures
 
+## FP_SKIN_READY_GATE (docs/COSMOS-LOD-DROPOUT-DESIGN.md §4, Stage S3): forward the card→skin readiness query
+## (WorldManager → FacetTexBaker.ready_frac) to the far-tree + far-structure tiers so the card→skin hide holds until
+## the target facets' skin is baked. No-op with no instance; only read under the flag (byte-identical off).
+func set_far_trees_skin_ready_query(q: Callable) -> void:
+	if _far_trees != null:
+		_far_trees.set_skin_ready_query(q)
+
+func set_far_structures_skin_ready_query(q: Callable) -> void:
+	if _far_structures != null:
+		_far_structures.set_skin_ready_query(q)
+
 ## docs/COSMOS-FAR-TREES-DESIGN.md (P0): cache the live camera (render frame) so the far-trees step can compute
 ## camera-distance band membership. Cheap state write; no-op consumer with the flag off.
 func set_far_trees_camera(cam: Vector3) -> void:

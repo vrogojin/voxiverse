@@ -307,6 +307,16 @@ var _edits_by_fid: Dictionary = {}    # int fid -> Dictionary(edit_key:int -> tr
 # cells, driven from the two write choke points (_write_cell / sim_revert_cell). Constructed in setup() under the
 # flag; null off (the choke-point hooks are one null test) ⇒ byte-identical. See structure_tracker.gd.
 var _structure_tracker = null
+# FP_WORST_FRAME_ATTR (docs/COSMOS-FAR-EDIT-DEBOUNCE-DESIGN.md §5): break/place main-thread cost attribution for the
+# ~3.4 s freeze-on-break. Timed UNCONDITIONALLY into per-frame event accumulators (cheap get_ticks_usec pairs, the _dbg
+# precedent) and surfaced into worst_frame_markers() ONLY under the flag ⇒ OFF telemetry byte-identical. FRAME-STAMPED
+# (Engine.get_frames_drawn) rather than reset-at-top-of-_process because a break fires in the INPUT phase — BEFORE any
+# _process reset would run — so a top-of-_process reset would wipe the value the SAME frame the snapshot needs it; the
+# stamp instead makes worst_frame_markers() report 0 on any later worst frame that carried no edit (no stale spike).
+var _wf_collapse_us := 0       # _structural_update total (StructuralSolver.solve + component flood + carve + VoxelBody spawn)
+var _wf_solve_us := 0          # StructuralSolver.solve() sub-portion, NESTED inside _wf_collapse_us (collapse − solve = flood+carve+spawn)
+var _wf_edit_frame := -1       # Engine.get_frames_drawn() when collapse/solve were last accumulated (staleness stamp; accumulates within a frame)
+var _wf_ftr_edit_fires := 0    # cumulative count of break/place edit actions (each bumps edit_count → the far-tree edits_rev query rebuilds the tier)
 # docs/COSMOS-STRUCTURES-DESIGN.md (P1, FP_STRUCT_GEN §12.5): the GEN half of the ONE registry — a pure per-fid cache
 # of StructureGen's village hash. Constructed in setup() under the flag; null off ⇒ the structure_registry concat +
 # the structure_cell_at GEN branch + the rev-bump hooks are all one null test (byte-identical). See struct_gen_index.gd.
@@ -622,6 +632,13 @@ func _ready() -> void:
 			_facet_tex.set_job_lane(_job_lane)
 			_facet_tex.prewarm(_facet_ring.visible_fids())
 			_facet_ring.set_facet_tex(_facet_tex.base_texture())
+			# docs/COSMOS-LOD-DROPOUT-DESIGN.md §4 (Stage S3, FP_SKIN_READY_GATE): hand the far-tree + far-structure
+			# tiers the baker's card→skin readiness query (ready_frac over their card-band handoff set) so the card/mesh
+			# tier HOLDS until the target facets' skin is baked. Wired ONLY under the flag ⇒ the query stays unset off ⇒
+			# each tier's ready_frac degrades to 1.0 ⇒ the shipped pure-altitude hide (byte-identical).
+			if CubeSphere.FP_SKIN_READY_GATE:
+				_facet_ring.set_far_trees_skin_ready_query(Callable(self, "far_skin_ready_frac"))
+				_facet_ring.set_far_structures_skin_ready_query(Callable(self, "far_skin_ready_frac"))
 			# COSMOS LOD-TEXTURE Phase 4: bind the (all-transparent-at-setup) close-up array now so the shader's
 			# closeup_map is never an unbound sampler; no facet carries slot ≥ 0 until the first bake, so it is unsampled
 			# until then. No-op unless FP_FACET_TEX_CLOSEUP is on (set_facet_closeup_tex is flag-guarded).
@@ -2188,6 +2205,7 @@ func break_terrain(cell: Vector3i, from_pos: Vector3 = Vector3.INF) -> int:
 		return BlockCatalog.id_of(&"snow_block")
 	var id: int = block_id_at(cell)     # capture the MATERIAL id BEFORE carving
 	_write_cell(cell, 0)                # dig to air (0 = canonical air)
+	_wf_ftr_edit_fires += 1             # FP_WORST_FRAME_ATTR §5: this dig bumped edit_count → the far-tree edits_rev query rebuilds the tier
 	_structural_update(cell, from_pos)  # only from the player break — never a spawn
 	# Disturbance: wake dormant debris near the break so anything that just lost its support falls
 	# (dormant-by-default reactivation). The new-body spawns from _structural_update are already awake.
@@ -2216,6 +2234,7 @@ func place_block(cell: Vector3i, value: int) -> bool:
 	if cell_solid(cell):
 		return false
 	_write_cell(cell, value)              # _write_cell canonicalizes (full cube if value was a bare id)
+	_wf_ftr_edit_fires += 1               # FP_WORST_FRAME_ATTR §5: this placement bumped edit_count → the far-tree edits_rev query rebuilds the tier
 	var key := Vector2i(cell.x, cell.z)
 	var prev: int = _placed_top.get(key, -0x40000000)
 	if cell.y > prev:
@@ -3862,7 +3881,15 @@ func update_block_lod_orbit(cam: Vector3) -> void:
 		if _facet_ring.has_method("set_skin_active"):
 			_facet_ring.set_skin_active(not retire)
 		if _facet_tex != null and _facet_tex.has_method("set_frozen"):
-			_facet_tex.set_frozen(retire)   # freeze §2V page bakes at orbit (no bake pop-in); resume on descent
+			# S4 (FP_SKIN_HANDOFF_PREWARM §4.3): un-freeze the page baker at de-orbit COMMITMENT, not at skin handover.
+			# The shipped freeze (=retire) keeps the baker stone-cold through the whole orbit + descent, so the card→skin
+			# handoff at 600/2400 arrives with an empty queue (mechanism M2). Under the flag we never freeze: the skin is
+			# retired/unbound at orbit so the bakes are INVISIBLE (no pop-in) but PREWARM the descent's disc under the
+			# baker's own bounded 5 ms budget — giving the readiness gate (S3) a short hold instead of the 30 s tail.
+			var freeze := retire
+			if CubeSphere.FP_SKIN_HANDOFF_PREWARM:
+				freeze = false
+			_facet_tex.set_frozen(freeze)
 
 ## COSMOS-ORBITAL-SHELL S1/S2 (docs/COSMOS-ORBITAL-SHELL-DESIGN.md §3/§4): drive the far ring's camera-radial
 ## emitted-set law + one-shot prewarm arming from this frame's camera (render frame). No faceted ring (fallback/
@@ -3914,6 +3941,13 @@ func set_smooth_v2_sun_dir(sun_dir: Vector3) -> void:
 func set_orbit_relief_sun_dir(sun_dir: Vector3) -> void:
 	if _facet_ring != null:
 		_facet_ring.set_orbit_relief_sun_dir(sun_dir)
+
+## docs/COSMOS-LOD-DROPOUT-DESIGN.md §4 (Stage S3, FP_SKIN_READY_GATE): the card→skin readiness fraction the far-tree +
+## far-structure tiers consult before completing a card→skin hide. Delegates to FacetTexBaker.ready_frac over the tier's
+## supplied handoff facet set; no baker ⇒ 1.0 (⇒ the tier holds nothing ⇒ the shipped pure-altitude hide). Wired only
+## under the flag, so this is dead code off (never called).
+func far_skin_ready_frac(fids) -> float:
+	return _facet_tex.ready_frac(fids) if _facet_tex != null else 1.0
 
 ## docs/COSMOS-FAR-TREES-DESIGN.md (P0): forward the current Sun direction + the live camera into the far-tree
 ## card tier each frame. No-op with no faceted ring (the ring setters self-guard) ⇒ byte-identical off.
@@ -4319,6 +4353,20 @@ func worst_frame_markers() -> Dictionary:
 	}
 	for k in wf_tier:
 		out[k] = wf_tier[k]
+	# FP_WORST_FRAME_ATTR §5 (docs/COSMOS-FAR-EDIT-DEBOUNCE-DESIGN.md §5): the break/place main-thread cost markers that
+	# attribute the ~3.4 s freeze-on-break. wf_collapse_ms/wf_solve_ms are frame-stamped event values (report the accumulated
+	# ms ONLY when this call lands on the same frame the edit ran — else 0, no stale spike); wf_solve_ms is NESTED inside
+	# wf_collapse_ms. wf_reclust_ms is the tracker's last _recluster_all self-time (also frame-stamped, in the tracker's own
+	# accessor — the debounced recluster usually lands on a LATER frame than the break, so it surfaces as its OWN worst frame).
+	# wf_ftr_edit_fires is CUMULATIVE (the ftr_rb precedent): the A/B diffs it across windows and compares to wf_ftr_rb to
+	# confirm the far-tree tier rebuilds 1:1 on every edit. Gated so the OFF arm is byte-identical (this fn is only CALLED
+	# under the flag, but the explicit gate matches the wf_tier convention above).
+	if CubeSphere.FP_WORST_FRAME_ATTR:
+		var _wf_fr := Engine.get_frames_drawn()
+		out["wf_collapse_ms"] = snappedf((_wf_collapse_us if _wf_edit_frame == _wf_fr else 0) / 1000.0, 0.01)
+		out["wf_solve_ms"] = snappedf((_wf_solve_us if _wf_edit_frame == _wf_fr else 0) / 1000.0, 0.01)
+		out["wf_reclust_ms"] = snappedf((_structure_tracker.wf_reclust_us() if _structure_tracker != null else 0) / 1000.0, 0.01)
+		out["wf_ftr_edit_fires"] = _wf_ftr_edit_fires
 	# FP_STRUCT_EDIT_DEBOUNCE (§7): surface the debounce sensors so the live A/B observes the hold (sed_pend / oldest_ms)
 	# and the publishes (sed_pub / sed_forced). {} off-flag ⇒ nothing merged (byte-identical telemetry).
 	var sed = struct_debounce_state()
@@ -4806,8 +4854,19 @@ const _NEIGHBORS_6: Array[Vector3i] = [
 ## MUST be called only from the player-initiated break_terrain / place_block, never
 ## from a spawn path, so it cannot recurse (a landing VoxelBody is physics-side).
 func _structural_update(center: Vector3i, from_pos: Vector3) -> void:
+	# FP_WORST_FRAME_ATTR §5: on the FIRST edit of a frame, zero the accumulators so the next break starts fresh; further
+	# breaks in the SAME frame accumulate (+=). The whole function's wall time is wf_collapse_us; the solve() call is timed
+	# as the nested wf_solve_us sub-marker (so flood+carve+spawn = collapse − solve). Unconditional (the _dbg precedent).
+	var _wf_fr := Engine.get_frames_drawn()
+	if _wf_edit_frame != _wf_fr:
+		_wf_edit_frame = _wf_fr
+		_wf_collapse_us = 0
+		_wf_solve_us = 0
+	var _wf_t0 := Time.get_ticks_usec()
 	var falling: Dictionary = StructuralSolver.solve(self, center)
+	_wf_solve_us += Time.get_ticks_usec() - _wf_t0
 	if falling.is_empty():
+		_wf_collapse_us += Time.get_ticks_usec() - _wf_t0
 		return   # common case: nothing detaches, spawn nothing
 
 	# Group the detaching cells into 6-neighbour connected components; each becomes
@@ -4853,6 +4912,9 @@ func _structural_update(center: Vector3i, from_pos: Vector3) -> void:
 		# to identity (cells stay lattice), so its GLOBAL comes out T_active·cell — the block's true absolute pose,
 		# where it physically sat. Frame off ⇒ global identity == local identity (parent @ identity) → byte-identical.
 		VoxelBody.spawn_loose(_frame_host(), comp_ids, self, from_pos)
+	# FP_WORST_FRAME_ATTR §5: total collapse wall (solve + component flood + carve + VoxelBody spawn), accumulated onto
+	# this frame's marker (reset above on the frame's first edit). Nested wf_solve_us already folded in inside solve().
+	_wf_collapse_us += Time.get_ticks_usec() - _wf_t0
 
 # --- per-joint reinforcement (STRUCTURAL-INTEGRITY §4.2/§7) ---------------------
 

@@ -60,6 +60,11 @@ class FakeWorld extends RefCounted:
 	var band := Vector2(-64.0, 130.0)
 	func skin_near_meshed(_fid: int, _box: AABB) -> bool: return meshed
 	func meshed_band_y(_ly: float) -> Vector2: return band
+## G-SKIN-GATE skin-readiness stub: the tier's _skin_ready_query calls this with _last_wanted; it returns a controllable
+## baked fraction (a method, not a captured local — the closure-trap guard). Mirrors FacetTexBaker.ready_frac.
+var _fake_skin_frac := 1.0
+func _fake_skin_ready(_fids) -> float:
+	return _fake_skin_frac
 func _ok(c: bool, m: String) -> void:
 	if c: _pass += 1
 	else:
@@ -142,6 +147,9 @@ func _initialize() -> void:
 		# G-FT-FLIP-CALM-REAL (Codex P0-1 / Fable F3): the BOUNDED-DEFERRAL fix through the REAL step() credit/settle path
 		# (a live FacetFarRing, not debug_step) — an expired flip must force its rebuild even parked at credit 0.
 		_gate_flip_calm_real()
+		# G-SKIN-GATE (FP_SKIN_READY_GATE, LOD-DROPOUT S3): the card→skin hide holds until the handoff set's skin is
+		# baked (ready_frac ≥ SKIN_READY_MIN), up to FT_SHELL_HOLD_MAX_ALT. Two-state (off ⇒ the shipped zone-O hide).
+		_gate_skin_gate()
 	else:
 		print("  (ON gates skipped — need FACETED + FP_FAR_TREES sed-toggled true)")
 
@@ -150,6 +158,47 @@ func _initialize() -> void:
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
+
+# ---- G-SKIN-GATE (FP_SKIN_READY_GATE, LOD-DROPOUT S3) ---------------------------------------------------------------
+## The card→skin hide is gated on baked-skin readiness: cards HOLD (visible, tier_fade ≥ SKIN_HOLD_FADE, no _stale
+## latch) above FT_SHELL_HIDE_ALT until ready_frac ≥ SKIN_READY_MIN, OR the camera passes FT_SHELL_HOLD_MAX_ALT (the
+## hard ceiling) past which the hold releases regardless. Off ⇒ the shipped zone-O hide verbatim. A stub skin-ready
+## query (`_fake_skin_ready`) drives a controllable fraction so the whole hold law is proven without a live baker.
+func _gate_skin_gate() -> void:
+	if not CubeSphere.FP_FAR_TREES_CARDS:
+		print("  (G-SKIN-GATE skipped — needs FP_FAR_TREES_CARDS sed-toggled true)")
+		return
+	var on := CubeSphere.FP_SKIN_READY_GATE and CubeSphere.FP_FT_SHELL_BAND
+	var fid: int = _sample_facets()[0]
+	if on:
+		# un-ready skin at h=650 (∈ (HIDE 600, HOLD_MAX 900)) ⇒ cards HELD visible, faded ≥ floor, NOT stale.
+		var t1 = FT.new(); t1.setup_instance(_fake_ring(), fid); t1.set_skin_ready_query(Callable(self, "_fake_skin_ready"))
+		_fake_skin_frac = 0.0
+		var rh := t1.debug_skin_gate(true, 650.0)
+		_ok(rh["skin_hold"] and rh["ft_cards"] and not rh["ft_stale"] and rh["tier_fade"] >= CubeSphere.SKIN_HOLD_FADE,
+			"G-SKIN-GATE(on): skin un-ready at h=650 ⇒ cards HELD (visible, tier_fade %.2f ≥ %.2f, no stale)" % [rh["tier_fade"], CubeSphere.SKIN_HOLD_FADE])
+		# ready ⇒ the hand-off completes (zone-O hide + stale latch) — the shipped behaviour, within one step.
+		var t2 = FT.new(); t2.setup_instance(_fake_ring(), fid); t2.set_skin_ready_query(Callable(self, "_fake_skin_ready"))
+		_fake_skin_frac = 1.0
+		var rr := t2.debug_skin_gate(true, 650.0)
+		# The hand-off = cards HIDDEN at zone O (the _stale latch is FP_FAR_TREES_COLORFIX's own concern — G-FTSB).
+		_ok(not rr["skin_hold"] and not rr["ft_cards"],
+			"G-SKIN-GATE(on): skin ready at h=650 ⇒ cards hidden, zone-O hand-off (releases)")
+		# threshold: frac == SKIN_READY_MIN releases (hold is strictly frac < MIN).
+		var t3 = FT.new(); t3.setup_instance(_fake_ring(), fid); t3.set_skin_ready_query(Callable(self, "_fake_skin_ready"))
+		_fake_skin_frac = CubeSphere.SKIN_READY_MIN
+		_ok(not t3.debug_skin_gate(true, 650.0)["skin_hold"], "G-SKIN-GATE(on): ready_frac == SKIN_READY_MIN ⇒ no hold (releases)")
+		# ceiling: un-ready but above FT_SHELL_HOLD_MAX_ALT ⇒ the hold RELEASES (never held to true orbit).
+		var t4 = FT.new(); t4.setup_instance(_fake_ring(), fid); t4.set_skin_ready_query(Callable(self, "_fake_skin_ready"))
+		_fake_skin_frac = 0.0
+		var rc := t4.debug_skin_gate(true, 950.0)
+		_ok(not rc["skin_hold"] and not rc["ft_cards"],
+			"G-SKIN-GATE(on): above FT_SHELL_HOLD_MAX_ALT the hold releases regardless of readiness (ceiling bounds duty)")
+	else:
+		var t0 = FT.new(); t0.setup_instance(_fake_ring(), fid); t0.set_skin_ready_query(Callable(self, "_fake_skin_ready"))
+		_fake_skin_frac = 0.0
+		_ok(not t0.debug_skin_gate(true, 650.0)["skin_hold"],
+			"G-SKIN-GATE(off): FP_SKIN_READY_GATE off ⇒ never holds (byte-identical zone-O hide)")
 
 # ---- helpers -------------------------------------------------------------------------------------------------------
 

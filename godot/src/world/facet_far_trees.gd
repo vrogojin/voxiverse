@@ -196,6 +196,14 @@ var _stale_ref_cam := Vector3.ZERO
 ## under FP_FT_STALE_PARKED ⇒ byte-identical off (never set, never read).
 var _ft_cull_pending := false
 
+## FP_SKIN_READY_GATE (docs/COSMOS-LOD-DROPOUT-DESIGN.md §4, Stage S3): the card→skin handoff readiness query. Fed once
+## by WorldManager (only under the flag) → `_skin_ready_query.call(_last_wanted) -> float` returns the baked FRACTION of
+## the card-band handoff set (FacetTexBaker.ready_frac). Unset ⇒ `_skin_ready_frac()` returns 1.0 ⇒ the hold never
+## arms ⇒ the shipped pure-altitude zone-O hide verbatim (byte-identical). Read only under the flag.
+var _skin_ready_query: Callable = Callable()
+var _dbg_skin_hold := false             # S3 gate read-back: the card→skin hold was active last step
+var _dbg_skin_ready_frac := 1.0         # S3 gate read-back: the handoff set's baked fraction last step
+
 # =====================================================================================================================
 # Shader — HEAD + VoxiLight.shade_glsl() + TAIL. Alpha-scissor (discard), opaque (no sort), cull_disabled (the
 # cross is double-sided). ALBEDO = atlas.rgb · voxi_shade(radial_n, sun_dir). planet_centre + sun_dir are uniforms.
@@ -562,6 +570,19 @@ func _current_edits_rev() -> int:
 func set_near_query(q: Callable) -> void:
 	_near_query = q
 
+## FP_SKIN_READY_GATE §4.2: wire the card→skin readiness query (WorldManager → FacetTexBaker.ready_frac). Stored like the
+## near query; only read under the flag (byte-identical off — unset ⇒ _skin_ready_frac() == 1.0 ⇒ no hold).
+func set_skin_ready_query(q: Callable) -> void:
+	_skin_ready_query = q
+
+## FP_SKIN_READY_GATE §4.2: the baked fraction of THIS tier's card-band handoff set (`_last_wanted`, exactly the facets
+## the tier is about to hand to the skin). Unwired ⇒ 1.0 (degrade to the shipped hide). Called once per step, in the
+## rate-capped step(), so the ≤180 dict lookups inside ready_frac are negligible.
+func _skin_ready_frac() -> float:
+	if not _skin_ready_query.is_valid():
+		return 1.0
+	return float(_skin_ready_query.call(_last_wanted))
+
 ## FP_FAR_TREES_NEARCULL §5.2-§5.3: should this tree's FAR impostor be EMITTED, given the NEAR field's ACTUAL mesh
 ## presence? Only the uncertainty annulus [FT_CULL_MIN, near_render_radius()+40] is probed (below ⇒ never emit — the near
 ## field owns it, no gap; above the max near-mesh extent ⇒ emit, no probe — near can't reach there; the near field never
@@ -793,7 +814,11 @@ func _is_chopped(fid: int, bx: float, gy: float, bz: float) -> bool:
 ## behaviour). Under FP_FAR_TREES_COLORFIX (§4.2): any offsurf frame latches `_stale`, and the tier stays hidden
 ## on the offsurf→onsurf flip until the first completed rebuild clears the latch (correct-or-nothing, no stale-band
 ## garbage frame). Cleared by `_rebuild_*`'s caller (step / debug_rebuild) after the first real rebuild.
-func _apply_visibility(offsurf: bool, h := -1.0) -> void:
+func _apply_visibility(offsurf: bool, h := -1.0, hide_alt := -1.0) -> void:
+	# FP_SKIN_READY_GATE §4.2: the caller passes the EFFECTIVE zone-O boundary — the shipped FT_SHELL_HIDE_ALT normally,
+	# or FT_SHELL_HOLD_MAX_ALT while the card→skin hold is active (so zone B extends up to the ceiling: cards keep
+	# rendering above 600 while the skin bakes, and _stale is NOT latched). Default -1 ⇒ FT_SHELL_HIDE_ALT (byte-off).
+	var hi := hide_alt if hide_alt >= 0.0 else CubeSphere.FT_SHELL_HIDE_ALT
 	# FP_FT_SHELL_BAND §3: the three-zone altitude law. Off (or no `h` supplied — the default -1 keeps existing call
 	# sites/gates on the shipped path) ⇒ the binary offsurf⇒hide below, byte-identical.
 	if CubeSphere.FP_FT_SHELL_BAND and h >= 0.0:
@@ -809,7 +834,7 @@ func _apply_visibility(offsurf: bool, h := -1.0) -> void:
 				_mmi.visible = show_s and not descent_pending
 			for mmi in _mesh_mmis:
 				(mmi as MultiMeshInstance3D).visible = show_s
-		elif h < CubeSphere.FT_SHELL_HIDE_ALT:
+		elif h < hi:
 			# ZONE B (shell band): CARDS visible + LIVE (no _stale latch — the set stays live); mesh rung HIDDEN. A
 			# de-orbit O→B keeps _stale until the first zone-B rebuild clears it (correct-or-nothing, §4.2).
 			var show_b := not (CubeSphere.FP_FAR_TREES_COLORFIX and _stale)
@@ -847,22 +872,40 @@ func step(settled := true, credit_ok := true, cam_render := Vector3.ZERO) -> voi
 	# (§4.2): trees show ON-surface only" — the whole node hidden + the set frozen — verbatim below (byte-identical).
 	var offsurf := (_ring as FacetFarRing).shell_offsurface()
 	var h := (_ring as FacetFarRing).shell_cam_alt() if CubeSphere.FP_FT_SHELL_BAND else -1.0
-	var shell_mode := CubeSphere.FP_FT_SHELL_BAND and offsurf and h < CubeSphere.FT_SHELL_HIDE_ALT
+	# FP_SKIN_READY_GATE §4.2 (S3): the card→skin HOLD — do NOT hand the view to the fine-map skin (zone O) until the
+	# handoff set's skin is baked (ready_frac ≥ SKIN_READY_MIN), up to the hard ceiling FT_SHELL_HOLD_MAX_ALT. Armed
+	# early (from FADE_ALT − MARGIN) so the tier_fade never sinks below SKIN_HOLD_FADE while the skin is un-ready. Only
+	# under FP_FT_SHELL_BAND (the shell band is where the handoff lives); unwired baker ⇒ frac 1.0 ⇒ never holds ⇒
+	# byte-identical. `hide_alt` = the effective zone-O boundary the visibility + shell_mode use while holding.
+	var hold := false
+	if CubeSphere.FP_SKIN_READY_GATE and CubeSphere.FP_FT_SHELL_BAND and offsurf \
+			and h >= (CubeSphere.FT_SHELL_FADE_ALT - CubeSphere.SKIN_HANDOFF_MARGIN_ALT) \
+			and h < CubeSphere.FT_SHELL_HOLD_MAX_ALT:
+		_dbg_skin_ready_frac = _skin_ready_frac()
+		hold = _dbg_skin_ready_frac < CubeSphere.SKIN_READY_MIN
+	_dbg_skin_hold = hold
+	var hide_alt := CubeSphere.FT_SHELL_HOLD_MAX_ALT if hold else CubeSphere.FT_SHELL_HIDE_ALT
+	var shell_mode := CubeSphere.FP_FT_SHELL_BAND and offsurf and h < hide_alt
 	# FP_FT_SHELL_BAND A/B readback: latch the computed zone (0=S,1=B,2=O; -1 flag off) + offsurf/h for a confound-free
 	# live telemetry probe (shell_band_state()). Cheap unconditional writes; only READ under the flag → byte-identical off.
-	_dbg_shell_zone = (-1 if not CubeSphere.FP_FT_SHELL_BAND else (0 if not offsurf else (1 if h < CubeSphere.FT_SHELL_HIDE_ALT else 2)))
+	_dbg_shell_zone = (-1 if not CubeSphere.FP_FT_SHELL_BAND else (0 if not offsurf else (1 if h < hide_alt else 2)))
 	_dbg_shell_h = h
 	_dbg_shell_offsurf = offsurf
 	# FP_FT_SHELL_FLIP_CALM §S2: latch a zone flip BEFORE the visibility apply so the flip frame keeps the rung-1 mesh
 	# visible (no gap) while the paced zone-B rebuild is deferred. No-op unless the flag is live.
 	_note_shell_flip(shell_mode)
-	_apply_visibility(offsurf, h)
+	_apply_visibility(offsurf, h, hide_alt)
 	if offsurf and not shell_mode:
 		return
 	# FP_FT_SHELL_BAND §3.3: drive the tier dissolve uniform every frame (cheap, no rebuild) — 1.0 in zone S, ramping to 0
 	# over [FADE_ALT, HIDE_ALT] in zone B so the tier hands off to the rung-3 speckle. Off / no material ⇒ never set.
 	if CubeSphere.FP_FT_SHELL_BAND and _material != null:
 		var tf := (1.0 - smoothstep(CubeSphere.FT_SHELL_FADE_ALT, CubeSphere.FT_SHELL_HIDE_ALT, h)) if shell_mode else 1.0
+		# FP_SKIN_READY_GATE §4.2: while holding, clamp the dissolve to SKIN_HOLD_FADE so the cards stay clearly present
+		# over the whole fade band + the extended hold (above HIDE_ALT the smoothstep is already 1 ⇒ tf 0 ⇒ clamped up).
+		# Released the step the skin becomes ready (hold flips false) ⇒ the natural ramp resumes ⇒ cards fade within a step.
+		if hold:
+			tf = maxf(tf, CubeSphere.SKIN_HOLD_FADE)
 		_material.set_shader_parameter("tier_fade", tf)
 		# FP_FT_SHELL_FLIP_CALM (Fable F6): under the flip-calm handoff the rung-1 mesh set can stay VISIBLE into zone B
 		# (held until the card buffer commits). Drive the SAME tier_fade on the mesh material so a held rung fades in
@@ -1824,8 +1867,34 @@ func mesh_min_vertex_y(col: int) -> float:
 	return mn
 
 ## FP_FAR_TREES_COLORFIX gate hooks (§4): drive the visibility latch + read the mesh MultiMesh color-slot state.
-func debug_apply_visibility(offsurf: bool, h := -1.0) -> void:
-	_apply_visibility(offsurf, h)
+func debug_apply_visibility(offsurf: bool, h := -1.0, hide_alt := -1.0) -> void:
+	_apply_visibility(offsurf, h, hide_alt)
+
+## FP_SKIN_READY_GATE gate hook (G-SKIN-GATE): replicate step()'s hold decision + visibility + tier_fade for a scripted
+## altitude sweep (no live ring). Uses the wired _skin_ready_query (a gate stub) exactly as step() does. Returns the
+## computed {skin_hold, skin_ready_frac, hide_alt, ft_cards (card MMI visible), tier_fade, ft_stale}.
+func debug_skin_gate(offsurf: bool, h: float) -> Dictionary:
+	var hold := false
+	if CubeSphere.FP_SKIN_READY_GATE and CubeSphere.FP_FT_SHELL_BAND and offsurf \
+			and h >= (CubeSphere.FT_SHELL_FADE_ALT - CubeSphere.SKIN_HANDOFF_MARGIN_ALT) \
+			and h < CubeSphere.FT_SHELL_HOLD_MAX_ALT:
+		_dbg_skin_ready_frac = _skin_ready_frac()
+		hold = _dbg_skin_ready_frac < CubeSphere.SKIN_READY_MIN
+	_dbg_skin_hold = hold
+	var hide_alt := CubeSphere.FT_SHELL_HOLD_MAX_ALT if hold else CubeSphere.FT_SHELL_HIDE_ALT
+	var shell_mode := CubeSphere.FP_FT_SHELL_BAND and offsurf and h < hide_alt
+	_apply_visibility(offsurf, h, hide_alt)
+	var tf := (1.0 - smoothstep(CubeSphere.FT_SHELL_FADE_ALT, CubeSphere.FT_SHELL_HIDE_ALT, h)) if shell_mode else 1.0
+	if hold:
+		tf = maxf(tf, CubeSphere.SKIN_HOLD_FADE)
+	return {
+		"skin_hold": hold,
+		"skin_ready_frac": _dbg_skin_ready_frac,
+		"hide_alt": hide_alt,
+		"ft_cards": (_mmi != null and _mmi.visible),
+		"tier_fade": tf,
+		"ft_stale": _stale,
+	}
 func mmi_visible() -> bool:
 	return _mmi != null and _mmi.visible
 ## FP_FT_SHELL_BAND gate read-back (G-FTSB-VIS): the mesh rung MMI visibility (hidden in zone B). True iff ANY mesh MMI shows.

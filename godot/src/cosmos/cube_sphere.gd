@@ -1523,6 +1523,17 @@ const STRUCT_CARD_HIDE_ALT := 2400.0         # card zone-O boundary (blocks) —
 const STRUCT_CARD_FADE_ALT := 2000.0         # card tier_fade dissolve start (the top cross-fade band [2000, 2400])
 const STRUCT_SHELL_STEP_MS := 500            # extended-band (h ≥ FT_SHELL_HIDE_ALT) prelude cadence — the view changes slowly up there
 
+# --- FP_SKIN_READY_GATE / FP_SKIN_HANDOFF_PREWARM (LOD skin-readiness handoff, docs/COSMOS-LOD-DROPOUT-DESIGN.md) ---
+# Hold the card/mesh tier past its normal hide-alt until the replacement fine-map skin is baked (ready), so trees/houses
+# never vanish into an un-baked gap across an LOD step; a hard ceiling releases regardless of readiness (no infinite hold).
+const FP_SKIN_READY_GATE := false            # gate the card→skin handoff on baker readiness (extends hide-alt to *_HOLD_MAX_ALT)
+const FP_SKIN_HANDOFF_PREWARM := false       # baker "handoff" priority class + early un-freeze so the descent disc pre-bakes
+const FT_SHELL_HOLD_MAX_ALT := 900.0         # far-tree hold ceiling (blocks): release the mesh/card even if skin not ready (> FT_SHELL_HIDE_ALT 600)
+const STRUCT_CARD_HOLD_MAX_ALT := 2800.0     # far-structure card hold ceiling (blocks): release even if skin not ready (> STRUCT_CARD_HIDE_ALT 2400)
+const SKIN_HANDOFF_MARGIN_ALT := 40.0        # blocks below *_FADE_ALT at which the readiness-hold logic starts watching
+const SKIN_READY_MIN := 1.0                  # min baked fraction (0..1) of wanted skin fids to release the hold (< ⇒ hold)
+const SKIN_HOLD_FADE := 1.0                  # tier_fade floor (0..1) while holding — keep the tier fully visible, no dissolve
+
 ## FP_STRUCT_CARD_STAGE (docs/COSMOS-CARD-BAND-HANDOFF-DESIGN.md §6-§7, Stage 3 S2+S4) — kills the ~1136 ms crossing
 ## spike, two composing fixes. (S2/§7) THE SORT BOMB: _rebuild's nearest-first sort_custom recomputes _structure_dist
 ## → _structure_centre → lattice_to_world64 (a fresh 3-Variant Array) PER COMPARISON (~N·log N allocating calls); under

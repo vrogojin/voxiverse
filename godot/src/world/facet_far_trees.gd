@@ -140,6 +140,7 @@ var _last_rebuild_shell := false        # FP_FT_SHELL_BAND: the zone (S vs B) of
 ## until the first zone-B card buffer commits clears it (no [R0,448) gap). Only read/written under the flag ⇒ byte-identical off.
 var _flip_pending := false
 var _flip_pending_ms := 0
+var _dbg_flip_defers := 0               # FP_WF_TIER_ATTR (F4): cumulative zone-flip DEFERS — "fired and helped" vs "never fired" sensor
 var _dbg_shell_zone := -1               # FP_FT_SHELL_BAND A/B readback: last computed zone (0=S,1=B,2=O; -1 off)
 var _dbg_shell_h := 0.0                 # last camera radial altitude the zone law saw
 var _dbg_shell_offsurf := false         # last shell_offsurface() the zone law saw
@@ -368,6 +369,13 @@ static func mesh_shader_code() -> String:
 			"float _sn = step(1.5, INSTANCE_CUSTOM.y);\n\tfloat _hue = fract(INSTANCE_CUSTOM.y);\n\tfloat jit = 1.0 + (_hue - 0.5) * 0.08;")
 		tail = tail.replace("v_col = vec4(COLOR.rgb * voxi_shade(n, sun_dir) * jit, 1.0);",
 			"vec3 _alb = mix(COLOR.rgb, snow_tint, _sn * snow_amt * flag);\n\tv_col = vec4(_alb * voxi_shade(n, sun_dir) * jit, 1.0);")
+	# FP_FT_SHELL_FLIP_CALM (Fable F6): mirror the card shader's tier_fade splice into the MESH dither so a rung held
+	# visible into zone B (the flip-calm handoff) dissolves in lockstep with the cards instead of drawing full-opacity.
+	# The `> v_fade)` token lives only in _MESH_TAIL_FADE (FP_FAR_TREES_FADE), so guard on it. Gated on FP_FT_SHELL_FLIP_CALM
+	# so the mesh shader is byte-identical when the flag is off (shipped tail verbatim).
+	if CubeSphere.FP_FT_SHELL_FLIP_CALM and CubeSphere.FP_FT_SHELL_BAND and CubeSphere.FP_FAR_TREES_FADE:
+		head += "uniform float tier_fade = 1.0;\n"
+		tail = tail.replace("> v_fade)", "> v_fade * tier_fade)")
 	return head + VoxiLight.shade_glsl() + tail
 
 static func make_mesh_material() -> ShaderMaterial:
@@ -792,8 +800,13 @@ func _apply_visibility(offsurf: bool, h := -1.0) -> void:
 		if not offsurf:
 			# ZONE S (surface): cards + meshes shown unless the COLORFIX stale latch holds (shipped).
 			var show_s := not (CubeSphere.FP_FAR_TREES_COLORFIX and _stale)
+			# FP_FT_SHELL_FLIP_CALM §S2.2 (descent mirror, Fable F2): on a B→S flip the card MMI still holds the zone-B
+			# [R0,2400] buffer, which would DOUBLE-RENDER over the resident mesh rung [R0,448). While the flip is pending
+			# (the last rebuild was zone B), keep the CARDS hidden + the meshes up until the zone-S rebuild repartitions
+			# (mesh [R0,448) + cards [448,2400]) and clears _flip_pending. Off ⇒ both shown (shipped, byte-identical).
+			var descent_pending := CubeSphere.FP_FT_SHELL_FLIP_CALM and _flip_pending and _last_rebuild_shell
 			if _mmi != null:
-				_mmi.visible = show_s
+				_mmi.visible = show_s and not descent_pending
 			for mmi in _mesh_mmis:
 				(mmi as MultiMeshInstance3D).visible = show_s
 		elif h < CubeSphere.FT_SHELL_HIDE_ALT:
@@ -851,6 +864,11 @@ func step(settled := true, credit_ok := true, cam_render := Vector3.ZERO) -> voi
 	if CubeSphere.FP_FT_SHELL_BAND and _material != null:
 		var tf := (1.0 - smoothstep(CubeSphere.FT_SHELL_FADE_ALT, CubeSphere.FT_SHELL_HIDE_ALT, h)) if shell_mode else 1.0
 		_material.set_shader_parameter("tier_fade", tf)
+		# FP_FT_SHELL_FLIP_CALM (Fable F6): under the flip-calm handoff the rung-1 mesh set can stay VISIBLE into zone B
+		# (held until the card buffer commits). Drive the SAME tier_fade on the mesh material so a held rung fades in
+		# lockstep with the cards instead of drawing full-opacity — no un-faded pop near HIDE_ALT. No-op / no material off.
+		if CubeSphere.FP_FT_SHELL_FLIP_CALM and _mesh_material != null:
+			_mesh_material.set_shader_parameter("tier_fade", tf)
 	var cam_abs := _cam_to_absolute(cam_render)            # one absolute-frame camera — guard, staleness floor + rebuild all reuse it
 	# FP_FT_NEAR_GUARD §1 (task #132): the bounded cull-only double-render guard runs BEFORE the settle/credit return, so it
 	# heals far-over-near even while the client sits at stream credit 0 (the ~30fps regime where the rebuild — and thus the
@@ -927,7 +945,17 @@ func step(settled := true, credit_ok := true, cam_render := Vector3.ZERO) -> voi
 ## under the flag, settled, credit 0, and the camera moved > FT_STALE_MOVE from the last rebuild AND ≥ FT_STALE_MS since it
 ## — a hard ≤0.5 Hz floor. Off ⇒ always false (byte-identical credit gate). Extracted so the gate can drive it directly.
 func _stale_override(settled: bool, credit_ok: bool, cam_abs: Vector3) -> bool:
-	if not (CubeSphere.FP_FT_STALE_REBUILD and settled and not credit_ok):
+	if not (settled and not credit_ok):
+		return false
+	# FP_FT_SHELL_FLIP_CALM §S2.1 (Codex P0-1 / Fable F3): an EXPIRED pending flip MUST force its rebuild through the
+	# credit gate even when parked at credit 0 — else step() returns here (before _rebuild_inputs_changed can evaluate the
+	# FT_FLIP_MAX_MS failsafe) and the flip latch persists unbounded (a permanent stale band). Independent of
+	# FP_FT_STALE_REBUILD and NOT subject to the FT_STALE_MS floor (FT_FLIP_MAX_MS is its own rate bound; it fires once,
+	# then _flip_pending clears). Off ⇒ the term is false (the flag short-circuits) ⇒ byte-identical below.
+	if CubeSphere.FP_FT_SHELL_FLIP_CALM and _flip_pending \
+			and Time.get_ticks_msec() - _flip_pending_ms >= CubeSphere.FT_FLIP_MAX_MS:
+		return true
+	if not CubeSphere.FP_FT_STALE_REBUILD:
 		return false
 	if Time.get_ticks_msec() - _last_rebuild_wall_ms < FT_STALE_MS:
 		return false                                          # the ≤0.5 Hz wall-clock floor (BOTH arms — never removed)
@@ -954,6 +982,7 @@ func _note_shell_flip(shell_mode: bool) -> void:
 			and shell_mode != _last_rebuild_shell and not _flip_pending:
 		_flip_pending = true
 		_flip_pending_ms = Time.get_ticks_msec()
+		_dbg_flip_defers += 1                                  # F4: a flip was deferred (not force-armed) this crossing
 
 # --- enumeration worker (one facet / job) ---------------------------------------------------------------------------
 
@@ -1732,6 +1761,13 @@ func debug_flip_pending() -> bool:
 	return _flip_pending
 func debug_set_flip_pending_ms(ms: int) -> void:
 	_flip_pending_ms = ms
+func debug_set_flip_pending(v: bool) -> void:
+	_flip_pending = v
+func debug_set_last_step_ms(ms: int) -> void:                   # bypass the FT_SHELL_REBUILD_MS step cap in the real-step gate
+	_last_step_ms = ms
+## FP_WF_TIER_ATTR (F4): cumulative zone-flip defers — the "fired and helped" vs "never fired" live sensor.
+func flip_defers() -> int:
+	return _dbg_flip_defers
 
 ## FP_FT_STALE_REBUILD gate hooks (G-FTS-*): drive the staleness-override decision directly + manipulate/read its
 ## reference, so the ≤0.5 Hz floor logic is provable without a live FacetFarRing / a 2 s wall wait.

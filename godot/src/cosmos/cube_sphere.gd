@@ -451,6 +451,11 @@ const SHELL_PWD_DTH_DEG := 1.0      # …or θ_h moved ≥ this (else the pacer 
 ## the arm is SAFETY, byte-identical). Off ⇒ the shipped SAFETY arm verbatim (byte-identical, FLAT 6042/0). Composes
 ## disjointly with FP_SHELL_PREWARM_DESCENT (descending+un-floored+[650,1300]) / STAGE_REEMIT / SECTOR_FINE / CLIMB_NO_CHURN.
 ## NEVER-OOM: temporarily keeps the LARGER already-resident mesh (zero growth); the promote shrinks it. Gate: verify_shell.gd G-SHELL-ASCENT-LAZY.
+## DEFERRED (Fable F1): INERT under the currently-served flags — FP_SHELL_SURF_CAP diet-caps the floored cap to θ_h+29°
+## and FP_SHELL_FALL_HOLD adds the release margin, so the containment test acos(new_cos)+drift ≤ acos(_emit_cos) can never
+## be satisfied on a climb ⇒ always SAFETY-immediate ⇒ the shipped spike. This flag is a FUTURE arm: it can only fire with
+## FP_SHELL_SURF_CAP OFF (or the floored cap widened back toward the 90° hemisphere). Deploy it OFF for now; the F4
+## shell_ascent_lazy_arms counter (surfaced under FP_WF_TIER_ATTR) measures whether it ever fires when later enabled.
 const FP_SHELL_ASCENT_LAZY := false
 const SHELL_ASCENT_LAZY_MAX_MS := 4000   # failsafe: past this wall-ms a parked ascent-release luxury arm is force-promoted (the conversion always lands)
 
@@ -1304,6 +1309,9 @@ const FT_SHELL_SWAP_DWELL := 2               # steps of zone dwell before the me
 ## zone-B card buffer commits — so the deferral never opens a gap (FT_SHELL_SWAP_DWELL promoted from "2 blind steps" to
 ## "until the replacement is resident"). Off ⇒ the shipped force-arm + immediate hide verbatim (byte-identical, FLAT
 ## 6042/0). Composes with FP_FT_STALE_PARKED (disjoint latch). Gate: verify_far_trees.gd G-FT-FLIP-CALM.
+## REQUIRES FP_FAR_TREES_DELTA on (deployed on): the flip is served through _rebuild_inputs_changed, which only runs under
+## DELTA. F7 caveat — with DELTA OFF the flip would perpetually re-latch (the DELTA gate that consumes it never runs); that
+## combination is unreachable in the served config, but do not ship FLIP_CALM with DELTA off.
 const FP_FT_SHELL_FLIP_CALM := false
 const FT_FLIP_MAX_MS := 2000                 # failsafe: past this wall-ms a still-pending flip rebuild is forced through (no stale band persists)
 
@@ -4553,7 +4561,10 @@ const FP_WORST_FRAME_ATTR := false
 ## (last FacetOrbitRelief.step µs), wf_ring_disp_us (the _dispatch_async_rebuild main-thread prelude µs), wf_ring_swap_us
 ## (last _swap_in_sectors/_swap_in_arrays µs). The timing itself is unconditional + cheap (a couple of get_ticks_usec
 ## reads, the _dbg_drive_ms precedent), but the KEYS are merged into the marker dict ONLY under this flag ⇒ OFF telemetry
-## is byte-identical (no wf_*_us key stamped). Zero engine rebuild.
+## is byte-identical (no wf_*_us key stamped). Zero engine rebuild. Also surfaces the F4 "fired" counters ft_flip_defers
+## (zone-flip defers) + shell_ascent_lazy_arms (ascent-release luxury arms) so an A/B can tell "fired and helped" from
+## "never fired". F8 caveat — wf_ring_disp_us / wf_ring_swap_us are last-EVENT values (a dispatch/swap only happens on a
+## re-emit), reset to 0 each ring frame; read them ALONGSIDE the sh_reemit/sh_emit deltas, not as per-frame costs.
 const FP_WF_TIER_ATTR := false
 
 ## COSMOS-PERF FALL — THE fall-fps fix. _attitude_ground_contact() (player.gd) calls world.floor_under() EVERY

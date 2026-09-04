@@ -2014,6 +2014,16 @@ func _gate_sed_tracker() -> void:
 		_ok(tr.version() == v0, "G-SED-TRACKER(on): a mid-hold _recluster_all does NOT leak a version drift (rev storm held)")
 		tr.publish()
 		_ok(tr.version() != v0, "G-SED-TRACKER(on): publish() latches the version (the far tier re-bakes on departure)")
+		# THE REGRESSION GUARD (Fable P0 / Codex P1): registry() — what the far tier actually SNAPSHOTS — must SERVE the
+		# published rev (== truth, > 0) after publish(). FAILS pre-fix (publish never re-made _reg ⇒ stale rev 0 ⇒
+		# _ensure_bake keeps the pre-edit bake ⇒ the hole never appears far); PASSES with the publish() re-make.
+		var reg2: Array = tr.registry()
+		var served_ok := false
+		if not reg2.is_empty():
+			var r2 := int((reg2[0] as Dictionary)["root"])
+			var served := int((reg2[0] as Dictionary)["rev"])
+			served_ok = tr._clusters.has(r2) and served == int(tr._clusters[r2]["rev"]) and served > 0
+		_ok(served_ok, "G-SED-TRACKER(on): after publish(), registry() SERVES the published rev (== truth, > 0) — the far model re-bakes the hole")
 	else:
 		_ok(tr.version() != v0, "G-SED-TRACKER(off): the version bumps on the edit (shipped immediate)")
 
@@ -2046,3 +2056,21 @@ func _gate_sed_gate() -> void:
 	_ok(wm2._sed_pending.size() <= CubeSphere.STRUCT_EDIT_PENDING_MAX and wm2._sed_forced >= 1,
 		"G-SED-GATE: pending cap respected — overflow force-publishes the oldest (NEVER-OOM)")
 	wm2.free()
+	# #3 AABB boundary precision: the gate opens at EXACTLY STRUCT_EDIT_DEPART_BLK from the OUTER voxel face. Place the
+	# player along +x at a KNOWN world distance beyond the entry's world AABB (so _sed_aabb_dist == that distance exactly,
+	# independent of curvature). 15.999 blk ⇒ held; 16.001 blk ⇒ publish — proving the [bmin, bmax+1] +1 fix (else the
+	# box would omit the outer voxel and the gate would open ~1 block early).
+	var wm3 = WM.new(); wm3._gen_index = SGI.new()
+	var abb: Array = wm3._sed_world_aabb(0, Vector3i(100, 40, 100), Vector3i(106, 46, 106))
+	var wmin3: Vector3 = abb[0]
+	var wmax3: Vector3 = abb[1]
+	var cy3 := (wmin3.y + wmax3.y) * 0.5
+	var cz3 := (wmin3.z + wmax3.z) * 0.5
+	var t3 := Time.get_ticks_msec()
+	wm3._sed_note_gen([{"root": -77, "fid": 0, "bmin": Vector3i(100, 40, 100), "bmax": Vector3i(106, 46, 106)}])
+	var dep: float = CubeSphere.STRUCT_EDIT_DEPART_BLK
+	wm3._sed_gate_publish(Vector3(wmax3.x + dep - 0.001, cy3, cz3), t3 + CubeSphere.STRUCT_EDIT_IDLE_MS + 1000)
+	_ok(wm3._sed_pending.size() == 1, "G-SED-GATE: %.3f blk from the OUTER voxel face ⇒ HELD (< DEPART_BLK)" % (dep - 0.001))
+	wm3._sed_gate_publish(Vector3(wmax3.x + dep + 0.001, cy3, cz3), t3 + CubeSphere.STRUCT_EDIT_IDLE_MS + 1000)
+	_ok(wm3._sed_pending.is_empty(), "G-SED-GATE: %.3f blk from the outer voxel face ⇒ PUBLISH (≥ DEPART_BLK; the +1 AABB fix)" % (dep + 0.001))
+	wm3.free()

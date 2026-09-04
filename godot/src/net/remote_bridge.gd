@@ -723,6 +723,14 @@ func _capture_worst_frame_snapshot() -> Dictionary:
 			# FP_STRUCT_REG_EPOCH: the far-structure step() prelude cost (µs) at the worst frame — the un-gated
 			# registry-duplicate + per-record lattice_to_world64 spike the version-gate targets (present in ALL states).
 			snap["wf_st_step_us"] = (wm as Dictionary).get("st_step_us", 0)
+			# FP_STRUCT_EDIT_DEBOUNCE (§7): the far-edit debounce sensors — present only under the flag (absent keys ⇒
+			# not merged). sed_pend = held structures now; sed_oldest_ms = how long the oldest hold has waited; sed_pub /
+			# sed_forced = publishes (departures) / NEVER-OOM force-publishes across the run.
+			if (wm as Dictionary).has("sed_pend"):
+				snap["wf_sed_pend"] = (wm as Dictionary).get("sed_pend", 0)
+				snap["wf_sed_pub"] = (wm as Dictionary).get("sed_pub", 0)
+				snap["wf_sed_oldest_ms"] = (wm as Dictionary).get("sed_oldest_ms", 0)
+				snap["wf_sed_forced"] = (wm as Dictionary).get("sed_forced", 0)
 	# if FP_FALL_TIMING is ALSO on: the in-progress (not-yet-window-flushed) _ft segment maxima — narrows the fall-segment
 	# correlation from 250 ms to "since last new-worst". Empty (no keys) when fall-timing was never on ⇒ nothing stamped.
 	if CubeSphere.FP_FALL_TIMING and is_instance_valid(player) and _has_m(player, "fall_timing_peek"):

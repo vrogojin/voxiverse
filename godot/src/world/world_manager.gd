@@ -4084,9 +4084,13 @@ func _sed_upsert(key: int, fid: int, bmin: Vector3i, bmax: Vector3i, now: int, g
 func _sed_world_aabb(fid: int, bmin: Vector3i, bmax: Vector3i) -> Array:
 	var wmin := Vector3(INF, INF, INF)
 	var wmax := Vector3(-INF, -INF, -INF)
-	for cx in [bmin.x, bmax.x]:
-		for cy in [bmin.y, bmax.y]:
-			for cz in [bmin.z, bmax.z]:
+	# Codex P1: bmax is an INCLUSIVE cell index — the voxel at bmax occupies through bmax+1 (the +1 the centre law
+	# bmin+bmax+1 also carries). Map the corners over [bmin, bmax + 1] so the world box covers the outer voxel faces
+	# (else the depart gate opens ~1 block early).
+	var hi := bmax + Vector3i.ONE
+	for cx in [bmin.x, hi.x]:
+		for cy in [bmin.y, hi.y]:
+			for cz in [bmin.z, hi.z]:
 				var w := FacetAtlas.lattice_to_world64(fid, float(cx), float(cy), float(cz))
 				var p := Vector3(float(w[0]), float(w[1]), float(w[2]))
 				wmin = Vector3(minf(wmin.x, p.x), minf(wmin.y, p.y), minf(wmin.z, p.z))
@@ -4299,13 +4303,22 @@ func worst_frame_markers() -> Dictionary:
 			smooth_v2_commit_ms = float((m as Dictionary).get("smooth_v2_commit_ms", 0.0))
 			ftr_rb = int((m as Dictionary).get("ftr_rb", 0))
 			st_rb = int((m as Dictionary).get("st_rb", 0))
-	return {
+	var out := {
 		"st_bms": snappedf(st_bms, 0.1),
 		"smooth_v2_commit_ms": snappedf(smooth_v2_commit_ms, 0.01),
 		"main_commit_ms": snappedf(_job_lane.peek_main_commit_ms() if _job_lane != null else 0.0, 0.01),
 		"ftr_rb": ftr_rb,
 		"st_rb": st_rb,
 	}
+	# FP_STRUCT_EDIT_DEBOUNCE (§7): surface the debounce sensors so the live A/B observes the hold (sed_pend / oldest_ms)
+	# and the publishes (sed_pub / sed_forced). {} off-flag ⇒ nothing merged (byte-identical telemetry).
+	var sed = struct_debounce_state()
+	if sed is Dictionary and not (sed as Dictionary).is_empty():
+		out["sed_pend"] = int((sed as Dictionary)["sed_pend"])
+		out["sed_pub"] = int((sed as Dictionary)["sed_pub"])
+		out["sed_oldest_ms"] = int((sed as Dictionary)["sed_oldest_ms"])
+		out["sed_forced"] = int((sed as Dictionary)["sed_forced"])
+	return out
 
 ## path keeps the analytic far field as cover during the drop (full dual-window handoff is M4).
 func maybe_flip_home_face(player_pos: Vector3) -> bool:

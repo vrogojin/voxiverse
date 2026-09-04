@@ -132,7 +132,13 @@ func enumerate_facet(fid: int, pcache = null) -> Array:
 func note_edit(fid: int, cell: Vector3i) -> Array:
 	var recs: Variant = _cache.get(fid)
 	if recs == null:
-		return []
+		# Codex P0 robustness: a cache-cold in-bbox edit would otherwise never record the damage (far model stays
+		# pristine). Under the flag, lazy-fill the facet so the truth rev is always bumped (never-drop); the enumerate's
+		# own _version bump is a legitimate refill (§4) that materializes PUBLISHED (pristine) revs, so no mid-edit
+		# re-bake leaks. Off ⇒ the shipped early-return verbatim (byte-identical — a cache-cold edit is not recorded).
+		if not CubeSphere.FP_STRUCT_EDIT_DEBOUNCE:
+			return []
+		recs = enumerate_facet(fid)
 	var deb := CubeSphere.FP_STRUCT_EDIT_DEBOUNCE
 	var damaged: Array = []
 	for r in (recs as Array):

@@ -370,8 +370,24 @@ func structure_bbox(root: int) -> Dictionary:
 ## version()/_make_record serve the current revs so the far tier re-bakes the changed player build exactly once.
 func publish() -> void:
 	_version_pub = _rev_counter * 1024 + _reg.size()
+	# latch the published revs FIRST (so _make_record below serves the NEW rev)…
 	for root in _clusters:
 		_rev_pub[root] = int((_clusters[root] as Dictionary)["rev"])
+	# …then RE-MAKE the registered records so registry() serves the published rev (Fable P0 / Codex P1): without this,
+	# _reg[root] keeps the pre-edit rev and _ensure_bake's (root, rev) key matches the cached PRE-edit bake ⇒ the
+	# player-build hole never appears far. Re-making with the freshly-latched _rev_pub advances the served rev by exactly
+	# the departure's worth of damage.
+	for root in _reg.keys():
+		if _clusters.has(root):
+			_reg[root] = _make_record(root)
+	# PRUNE _rev_pub to live cluster roots — reclusters rename roots, orphaning stale published-rev entries (leak).
+	if _rev_pub.size() > _clusters.size():
+		var drop: Array = []
+		for root in _rev_pub.keys():
+			if not _clusters.has(root):
+				drop.append(root)
+		for root in drop:
+			_rev_pub.erase(root)
 
 func tracked_count() -> int: return _cell_mat.size()
 func registry_count() -> int: return _reg.size()

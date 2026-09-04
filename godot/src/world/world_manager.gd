@@ -4296,6 +4296,10 @@ func worst_frame_markers() -> Dictionary:
 	# COSMOS-FARTIER-WALK §5: forward the far-tier rebuild-rate counters (cumulative; the A/B diffs across windows).
 	var ftr_rb := 0
 	var st_rb := 0
+	# FP_WF_TIER_ATTR S1: the ring's per-tier worst-frame self-time markers, forwarded verbatim when present (the ring
+	# adds them only under the flag ⇒ OFF ⇒ absent ⇒ not forwarded ⇒ byte-identical telemetry). Same has()-guard pattern
+	# as the sed_* debounce sensors below.
+	var wf_tier := {}
 	if _facet_ring != null and _facet_ring.has_method("worst_frame_markers"):
 		var m = _facet_ring.call("worst_frame_markers")
 		if m is Dictionary:
@@ -4303,6 +4307,9 @@ func worst_frame_markers() -> Dictionary:
 			smooth_v2_commit_ms = float((m as Dictionary).get("smooth_v2_commit_ms", 0.0))
 			ftr_rb = int((m as Dictionary).get("ftr_rb", 0))
 			st_rb = int((m as Dictionary).get("st_rb", 0))
+			for k in ["wf_ftr_us", "wf_or_us", "wf_ring_disp_us", "wf_ring_swap_us"]:
+				if (m as Dictionary).has(k):
+					wf_tier[k] = int((m as Dictionary)[k])
 	var out := {
 		"st_bms": snappedf(st_bms, 0.1),
 		"smooth_v2_commit_ms": snappedf(smooth_v2_commit_ms, 0.01),
@@ -4310,6 +4317,8 @@ func worst_frame_markers() -> Dictionary:
 		"ftr_rb": ftr_rb,
 		"st_rb": st_rb,
 	}
+	for k in wf_tier:
+		out[k] = wf_tier[k]
 	# FP_STRUCT_EDIT_DEBOUNCE (§7): surface the debounce sensors so the live A/B observes the hold (sed_pend / oldest_ms)
 	# and the publishes (sed_pub / sed_forced). {} off-flag ⇒ nothing merged (byte-identical telemetry).
 	var sed = struct_debounce_state()

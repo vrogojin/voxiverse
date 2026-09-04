@@ -135,6 +135,9 @@ func _initialize() -> void:
 		# G-FTSB (FP_FT_SHELL_BAND, far-tree orbit dropout): the three-zone altitude visibility law + zone-B card-only
 		# rebuild + cadence + de-orbit latch. Two-state, self-describing (off ⇒ shipped binary offsurf⇒hide).
 		_gate_shell_band()
+		# G-FT-FLIP-CALM (FP_FT_SHELL_FLIP_CALM, surface-entry spike S2): the de-forced zone flip — paced, credit-gated,
+		# mesh-visible-until-commit. Two-state, self-describing (off ⇒ the shipped force-arm on the flip step).
+		_gate_flip_calm()
 	else:
 		print("  (ON gates skipped — need FACETED + FP_FAR_TREES sed-toggled true)")
 
@@ -1706,7 +1709,12 @@ func _gate_shell_band() -> void:
 		var did_big := tier.debug_step(wanted, far, true, h_b)
 		_ok(did_big, "G-FTSB-CADENCE: 90-blk move > thr(75) ⇒ rebuild")
 		var did_flip := tier.debug_step(wanted, far, false, 40.0)   # same cam, zone B→S ⇒ flip re-arm
-		_ok(did_flip, "G-FTSB-CADENCE: a zone flip (B→S) re-arms exactly one rebuild (still camera)")
+		# FP_FT_SHELL_FLIP_CALM §S2.1 inverts this: the flip no longer force-arms (it latches _flip_pending, served paced +
+		# by the FT_FLIP_MAX_MS failsafe). So under FLIP_CALM the still-camera flip does NOT rebuild — asserted in G-FT-FLIP-CALM.
+		if CubeSphere.FP_FT_SHELL_FLIP_CALM:
+			_ok(not did_flip, "G-FTSB-CADENCE: under FP_FT_SHELL_FLIP_CALM a still-camera zone flip DEFERS (no forced rebuild)")
+		else:
+			_ok(did_flip, "G-FTSB-CADENCE: a zone flip (B→S) re-arms exactly one rebuild (still camera)")
 
 	# ---- G-FTSB-LATCH: climb + de-orbit, correct-or-nothing (fresh tier) ----
 	if on:
@@ -1728,4 +1736,53 @@ func _gate_shell_band() -> void:
 		_ok(deorbit_hidden, "G-FTSB-LATCH: de-orbit O→B stays hidden until a fresh rebuild (correct-or-nothing, #115 safe)")
 		_ok(t2.mmi_visible() and not t2.is_stale(), "G-FTSB-LATCH: visible after the first zone-B rebuild clears the latch")
 
+	ring.queue_free()
+
+# ---- G-FT-FLIP-CALM (FP_FT_SHELL_FLIP_CALM — the surface-entry spike S2) --------------------------------------------
+
+## Drive a synthetic S→B flip and assert the de-forced handoff. FLIP_CALM ON: the flip step does NOT rebuild (it latches
+## _flip_pending), the rung-1 mesh stays VISIBLE while pending (no [R0,448) gap), the FT_FLIP_MAX_MS failsafe forces the
+## deferred rebuild through, and the commit clears the pending flip + hides the rung. OFF: the flip force-arms a rebuild
+## on the flip step (shipped). Needs FP_FT_SHELL_BAND (the zones) + FP_FAR_TREES_CARDS (the rebuild proxy). Hermetic —
+## debug hooks only, no live ring / no 2 s wall wait.
+func _gate_flip_calm() -> void:
+	if not CubeSphere.FP_FAR_TREES_CARDS:
+		print("  (G-FT-FLIP-CALM skipped — needs FP_FAR_TREES_CARDS sed-toggled true, the rebuild proxy)")
+		return
+	if not CubeSphere.FP_FT_SHELL_BAND:
+		print("  (G-FT-FLIP-CALM skipped — needs FP_FT_SHELL_BAND sed-toggled true for the zones)")
+		return
+	var calm := CubeSphere.FP_FT_SHELL_FLIP_CALM
+	var ring := _fake_ring()
+	var tier = FT.new()
+	var fid: int = _sample_facets()[0]
+	tier.setup_instance(ring, fid)
+	tier.set_edits_rev_query(Callable(self, "_fake_edit_count"))
+	_fake_edits_rev = 0
+	tier.enumerate_facet_sync(fid)
+	var d := FA.cell_dir(fid, (FA.dom_min(fid).x + FA.dom_max(fid).x) / 2, (FA.dom_min(fid).y + FA.dom_max(fid).y) / 2)
+	var cam := Vector3(d.x, d.y, d.z) * (FA.R_BLOCKS + 300.0)   # one camera reused for the baseline + the flip (still camera)
+	var wanted := [fid]
+	# Baseline: a zone-S rebuild latches _last_rebuild_shell = false (the pre-flip zone).
+	tier.debug_step(wanted, cam, false, 41.0)
+	var c0 := tier.rebuild_count()
+	# The S→B flip step (still camera, so ONLY the zone changed).
+	var did_flip := tier.debug_step(wanted, cam, true, 300.0)
+	if calm:
+		_ok(not did_flip and tier.rebuild_count() == c0,
+			"G-FT-FLIP-CALM: the S→B flip step DEFERS (no forced rebuild; count %d→%d)" % [c0, tier.rebuild_count()])
+		_ok(tier.debug_flip_pending(), "G-FT-FLIP-CALM: the flip is latched _flip_pending")
+		tier.debug_apply_visibility(true, 300.0)
+		_ok(tier.mesh_mmi_visible(), "G-FT-FLIP-CALM: rung-1 mesh stays VISIBLE while the flip is pending (no [R0,448) gap)")
+		# The FT_FLIP_MAX_MS failsafe: age the pending flip past the ceiling ⇒ the next step forces the deferred rebuild.
+		tier.debug_set_flip_pending_ms(Time.get_ticks_msec() - CubeSphere.FT_FLIP_MAX_MS - 1)
+		var did_fs := tier.debug_step(wanted, cam, true, 300.0)
+		_ok(did_fs and tier.rebuild_count() == c0 + 1,
+			"G-FT-FLIP-CALM: the FT_FLIP_MAX_MS failsafe forces the deferred zone-B rebuild through (count %d)" % tier.rebuild_count())
+		_ok(not tier.debug_flip_pending(), "G-FT-FLIP-CALM: the committed rebuild clears the pending flip")
+		tier.debug_apply_visibility(true, 300.0)
+		_ok(not tier.mesh_mmi_visible(), "G-FT-FLIP-CALM: rung-1 mesh hides once the zone-B card buffer is resident")
+	else:
+		_ok(did_flip and tier.rebuild_count() == c0 + 1,
+			"G-FT-FLIP-CALM(off): the flip force-arms a rebuild on the flip step (shipped, count %d→%d)" % [c0, tier.rebuild_count()])
 	ring.queue_free()

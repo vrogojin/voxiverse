@@ -437,6 +437,30 @@ const SHELL_PWD_SNAP_MS := 500      # min wall-ms between pre-warm-forced cap sn
 const SHELL_PWD_DRIFT_DEG := 2.0    # force a snapshot only when the axis swept ≥ this since the last one…
 const SHELL_PWD_DTH_DEG := 1.0      # …or θ_h moved ≥ this (else the pacer stays silent — no-op ticks are free)
 
+## FP_SHELL_ASCENT_LAZY (docs/COSMOS-SURFACE-ENTRY-SPIKE-DESIGN.md S3) — the SECONDARY surface-entry fix (mirror of the
+## descent pre-warm, ascent-shaped). The UPWARD floor release (was floored, now off-surface) today arms a SAFETY re-emit
+## (shell_fall_should_reemit returns true first thing on floor_changed), dirtying the whole cap in one dispatch + the main-
+## thread prelude. But the resident FLOORED cap is a strict SUPERSET of the narrower un-floored cap (new_cos >= _emit_cos)
+## whenever the axis has not swept (drift ≤ SHELL_SLACK_DEG) — below the CLIMB_NO_CHURN ~9900-block bound the floored 90°
+## hemisphere contains every pixel of the new cap — so the re-emit is a pure QUALITY upgrade, deferrable by construction.
+## When true (and the release is that superset case) the snapshot's axis/cap/regime still commit (so shell_offsurface()/
+## _shell_orbit() advance), but the re-emit arms on the LUXURY rail (FP_APPLIED_PROBE_CALM promotes it when the stream is
+## healthy+settled) with a SHELL_ASCENT_LAZY_MAX_MS forced-promote failsafe; and _orbit_emitted_once is set so
+## _orbit_warm_async does not force the first off-surface emit. The DESCENT floor edge (genuine growth, 90° ⊅ resident) is
+## untouched — SAFETY, as shipped. Requires FP_APPLIED_PROBE_CALM (with it off, _arm_pending ignores the luxury param and
+## the arm is SAFETY, byte-identical). Off ⇒ the shipped SAFETY arm verbatim (byte-identical, FLAT 6042/0). Composes
+## disjointly with FP_SHELL_PREWARM_DESCENT (descending+un-floored+[650,1300]) / STAGE_REEMIT / SECTOR_FINE / CLIMB_NO_CHURN.
+## NEVER-OOM: temporarily keeps the LARGER already-resident mesh (zero growth); the promote shrinks it. Gate: verify_shell.gd G-SHELL-ASCENT-LAZY.
+const FP_SHELL_ASCENT_LAZY := false
+const SHELL_ASCENT_LAZY_MAX_MS := 4000   # failsafe: past this wall-ms a parked ascent-release luxury arm is force-promoted (the conversion always lands)
+
+## FP_OFFSURF_MAT_PREWARM (docs/COSMOS-SURFACE-ENTRY-SPIKE-DESIGN.md S4) — prepay the once-per-session GL/ANGLE program
+## link of the off-surface-only materials (FacetOrbitRelief's ShaderMaterial foremost) at the boot-splash prewarm stage,
+## so the first ascent past 256 does not pay a first-draw compile. PENDING the §3.1 repeat-crossing discriminator (a live
+## test that says whether the spike has a one-time first-exposure component); the flag const exists so the wiring lands in
+## one place, but the splash-prewarm logic is NOT yet implemented. Off ⇒ inert.
+const FP_OFFSURF_MAT_PREWARM := false
+
 ## COSMOS DE-ORBIT SLICE SMOOTHING (docs/COSMOS-DEORBIT-SLICE-SMOOTHING-DESIGN.md) — bound the staged shell slice.
 ## FP_FARRING_SECTORS' 2×2 face-quadrant sector (≤ (K/2)²=144 fids) is the ATOMIC swap unit, so every staged slice
 ## carries 130–144 facets and convoys the wasm dlmalloc lock 284–1041 ms/frame down the descent. When true, the
@@ -1269,6 +1293,19 @@ const FT_SHELL_FADE_ALT := 520.0             # tier_fade dissolve start (80-blk 
 const FT_SHELL_MOVE_FRAC := 0.25             # zone-B DELTA move threshold = max(FT_DELTA_MOVE_HYST, frac·h)
 const FT_SHELL_REBUILD_MS := 500             # zone-B rebuild rate cap (≤2 Hz hard ceiling)
 const FT_SHELL_SWAP_DWELL := 2               # steps of zone dwell before the mesh↔card rung swap (256-boundary flap absorber)
+
+## FP_FT_SHELL_FLIP_CALM (docs/COSMOS-SURFACE-ENTRY-SPIKE-DESIGN.md S2) — the PRIMARY surface-entry fix. The zone S→B
+## flip today FORCE-ARMS an immediate full _rebuild_cards (_rebuild_inputs_changed returns true on shell_mode !=
+## _last_rebuild_shell, bypassing every calm lever) AND immediately hides the rung-1 mesh set, opening a [R0,448) card
+## gap the forced rebuild scrambles to close — a ~350-600 ms main-thread GDScript loop landing on the crossing frame on
+## ASCENT (near field resident+idle ⇒ credit flows there). This flag makes the flip a correct-or-nothing HANDOFF: the raw
+## flip no longer force-arms (it latches _flip_pending, served by the SAME paced/credit-gated path as every zone-B rebuild,
+## with an FT_FLIP_MAX_MS failsafe), and the rung-1 mesh set stays VISIBLE (real geometry, one frame ago) until the first
+## zone-B card buffer commits — so the deferral never opens a gap (FT_SHELL_SWAP_DWELL promoted from "2 blind steps" to
+## "until the replacement is resident"). Off ⇒ the shipped force-arm + immediate hide verbatim (byte-identical, FLAT
+## 6042/0). Composes with FP_FT_STALE_PARKED (disjoint latch). Gate: verify_far_trees.gd G-FT-FLIP-CALM.
+const FP_FT_SHELL_FLIP_CALM := false
+const FT_FLIP_MAX_MS := 2000                 # failsafe: past this wall-ms a still-pending flip rebuild is forced through (no stale band persists)
 
 ## FP_STRUCT_DETECT + FP_STRUCT_FAR (docs/COSMOS-STRUCTURES-DESIGN.md, task #121) — player-built (and, in P1,
 ## generated) STRUCTURES rendered NEAR to orbit as decimated low-res VOXEL MODELS, culled where the near voxel
@@ -4508,6 +4545,16 @@ const FP_FALL_TIMING := false
 ## hot path). Off ⇒ the snapshot is never built and NO wf_* key is stamped (byte-identical telemetry). NEVER-OOM: zero
 ## growing state (one fixed dict, overwritten each new worst, cleared every emit). Zero engine rebuild.
 const FP_WORST_FRAME_ATTR := false
+
+## FP_WF_TIER_ATTR (docs/COSMOS-SURFACE-ENTRY-SPIKE-DESIGN.md S1) — per-tier worst-frame self-time markers so the
+## surface→off-surface (256) regime-flip spike is ATTRIBUTABLE (today `worst_frame_markers` has structure-tier
+## st_step_us but no far-tree / orbit-relief / ring-prelude / ring-swap self-time, so the 1111 ms is unpinnable).
+## Adds four leaf µs timers surfaced only under this flag: wf_ftr_us (last FacetFarTrees.step wall µs), wf_or_us
+## (last FacetOrbitRelief.step µs), wf_ring_disp_us (the _dispatch_async_rebuild main-thread prelude µs), wf_ring_swap_us
+## (last _swap_in_sectors/_swap_in_arrays µs). The timing itself is unconditional + cheap (a couple of get_ticks_usec
+## reads, the _dbg_drive_ms precedent), but the KEYS are merged into the marker dict ONLY under this flag ⇒ OFF telemetry
+## is byte-identical (no wf_*_us key stamped). Zero engine rebuild.
+const FP_WF_TIER_ATTR := false
 
 ## COSMOS-PERF FALL — THE fall-fps fix. _attitude_ground_contact() (player.gd) calls world.floor_under() EVERY
 ## free-fall frame; at high altitude the near field is ALT_REGIME-frozen so the floor query hits a slow regenerate

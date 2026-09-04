@@ -723,6 +723,12 @@ func _capture_worst_frame_snapshot() -> Dictionary:
 			# FP_STRUCT_REG_EPOCH: the far-structure step() prelude cost (µs) at the worst frame — the un-gated
 			# registry-duplicate + per-record lattice_to_world64 spike the version-gate targets (present in ALL states).
 			snap["wf_st_step_us"] = (wm as Dictionary).get("st_step_us", 0)
+			# FP_WF_TIER_ATTR S1 (docs/COSMOS-SURFACE-ENTRY-SPIKE-DESIGN.md): per-tier worst-frame self-time markers (us)
+			# — present only under the flag (absent keys => not merged => byte-identical telemetry off). These pin the
+			# surface->off-surface flip spike to a tier (far-tree rebuild / orbit-relief / ring dispatch prelude / ring swap).
+			for _wk in ["wf_ftr_us", "wf_or_us", "wf_ring_disp_us", "wf_ring_swap_us"]:
+				if (wm as Dictionary).has(_wk):
+					snap[_wk] = (wm as Dictionary).get(_wk, 0)
 			# FP_STRUCT_EDIT_DEBOUNCE (§7): the far-edit debounce sensors — present only under the flag (absent keys ⇒
 			# not merged). sed_pend = held structures now; sed_oldest_ms = how long the oldest hold has waited; sed_pub /
 			# sed_forced = publishes (departures) / NEVER-OOM force-publishes across the run.

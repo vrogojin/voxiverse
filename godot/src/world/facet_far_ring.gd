@@ -380,6 +380,10 @@ var _pending_src := PackedInt32Array()   # per-source arm counts (sensor); sized
 var _pending_luxury := false             # a LUXURY arm is parked, waiting on the credit/settle rail (_process consumes)
 var _calm_last_lux_arm_ms := 0           # ticks of the last luxury arm (settle clock)
 var _calm_last_lux_promote_ms := 0       # ticks of the last luxury→pending promotion (rate clock)
+## FP_SHELL_ASCENT_LAZY (docs/COSMOS-SURFACE-ENTRY-SPIKE-DESIGN.md S3): wall-ms deadline for the failsafe promote of a
+## parked ascent-release luxury arm (0 = none pending). Set at the ascent floor-release latch; cleared when the calm
+## coalescer promotes normally OR the failsafe fires. Only read/written under the flag ⇒ byte-identical off.
+var _ascent_lazy_due_ms := 0
 # net-zero debounce latches — the noblack unsink FLIP and the ladder SHRINK each hold their state change + arm for
 # CALM_NETZERO_HOLD_MS; a probe REVERT within the hold cancels everything (0 rebuilds), a stand past it commits + arms.
 var _calm_nb_hold_active := false
@@ -1305,12 +1309,31 @@ func shell_set_camera_abs(dir: Array, d: float, floored: bool, surf_cap_override
 	if CubeSphere.FP_SHELL_PREWARM_DESCENT and _pwd_active and not reemit:
 		pwd_snap = shell_prewarm_snap_due(_pwd_snap_due,
 				Time.get_ticks_msec() - _last_snapshot_ms, drift, dtheta)
+	# FP_SHELL_ASCENT_LAZY S3 (docs/COSMOS-SURFACE-ENTRY-SPIKE-DESIGN.md): the UPWARD floor release (was floored, now off-
+	# surface) is a pure quality upgrade IFF the resident FLOORED cap still CONTAINS the new un-floored cap on its swept
+	# axis. `_emit_cos` here is still the OLD committed cap cos; the resident cap has half-angle acos(_emit_cos) about the
+	# OLD axis, the new cap has half-angle acos(new_cos) about an axis `drift` away, so containment is exactly
+	# acos(new_cos) + drift ≤ acos(_emit_cos). This is provably hole-free for ANY axis sweep ≤ slack AND is correct
+	# regardless of FP_SHELL_SURF_CAP: if the floored cap was diet-capped (θ_h+29°) rather than the 90° hemisphere and it
+	# does NOT actually superset the new cap, the test fails and we stay SAFETY (no limb hole). It fires for the primary
+	# pure-vertical spike (drift≈0, cap NARROWS: the measured 7→500 case) — which the design's literal "solely
+	# floor_changed" wording would have excluded (see report). The DESCENT edge (floored true) is genuine growth ⇒ never
+	# lazy; `not pwd_snap` keeps the pre-warm snapshot on its own SRC_PREWARM rail. Off / axis-swept-out-of-cap / cap-grew
+	# past the bound ⇒ false ⇒ the shipped SAFETY arm (byte-identical).
+	var ascent_lazy := CubeSphere.FP_SHELL_ASCENT_LAZY and reemit and not pwd_snap \
+			and _emit_floored_last and not floored \
+			and drift <= deg_to_rad(CubeSphere.SHELL_SLACK_DEG) \
+			and acos(clampf(new_cos, -1.0, 1.0)) + drift <= acos(clampf(_emit_cos, -1.0, 1.0))
 	if reemit or pwd_snap:
 		if pwd_snap:
 			_pwd_snap_due = false
 			_pwd_snap_count += 1
-		_shell_snapshot(dir, new_cos, theta_h, floored, SRC_PREWARM if pwd_snap else SRC_CAM)
+		_shell_snapshot(dir, new_cos, theta_h, floored, SRC_PREWARM if pwd_snap else SRC_CAM, ascent_lazy)
 		_last_snapshot_ms = Time.get_ticks_msec()
+		if ascent_lazy:
+			# S3.2: don't let _orbit_warm_async force the first off-surface emit; S3.1: seed the failsafe promote clock.
+			_orbit_emitted_once = true
+			_ascent_lazy_due_ms = Time.get_ticks_msec() + CubeSphere.SHELL_ASCENT_LAZY_MAX_MS
 
 ## COSMOS-PERF FALL-COLLAPSE FIX A2 (FP_SHELL_FALL_HOLD) — the re-emit-trigger decision, split out PURE + static so
 ## the descent gate (G-SHELL-FALLHOLD) drives it directly with synthetic inputs (no wall-clock, no node). A floor/regime
@@ -1341,13 +1364,16 @@ static func shell_prewarm_snap_due(rising: bool, elapsed_ms: int, drift: float, 
 
 ## COSMOS-ORBITAL-SHELL S1 (§3): commit a new emit axis/cap and schedule the deferred re-emit (the warm + async
 ## build + single swap are the shipped pipeline; only _pending + the axis/cap snapshot change here).
-func _shell_snapshot(dir: Array, cap_cos: float, theta_h: float, floored: bool, src := SRC_CAM) -> void:
+func _shell_snapshot(dir: Array, cap_cos: float, theta_h: float, floored: bool, src := SRC_CAM, luxury := false) -> void:
 	_emit_axis = dir
 	_emit_cos = cap_cos
 	_emit_dir_last = dir
 	_emit_thetah_last = theta_h
 	_emit_floored_last = floored
-	_arm_pending(src)
+	# FP_SHELL_ASCENT_LAZY S3: the ascent floor-release arms on the LUXURY rail (deferred, superset-covered) instead of
+	# SAFETY — `luxury` is threaded from shell_set_camera_abs. With FP_APPLIED_PROBE_CALM off, _arm_pending ignores it and
+	# sets `_pending` immediately (the shipped SAFETY arm, byte-identical). The axis/cap/regime above always commit.
+	_arm_pending(src, luxury)
 	_snapshot_count += 1                                       # FIX A2 diagnostic: a scheduled re-emit (flat during a held fall)
 
 ## COSMOS-ORBITAL-SHELL S2 (§4): the one-shot whole-planet coarse-cache warm. After SHELL_PREWARM_DWELL_S sustained
@@ -1454,6 +1480,16 @@ var _dbg_drive_ms := 0.0
 var _dbg_step_ms := 0.0
 var _dbg_env_ms := 0.0
 
+## FP_WF_TIER_ATTR (docs/COSMOS-SURFACE-ENTRY-SPIKE-DESIGN.md S1): per-tier worst-frame self-time (µs). Timed
+## unconditionally (cheap get_ticks_usec pairs, the _dbg_drive_ms precedent) but surfaced into worst_frame_markers()
+## ONLY under the flag ⇒ OFF telemetry byte-identical. wf_or_us = last _orbit_relief.step(); wf_ftr_us = last
+## _far_trees.step(); wf_ring_disp_us = last _dispatch_async_rebuild main-thread prelude; wf_ring_swap_us = last
+## _swap_in_sectors/_swap_in_arrays.
+var _wf_ftr_us := 0
+var _wf_or_us := 0
+var _wf_ring_disp_us := 0
+var _wf_ring_swap_us := 0
+
 ## FP_APPLIED_PROBE_CALM §R2.5.1 choke point — every literal `_pending = true` in this file routes here with a source
 ## tag. Flag OFF ⇒ the shipped write verbatim (byte-identical: no counter, no latch, no rail). Flag ON ⇒ bump the
 ## per-source sensor and, for a LUXURY arm, park it on the forward rail (`_process` promotes it under credit/settle/
@@ -1484,6 +1520,23 @@ func _calm_try_promote_luxury(now_ms := Time.get_ticks_msec()) -> bool:
 		_pending_luxury = false
 		_calm_last_lux_promote_ms = now_ms
 		_pending = true
+		return true
+	return false
+
+## FP_SHELL_ASCENT_LAZY S3.1 — the ascent-release failsafe promote, split out PURE so the gate (G-SHELL-ASCENT-LAZY)
+## drives it with an injected clock (no wall wait). If the normal calm coalescer already consumed the luxury arm
+## (`not _pending_luxury`) it just retires the deadline; otherwise, past SHELL_ASCENT_LAZY_MAX_MS it force-promotes the
+## parked arm to a real `_pending` so the deferred conversion always lands. No-op / false with the flag off or nothing due.
+func _ascent_lazy_failsafe(now_ms := Time.get_ticks_msec()) -> bool:
+	if not CubeSphere.FP_SHELL_ASCENT_LAZY or _ascent_lazy_due_ms <= 0:
+		return false
+	if not _pending_luxury:
+		_ascent_lazy_due_ms = 0                                 # a normal promote (or a fresh SAFETY arm) already fired
+		return false
+	if now_ms >= _ascent_lazy_due_ms:
+		_pending_luxury = false
+		_pending = true
+		_ascent_lazy_due_ms = 0
 		return true
 	return false
 
@@ -1518,12 +1571,16 @@ func _process(_dt: float) -> void:
 	# commit for the relief-mesh tier. Cheap at rest (no dirty tiles, no in-flight slots ⇒ fast no-op scans).
 	# No-op / null with the flag off (byte-identical).
 	if _orbit_relief != null:
+		var _wf_or_t0 := Time.get_ticks_usec()   # FP_WF_TIER_ATTR S1: leaf self-time (surfaced only under the flag)
 		_orbit_relief.step()
+		_wf_or_us = Time.get_ticks_usec() - _wf_or_t0
 	# docs/COSMOS-FAR-TREES-DESIGN.md (P0): reap enumeration + rate-capped card-buffer rebuild. Suspends on-surface↔
 	# off-surface inverted (trees show ON-surface only). Respects the FP_LOAD_DEFER settle gate + stream credit like
 	# every other far tier. No-op / null with the flag off (byte-identical).
 	if _far_trees != null:
+		var _wf_ftr_t0 := Time.get_ticks_usec()   # FP_WF_TIER_ATTR S1: leaf self-time (surfaced only under the flag)
 		_far_trees.step(_load_settled, _stream_credit_ok, _ft_cam)
+		_wf_ftr_us = Time.get_ticks_usec() - _wf_ftr_t0
 	# docs/COSMOS-STRUCTURES-DESIGN.md (P0): rebuild the merged far-structure band (delta-gated, settle+credit-gated,
 	# near-handoff-culled). Reuses _ft_cam. No-op / null with FP_STRUCT_FAR off (byte-identical).
 	if _far_structures != null:
@@ -1575,6 +1632,10 @@ func _process(_dt: float) -> void:
 	# flags ship. Never entered / no allocation with the flag off (byte-identical).
 	if CubeSphere.FP_APPLIED_PROBE_CALM and _pending_luxury:
 		_calm_try_promote_luxury()
+	# FP_SHELL_ASCENT_LAZY S3.1: failsafe-promote a parked ascent-release luxury arm the calm coalescer never got to (the
+	# stream never settled). The normal promote above gets first chance; if it fired, `_pending_luxury` is already false
+	# and this just clears the deadline. Off / nothing pending ⇒ never entered (byte-identical).
+	_ascent_lazy_failsafe(Time.get_ticks_msec())
 	if _shell_orbit():
 		# COSMOS-PERF FALL-COLLAPSE FIX A (FP_SHELL_ORBIT_IDLE): idle short-circuit — once the front is fully warmed AND
 		# emitted with nothing pending, skip the per-frame full 6·K² _warm_front scan (the ~67 ms airborne proc baseline)
@@ -2504,7 +2565,8 @@ func _swap_in_sectors() -> void:
 	if CubeSphere.FP_SHELL_SNAP_GEN:
 		_last_committed_snap_gen = _async_snap_gen
 	_reemit_count += 1
-	_push_event("async-sect", _async_build_us, Time.get_ticks_usec() - t_swap, verts)
+	_wf_ring_swap_us = Time.get_ticks_usec() - t_swap   # FP_WF_TIER_ATTR S1: last sectored swap self-time (surfaced only under the flag)
+	_push_event("async-sect", _async_build_us, _wf_ring_swap_us, verts)
 
 ## Complete a warmed pending rebuild: dispatch it to a worker (async path) or build it inline (synchronous fallback).
 func _begin_rebuild() -> void:
@@ -2518,6 +2580,7 @@ func _begin_rebuild() -> void:
 ## worker reads are frozen for its lifetime — _process will not warm/dispatch again while _async_building (the gate in
 ## _process), and force_rebuild/set_excluded join first — so the worker only ever READS _pos_cache/_col_cache.
 func _dispatch_async_rebuild(sectored_on := CubeSphere.FP_FARRING_SECTORS, stage_on := CubeSphere.FP_SHELL_STAGE_REEMIT) -> void:
+	var _wf_disp_t0 := Time.get_ticks_usec()   # FP_WF_TIER_ATTR S1: main-thread dispatch prelude self-time (surfaced only under the flag)
 	transform = _placement_xform()   # rigid re-place is cheap + main-thread-only (same as _rebuild_full's first line)
 	# FP_SHELL_STAGE_REEMIT §4.2a: during a staged run HOLD the slot snapshot (the held _slot_snapshot/_band_slot_snapshot
 	# persist) so every staged sector emits from ONE coherent slot map. Off / not staging ⇒ refresh verbatim (byte-identical).
@@ -2602,6 +2665,7 @@ func _dispatch_async_rebuild(sectored_on := CubeSphere.FP_FARRING_SECTORS, stage
 			var _sax: Array = _cull_params()[0]
 			_stage_filter_dirty(Vector3(_sax[0], _sax[1], _sax[2]), stage_on)
 	_async_arrays = []
+	_wf_ring_disp_us = Time.get_ticks_usec() - _wf_disp_t0   # FP_WF_TIER_ATTR S1: prelude cost, before handing to the worker
 	_pending = false                 # consumed — a fresh crossing sets it again and is served after this build lands
 	_async_building = true
 	_async_task_id = WorkerThreadPool.add_task(Callable(self, "_async_build_worker"), false, "far-ring mesh rebuild")
@@ -2870,7 +2934,8 @@ func _swap_in_arrays(arrays: Array, fids: PackedInt32Array) -> void:
 		if _async_backstop.has(fid) and _bpos_cache.has(fid):
 			_emitted_backstop[fid] = true
 	_reemit_count += 1
-	_push_event("async", _async_build_us, Time.get_ticks_usec() - t_swap, verts)
+	_wf_ring_swap_us = Time.get_ticks_usec() - t_swap   # FP_WF_TIER_ATTR S1: last whole-mesh swap self-time (surfaced only under the flag)
+	_push_event("async", _async_build_us, _wf_ring_swap_us, verts)
 
 ## Warm (noise-cache) every uncached front-hemisphere facet under WARM_BUDGET_MS. Returns true once none remain
 ## uncached (rebuild may proceed), false when the frame budget is spent (resume next frame). The scan itself is a
@@ -3746,6 +3811,14 @@ func take_events() -> Array:
 
 # --- gate diagnostics ---
 func is_rebuild_pending() -> bool: return _pending
+## FP_SHELL_ASCENT_LAZY gate hooks (G-SHELL-ASCENT-LAZY): read the luxury/failsafe latches + drive them deterministically.
+func debug_pending_luxury() -> bool: return _pending_luxury
+func debug_ascent_lazy_due_ms() -> int: return _ascent_lazy_due_ms
+func debug_orbit_emitted_once() -> bool: return _orbit_emitted_once
+func debug_ascent_lazy_failsafe(now_ms: int) -> bool: return _ascent_lazy_failsafe(now_ms)
+func debug_reset_pending() -> void:                             # clear both rails so the ascent EDGE can be observed in isolation
+	_pending = false
+	_pending_luxury = false
 func reemit_count() -> int: return _reemit_count
 func snapshot_count() -> int: return _snapshot_count            # FIX A2 (G-SHELL-FALLHOLD): scheduled re-emits — flat during a held fall
 func warm_fail_count() -> int: return _warm_fail_count          # FIX D (G-WARM-TRUE-BUDGET): sh_wfail — must FLATLINE once the warm converges
@@ -6260,6 +6333,13 @@ func worst_frame_markers() -> Dictionary:
 	# FP_STRUCT_CARDS observability: live card instances / cap hit / card-sink self-time (µs) in the last _rebuild.
 	# {} off-flag ⇒ these fold nothing (the card_state() precedent); leaf reads, no allocation on the hot path.
 	var out := {"st_bms": st_bms, "smooth_v2_commit_ms": sv2, "ftr_rb": ftr_rb, "st_rb": st_rb, "st_step_us": st_step_us}
+	# FP_WF_TIER_ATTR S1: the per-tier worst-frame self-time markers (µs). Merged ONLY under the flag ⇒ OFF telemetry
+	# byte-identical (no wf_*_us key). Leaf ints, no allocation on the hot path.
+	if CubeSphere.FP_WF_TIER_ATTR:
+		out["wf_ftr_us"] = _wf_ftr_us
+		out["wf_or_us"] = _wf_or_us
+		out["wf_ring_disp_us"] = _wf_ring_disp_us
+		out["wf_ring_swap_us"] = _wf_ring_swap_us
 	# Flag-gated so the OFF arm allocates NOTHING new (card_state() would otherwise build a fresh {} every call).
 	if CubeSphere.FP_STRUCT_CARDS and _far_structures != null:
 		var cs = _far_structures.card_state()

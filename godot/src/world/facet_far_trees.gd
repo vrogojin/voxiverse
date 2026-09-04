@@ -135,6 +135,11 @@ var _last_rebuild_cam := Vector3.ZERO   # camera pos (absolute) at the last real
 var _last_rebuild_cache_epoch := -1     # _cache_epoch at the last real rebuild
 var _last_rebuild_edits_rev := -1       # edit revision at the last real rebuild
 var _last_rebuild_shell := false        # FP_FT_SHELL_BAND: the zone (S vs B) of the last real rebuild — a zone flip re-arms exactly one
+## FP_FT_SHELL_FLIP_CALM (docs/COSMOS-SURFACE-ENTRY-SPIKE-DESIGN.md S2): a zone flip is PENDING — latched (not force-armed)
+## so the rebuild rides the normal paced/credit-gated path (FT_FLIP_MAX_MS failsafe), and the rung-1 mesh set stays visible
+## until the first zone-B card buffer commits clears it (no [R0,448) gap). Only read/written under the flag ⇒ byte-identical off.
+var _flip_pending := false
+var _flip_pending_ms := 0
 var _dbg_shell_zone := -1               # FP_FT_SHELL_BAND A/B readback: last computed zone (0=S,1=B,2=O; -1 off)
 var _dbg_shell_h := 0.0                 # last camera radial altitude the zone law saw
 var _dbg_shell_offsurf := false         # last shell_offsurface() the zone law saw
@@ -797,8 +802,12 @@ func _apply_visibility(offsurf: bool, h := -1.0) -> void:
 			var show_b := not (CubeSphere.FP_FAR_TREES_COLORFIX and _stale)
 			if _mmi != null:
 				_mmi.visible = show_b
+			# FP_FT_SHELL_FLIP_CALM §S2.2: keep the rung-1 mesh set VISIBLE while a zone flip is pending (the first zone-B
+			# card buffer has not committed yet) so the S→B handoff never opens a [R0,448) gap — the meshes hold real
+			# geometry (drawn one frame ago). Cleared the instant the zone-B rebuild commits (step()). Off ⇒ hidden (shipped).
+			var keep_mesh := CubeSphere.FP_FT_SHELL_FLIP_CALM and _flip_pending and show_b
 			for mmi in _mesh_mmis:
-				(mmi as MultiMeshInstance3D).visible = false
+				(mmi as MultiMeshInstance3D).visible = keep_mesh
 		else:
 			# ZONE O (orbit): hidden + frozen; latch _stale so a later descent shows nothing until a fresh rebuild.
 			if CubeSphere.FP_FAR_TREES_COLORFIX:
@@ -831,6 +840,9 @@ func step(settled := true, credit_ok := true, cam_render := Vector3.ZERO) -> voi
 	_dbg_shell_zone = (-1 if not CubeSphere.FP_FT_SHELL_BAND else (0 if not offsurf else (1 if h < CubeSphere.FT_SHELL_HIDE_ALT else 2)))
 	_dbg_shell_h = h
 	_dbg_shell_offsurf = offsurf
+	# FP_FT_SHELL_FLIP_CALM §S2: latch a zone flip BEFORE the visibility apply so the flip frame keeps the rung-1 mesh
+	# visible (no gap) while the paced zone-B rebuild is deferred. No-op unless the flag is live.
+	_note_shell_flip(shell_mode)
 	_apply_visibility(offsurf, h)
 	if offsurf and not shell_mode:
 		return
@@ -903,6 +915,12 @@ func step(settled := true, credit_ok := true, cam_render := Vector3.ZERO) -> voi
 	# `_apply_visibility` shows the (now correct-band) tier. Off ⇒ inert (_stale is never set). See `_apply_visibility`.
 	if CubeSphere.FP_FAR_TREES_COLORFIX:
 		_stale = false
+	# FP_FT_SHELL_FLIP_CALM §S2.2: the zone rebuild just committed the correct-zone buffer, so the pending flip is
+	# resolved — clear it and RE-APPLY visibility THIS frame (visibility already ran at the top with _flip_pending true,
+	# keeping the mesh up) so the rung-1 mesh hides now the cards are resident, with no one-frame mesh+card double-render.
+	if CubeSphere.FP_FT_SHELL_FLIP_CALM and _flip_pending:
+		_flip_pending = false
+		_apply_visibility(offsurf, h)
 	_note_rebuilt(now, cam_abs)   # FP_FT_STALE_REBUILD §4.1: reset the staleness floor's reference (no-op read off)
 
 ## FP_FT_STALE_REBUILD §4.1: should the credit gate be overridden to let ONE real rebuild through at credit 0? True only
@@ -926,6 +944,16 @@ func _stale_override(settled: bool, credit_ok: bool, cam_abs: Vector3) -> bool:
 func _note_rebuilt(now_ms: int, cam_abs: Vector3) -> void:
 	_last_rebuild_wall_ms = now_ms
 	_stale_ref_cam = cam_abs
+
+## FP_FT_SHELL_FLIP_CALM §S2.1: latch a zone (S↔B) flip as PENDING — served by the paced/credit-gated rebuild path + the
+## FT_FLIP_MAX_MS failsafe, NOT force-armed. Idempotent (the timestamp is stamped once per flip so the failsafe clock
+## measures from the flip). Called from step() (before _apply_visibility, so the flip frame's visibility already sees the
+## latch) AND from _rebuild_inputs_changed (so debug_step latches too). No-op unless the flag is live.
+func _note_shell_flip(shell_mode: bool) -> void:
+	if CubeSphere.FP_FT_SHELL_FLIP_CALM and CubeSphere.FP_FT_SHELL_BAND \
+			and shell_mode != _last_rebuild_shell and not _flip_pending:
+		_flip_pending = true
+		_flip_pending_ms = Time.get_ticks_msec()
 
 # --- enumeration worker (one facet / job) ---------------------------------------------------------------------------
 
@@ -1092,8 +1120,18 @@ func _rebuild_inputs_changed(cam_abs: Vector3, shell_mode := false, h := 0.0) ->
 	# threshold when a cap was hit last rebuild (nearest-first ordering is then genuinely camera-dependent). Off ⇒ untouched.
 	if CubeSphere.FP_FT_WALK_CALM and not (_capped or _mesh_capped):
 		move_thr = maxf(move_thr, CubeSphere.FT_CALM_MARGIN * 0.5)
+	# FP_FT_SHELL_FLIP_CALM §S2.1: the raw zone flip no longer force-arms a rebuild. Latch it PENDING (here too, so
+	# debug_step latches) and drop it from the immediate-change set; the flip is then served by the normal levers below
+	# (camera move / cache / edits) OR the FT_FLIP_MAX_MS failsafe. Off ⇒ the shipped `shell_mode != _last_rebuild_shell`
+	# term verbatim (byte-identical).
+	_note_shell_flip(shell_mode)
+	var flip_term: bool
+	if CubeSphere.FP_FT_SHELL_FLIP_CALM:
+		flip_term = _flip_pending and (Time.get_ticks_msec() - _flip_pending_ms >= CubeSphere.FT_FLIP_MAX_MS)
+	else:
+		flip_term = CubeSphere.FP_FT_SHELL_BAND and shell_mode != _last_rebuild_shell
 	var changed := (not _have_rebuilt) \
-		or (CubeSphere.FP_FT_SHELL_BAND and shell_mode != _last_rebuild_shell) \
+		or flip_term \
 		or cam_abs.distance_to(_last_rebuild_cam) >= move_thr \
 		or _cache_epoch != _last_rebuild_cache_epoch \
 		or _current_edits_rev() != _last_rebuild_edits_rev \
@@ -1678,11 +1716,22 @@ func debug_step(wanted: Array, cam_abs: Vector3, shell_mode := false, h := 0.0) 
 		_nearcull_end()
 	if CubeSphere.FP_FAR_TREES_COLORFIX:
 		_stale = false
+	# FP_FT_SHELL_FLIP_CALM §S2.2: mirror step() — a completed rebuild resolves the pending flip (the gate re-checks
+	# visibility via debug_apply_visibility, so no re-apply here).
+	if CubeSphere.FP_FT_SHELL_FLIP_CALM:
+		_flip_pending = false
 	_note_rebuilt(Time.get_ticks_msec(), cam_abs)
 	return true
 
 func rebuild_count() -> int:
 	return _dbg_rebuild_count
+
+## FP_FT_SHELL_FLIP_CALM gate hooks (G-FT-FLIP-CALM): read the pending-flip latch + drive its failsafe clock so the
+## de-forced flip (paced + mesh-visible-until-commit) is provable without a live ring / a 2 s wall wait.
+func debug_flip_pending() -> bool:
+	return _flip_pending
+func debug_set_flip_pending_ms(ms: int) -> void:
+	_flip_pending_ms = ms
 
 ## FP_FT_STALE_REBUILD gate hooks (G-FTS-*): drive the staleness-override decision directly + manipulate/read its
 ## reference, so the ≤0.5 Hz floor logic is provable without a live FacetFarRing / a 2 s wall wait.

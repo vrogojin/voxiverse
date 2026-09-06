@@ -4375,6 +4375,11 @@ func set_near_daylight_sun_dir(sun_dir: Vector3) -> void:
 		var centre: Vector3 = _facet_ring.render_centre()
 		if _module_world != null and _module_world.has_method("set_near_daylight_planet_centre"):
 			_module_world.call("set_near_daylight_planet_centre", centre)
+		# COSMOS chop-dark fix: the unified branch fed ONLY the module atlas — the BlockMaterials fallback/residual/DEBRIS
+		# twins were left at planet_centre=0 whenever FP_SHADE_UNIFIED + FP_NIGHT_TERRAIN_CENTRE are both on (the shipped
+		# config), so a detached VoxelBody (chopped tree canopy) rendered through the twin shaded to the night floor = BLACK
+		# while the atlas-rendered terrain stayed lit. Feed the twins too (self-guards on FP_NEAR_DAYLIGHT+NIGHT_TERRAIN_CENTRE).
+		BlockMaterials.set_near_daylight_planet_centre(centre)
 
 ## COSMOS-ORBITAL-SHELL live-path telemetry: the far ring's driver→warm→emit→draw state for the remote bridge.
 ## {} when there is no faceted ring or the camera-set law is not engaged (⇒ the bridge stamps nothing, byte-identical).

@@ -4455,7 +4455,9 @@ func worst_frame_markers() -> Dictionary:
 					# FP_WORST_FRAME_ATTR (measurement-only): the orbit-relief step() sub-timing decomposition (present only
 					# under FP_WF_TIER_ATTR ⇒ absent keys not forwarded ⇒ byte-identical off).
 					"wf_or_reap_us", "wf_or_scan_us", "wf_or_evict_us", "wf_or_col_us", "wf_or_tex_us",
-					"wf_or_height_us", "wf_or_dispatch_us", "wf_or_commit_us", "wf_or_self_us"]:
+					"wf_or_height_us", "wf_or_dispatch_us", "wf_or_commit_us", "wf_or_self_us",
+					# FP_OR_COMMIT_PARTIAL: 1 = partial GPU path armed (self-check passed), 0 = whole-rebuild fallback.
+					"or_partial_ok"]:
 				if (m as Dictionary).has(k):
 					wf_tier[k] = int((m as Dictionary)[k])
 	var out := {

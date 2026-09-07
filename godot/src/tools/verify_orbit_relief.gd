@@ -97,6 +97,7 @@ func _initialize() -> void:
 			_gate_part_eq()
 			_gate_part_degen()
 			_gate_part_evict()
+			_gate_part_coalesce()
 	else:
 		_ok(true, "G-OR-DATA-EQ/BYTES/WELD/SEAM/COMMIT-COST/SUSPEND: skipped this run (needs FP_ORBIT_RELIEF + FP_GLOBAL_RELIEF_DATA both sed-toggled true)")
 
@@ -728,6 +729,8 @@ func _gate_commit_cost() -> void:
 						"G-OR-COMMIT-COST: the ON commit path uploads via RenderingServer.mesh_surface_update_{vertex,attribute}_region (O(changed slots))")
 					_ok(on_branch.find("add_surface_from_arrays") == -1,
 						"G-OR-COMMIT-COST: the ON commit path NEVER calls add_surface_from_arrays (no whole-arena re-pack in the partial path)")
+					_ok(on_branch.find("coalesce_runs(") != -1,
+						"G-OR-COMMIT-COST: the ON commit path COALESCES dirty slots into runs (fewer, larger glBufferSubData calls) — §6")
 
 	# The batch cap: mark the WHOLE 384-tile want-set as already BUILT (bypassing real dispatch — this gate only
 	# needs to prove the COMMIT-time batching, not re-prove dispatch pacing, already covered by the dispatch test
@@ -747,10 +750,12 @@ func _gate_commit_cost() -> void:
 		var slot := relief._alloc_arena_slot(i)
 		relief._tiles[i] = _bt(fid, heights, PackedColorArray(), slot * FOR_.VERTS_PER_TILE)
 	relief._commit_dirty = true
+	# §6: the EFFECTIVE cap is 8 when the partial path is armed (this run, FP_OR_COMMIT_PARTIAL true), else the shipped 24.
+	var cap := relief.commit_tiles_cap()
 	relief._commit()
-	_ok(relief._committed_tiles.size() <= CubeSphere.ORBIT_RELIEF_COMMIT_TILES,
-		"G-OR-COMMIT-COST: ONE _commit() call admits at most ORBIT_RELIEF_COMMIT_TILES(%d) of the %d-tile burst (got %d)" % [CubeSphere.ORBIT_RELIEF_COMMIT_TILES, n, relief._committed_tiles.size()])
-	_ok(relief._committed_tiles.size() == CubeSphere.ORBIT_RELIEF_COMMIT_TILES,
+	_ok(relief._committed_tiles.size() <= cap,
+		"G-OR-COMMIT-COST: ONE _commit() call admits at most the effective cap (%d) of the %d-tile burst (got %d)" % [cap, n, relief._committed_tiles.size()])
+	_ok(relief._committed_tiles.size() == cap,
 		"G-OR-COMMIT-COST: the burst actually SATURATES the batch cap (proves this isn't a vacuous pass)")
 	_ok(relief._commit_dirty, "G-OR-COMMIT-COST: still dirty after one capped commit — the rest of the burst is NOT silently dropped")
 	var iterations := 0
@@ -1071,4 +1076,84 @@ func _gate_part_evict() -> void:
 		"G-OR-PART-EVICT: B's mirror WEST edge actually CHANGED on the neighbour's eviction (not a stale no-op) — Δ=%.2f" % mirror_after.distance_to(mirror_before))
 	_ok(relief._gpu_dirty_slots.is_empty(), "G-OR-PART-EVICT: _gpu_dirty_slots is drained after the commit (B's region was uploaded)")
 
+	ring.free()
+
+# --- G-OR-PART-COALESCE (FP_OR_COMMIT_PARTIAL §6): dirty-slot run coalescing cuts RS calls, byte-identically --------
+func _gate_part_coalesce() -> void:
+	# (1) Pure partition: an unsorted dirty set with two adjacent-groups + a singleton coalesces into exactly the
+	# maximal consecutive runs — the union of run slots equals the input, every run slot is dirty (NO clean bridging),
+	# and adjacent runs are separated by a gap ≥ 2 (else they'd have merged).
+	var dirty := PackedInt32Array([7, 5, 6, 20, 21, 10])
+	var runs := FOR_.coalesce_runs(dirty)
+	var dset := {}
+	for s in dirty:
+		dset[int(s)] = true
+	var flat: Array = []
+	var all_dirty := true
+	for run in runs:
+		var start := int((run as Array)[0])
+		var count := int((run as Array)[1])
+		for d in range(count):
+			flat.append(start + d)
+			if not dset.has(start + d):
+				all_dirty = false
+	flat.sort()
+	_ok(flat == [5, 6, 7, 10, 20, 21], "G-OR-PART-COALESCE: runs partition EXACTLY the dirty set (got %s)" % str(flat))
+	_ok(all_dirty, "G-OR-PART-COALESCE: every slot inside every run is actually dirty — no clean-slot bridging (would upload stale bytes)")
+	var starts: Array = []
+	for run in runs:
+		starts.append([int((run as Array)[0]), int((run as Array)[1])])
+	starts.sort()
+	var maximal := true
+	for i in range(starts.size() - 1):
+		if int(starts[i][0]) + int(starts[i][1]) >= int(starts[i + 1][0]):
+			maximal = false
+	_ok(runs.size() == 3 and maximal, "G-OR-PART-COALESCE: exactly 3 MAXIMAL runs [5..7],[10],[20..21] (adjacent slots merged, gaps preserved)")
+
+	# (2) The cold-fill win: descending-contiguous free slots (range(cap)+pop_back gives 383,382,381,…) collapse to
+	# ONE run — so a whole batch of newly-admitted tiles uploads in 2 RS calls, not 2×N. Plus the empty case.
+	var runs2 := FOR_.coalesce_runs(PackedInt32Array([383, 382, 381, 380]))
+	_ok(runs2.size() == 1 and int((runs2[0] as Array)[0]) == 380 and int((runs2[0] as Array)[1]) == 4,
+		"G-OR-PART-COALESCE: a descending-contiguous cold-fill batch collapses to ONE run [380,4] (48 RS calls → 2)")
+	_ok(FOR_.coalesce_runs(PackedInt32Array()).is_empty(), "G-OR-PART-COALESCE: an empty dirty set produces no runs")
+
+	# (3) Falsifier — a set with NO consecutive slots must stay one run per slot (proves coalescing isn't vacuously
+	# merging everything).
+	var runs3 := FOR_.coalesce_runs(PackedInt32Array([3, 9, 40]))
+	_ok(runs3.size() == 3, "G-OR-PART-COALESCE: a gap-only set stays 3 singleton runs — coalescing merges ONLY true neighbours")
+
+	# (4) Byte-identity on a real armed instance: after committing 3 tiles into a contiguous slot range, each run's
+	# mirror byte-slice equals the concatenation of its per-slot slices — so the ONE glBufferSubData writes exactly
+	# what per-slot uploads would (the render is unchanged).
+	var fid := 12
+	var rd := GlobalReliefData.new(); rd.setup(); rd.bake_facet(fid)
+	var ring := FacetFarRing.new(); ring._active_fid = fid; _force_offsurface(ring)
+	var relief := FacetOrbitRelief.new(); relief.setup_instance(ring, fid, rd)
+	_ok(relief._or_partial_ok, "G-OR-PART-COALESCE: partial path armed")
+	var heights := rd.height_grid(fid)
+	var slots: Array = []
+	for t in range(3):
+		var sl: int = relief._alloc_arena_slot(1000 + t)
+		slots.append(sl)
+		relief._want[1000 + t] = true
+		relief._tiles[1000 + t] = _bt(fid, heights, PackedColorArray(), sl * FOR_.VERTS_PER_TILE)
+	relief._commit_dirty = true
+	relief._commit()
+	slots.sort()
+	var vlen := FOR_.VERTS_PER_TILE * relief._or_vstride
+	var alen := FOR_.VERTS_PER_TILE * relief._or_astride
+	var bytes_ok := true
+	for run in FOR_.coalesce_runs(PackedInt32Array(slots)):
+		var start := int((run as Array)[0])
+		var count := int((run as Array)[1])
+		var v_run := relief._arena_vbytes.slice(start * vlen, (start + count) * vlen)
+		var a_run := relief._arena_abytes.slice(start * alen, (start + count) * alen)
+		var v_cat := PackedByteArray()
+		var a_cat := PackedByteArray()
+		for d in range(count):
+			v_cat.append_array(relief._arena_vbytes.slice((start + d) * vlen, (start + d + 1) * vlen))
+			a_cat.append_array(relief._arena_abytes.slice((start + d) * alen, (start + d + 1) * alen))
+		if v_run != v_cat or a_run != a_cat:
+			bytes_ok = false
+	_ok(bytes_ok, "G-OR-PART-COALESCE: each coalesced run's vertex+attribute byte range == the concatenation of its per-slot ranges (upload byte-identical to per-slot)")
 	ring.free()

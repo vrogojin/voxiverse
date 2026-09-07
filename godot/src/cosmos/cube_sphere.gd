@@ -1083,6 +1083,13 @@ const ORBIT_RELIEF_MAX_TILES := 384          # hard cap; ≈26.55 MB at 72,492 B
 const ORBIT_RELIEF_AXIS_MS := 1000           # min ms between axis-drift want-set recomputes (crossings always force one)
 const ORBIT_RELIEF_COMMIT_MS := 500          # min ms between commits (array-concat + one GPU upload, no CPU normal pass)
 const ORBIT_RELIEF_COMMIT_TILES := 24        # max NEW tiles folded into the live mesh per commit (bounds the upload too)
+# FP_OR_COMMIT_PARTIAL granularity (docs/COSMOS-ORBIT-RELIEF-COMMIT-DESIGN.md §6 follow-up): once commits are cheap
+# per-slot region uploads (not a whole-arena re-pack), SMALLER/more-frequent batches spread the cold fill over ~3×
+# more commits at the SAME net fill rate (8 tiles/150 ms ≈ 24/450 ms) — ~⅓ the densest per-commit burst, smoother
+# ascent. Selected by FacetOrbitRelief.commit_tiles_cap()/commit_interval_ms() ONLY when the partial path is armed
+# (`_or_partial_ok`); the OFF whole-rebuild path keeps 24/500 (it wants FEWER, larger commits) — so byte-off is exact.
+const ORBIT_RELIEF_COMMIT_TILES_PARTIAL := 8    # partial-path NEW-tiles/commit cap (region uploads are cheap)
+const ORBIT_RELIEF_COMMIT_MS_PARTIAL := 150     # partial-path min ms between commits
 const ORBIT_RELIEF_FALLBACK_REACH_RAD := 0.7853981633974483   # deg_to_rad(45.0): on-surface/no-horizon-yet angular reach
 
 ## FP_OR_FLIP_STAGE (docs/COSMOS-SURFACE-ENTRY-SPIKE-DESIGN.md — the surface-entry SECONDARY, orbit-relief tier).

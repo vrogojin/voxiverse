@@ -401,6 +401,29 @@ static func pack_attr_bytes(col: PackedColorArray, uv: PackedVector2Array, uv2: 
 		out.encode_float(base + 16, uv2[k].y)
 	return out
 
+## FP_OR_COMMIT_PARTIAL §6 — coalesce a set of GPU-dirty slot indices into maximal STRICTLY-CONSECUTIVE runs, each
+## `[start_slot, count]`. A run's byte range (`start·stride … (start+count)·stride`) covers ONLY dirty slots — no
+## clean-slot bridging — so uploading it in ONE glBufferSubData writes exactly the freshly-packed mirror bytes those
+## slots hold, byte-identical to per-slot uploads. On the cold ascent the arena fills from descending-contiguous
+## free slots (`range(cap)` + `pop_back`), so a 24-tile burst collapses from 48 RS calls to a handful. PURE/static so
+## the gate can assert the partition directly. Input need not be sorted; duplicates never occur (`Dictionary` keys).
+static func coalesce_runs(slots: PackedInt32Array) -> Array:
+	var s := slots.duplicate()
+	s.sort()
+	var runs: Array = []
+	var i := 0
+	var n := s.size()
+	while i < n:
+		var start := int(s[i])
+		var count := 1
+		var j := i + 1
+		while j < n and int(s[j]) == int(s[j - 1]) + 1:
+			count += 1
+			j += 1
+		runs.append([start, count])
+		i = j
+	return runs
+
 # =====================================================================================================================
 # WS3 THE SHADER — G3's OWN material (deliberately NOT `FacetSmoothV2.make_material()`): hardcodes the SAME
 # radial-normal-only law V2's DEFAULT (non-LIT) tail already uses (`n = normalize(wp − centre)`,
@@ -1055,7 +1078,7 @@ func step() -> void:
 				break
 	if _commit_dirty:
 		var now_ms := Time.get_ticks_msec()
-		if should_commit(_commit_dirty, now_ms, _last_commit_ms, CubeSphere.ORBIT_RELIEF_COMMIT_MS):
+		if should_commit(_commit_dirty, now_ms, _last_commit_ms, commit_interval_ms()):   # §6: 150 when partial-armed, else 500 (byte-off)
 			var _wf_cm := Time.get_ticks_usec()   # commit datum (measurement-only)
 			_commit()
 			_wf_or_commit_us = Time.get_ticks_usec() - _wf_cm
@@ -1124,8 +1147,9 @@ func _commit() -> void:
 		_committed_tiles.erase(f)
 	var newly_added: Array = []
 	var added := 0
+	var commit_cap := commit_tiles_cap()   # FP_OR_COMMIT_PARTIAL §6: 8 when the partial path is armed, else 24 (byte-off)
 	for fid in _tiles.keys():
-		if added >= CubeSphere.ORBIT_RELIEF_COMMIT_TILES:
+		if added >= commit_cap:
 			break
 		var f := int(fid)
 		if _committed_tiles.has(f):
@@ -1171,14 +1195,25 @@ func _commit() -> void:
 		# persistent surface + static index buffer already exist (built once at setup) — NO whole-arena re-pack, no
 		# per-commit pack/alloc/AABB-scan, no full re-upload. All calls stay MAIN-thread (queued to the render side
 		# identically to the OFF mesh assign).
+		# §6 COALESCE the dirty slots into maximal consecutive runs and upload each run as ONE vertex + ONE attribute
+		# region call (instead of 2 per slot). Each run spans ONLY dirty slots, so its byte range is exactly those
+		# slots' freshly-packed mirror bytes — byte-identical to per-slot uploads. On the cold ascent the arena fills
+		# from descending-contiguous free slots, so a whole batch collapses to a handful of glBufferSubData calls.
 		var vlen := VERTS_PER_TILE * _or_vstride
 		var alen := VERTS_PER_TILE * _or_astride
+		var dirty := PackedInt32Array()
+		dirty.resize(_gpu_dirty_slots.size())
+		var di := 0
 		for dslot in _gpu_dirty_slots.keys():
-			var s := int(dslot)
-			var voff := s * vlen
-			var aoff := s * alen
-			RenderingServer.mesh_surface_update_vertex_region(_or_mesh_rid, 0, voff, _arena_vbytes.slice(voff, voff + vlen))
-			RenderingServer.mesh_surface_update_attribute_region(_or_mesh_rid, 0, aoff, _arena_abytes.slice(aoff, aoff + alen))
+			dirty[di] = int(dslot)
+			di += 1
+		for run in coalesce_runs(dirty):
+			var start := int((run as Array)[0])
+			var count := int((run as Array)[1])
+			var voff := start * vlen
+			var aoff := start * alen
+			RenderingServer.mesh_surface_update_vertex_region(_or_mesh_rid, 0, voff, _arena_vbytes.slice(voff, voff + count * vlen))
+			RenderingServer.mesh_surface_update_attribute_region(_or_mesh_rid, 0, aoff, _arena_abytes.slice(aoff, aoff + count * alen))
 		_gpu_dirty_slots.clear()
 	_commit_dirty = _committed_tiles.size() != _tiles.size()
 
@@ -1227,6 +1262,21 @@ func resident_bytes() -> int:
 ## How many facets are ACTUALLY drawn right now (not merely built/queued — `_tiles.size()` for that).
 func tile_count() -> int:
 	return _committed_tiles.size()
+
+## FP_OR_COMMIT_PARTIAL §6: the effective commit granularity. When the partial path is ARMED (region uploads are
+## cheap) use the smaller/more-frequent partial batch (8/150) — same net fill rate, ~⅓ the per-commit burst; the OFF
+## whole-rebuild path (and the self-check fallback) keeps the shipped 24/500 (it wants FEWER, larger commits). Off ⇒
+## returns the shipped consts verbatim ⇒ byte-identical cadence.
+func commit_tiles_cap() -> int:
+	return CubeSphere.ORBIT_RELIEF_COMMIT_TILES_PARTIAL if (CubeSphere.FP_OR_COMMIT_PARTIAL and _or_partial_ok) else CubeSphere.ORBIT_RELIEF_COMMIT_TILES
+
+func commit_interval_ms() -> int:
+	return CubeSphere.ORBIT_RELIEF_COMMIT_MS_PARTIAL if (CubeSphere.FP_OR_COMMIT_PARTIAL and _or_partial_ok) else CubeSphere.ORBIT_RELIEF_COMMIT_MS
+
+## FP_WF_TIER_ATTR telemetry: did the boot color-quant/layout self-check PASS (partial GPU path active) or degrade to
+## the whole-arena rebuild? Surfaced (bool→int) alongside wf_or_commit_us so a live WebGL2 run confirms it explicitly.
+func partial_ok() -> bool:
+	return _or_partial_ok
 
 ## FP_WORST_FRAME_ATTR MEASUREMENT-ONLY: the last step()'s sub-timing decomposition (µs). A leaf-int dict; the
 ## caller (FacetFarRing.worst_frame_markers) merges it alongside `wf_or_us` ONLY under the flag ⇒ off-telemetry

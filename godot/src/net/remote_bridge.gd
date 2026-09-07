@@ -733,6 +733,7 @@ func _capture_worst_frame_snapshot() -> Dictionary:
 					# FP_WORST_FRAME_ATTR (measurement-only): orbit-relief step() sub-timing decomposition of wf_or_us.
 					"wf_or_reap_us", "wf_or_scan_us", "wf_or_evict_us", "wf_or_col_us", "wf_or_tex_us",
 					"wf_or_height_us", "wf_or_dispatch_us", "wf_or_commit_us", "wf_or_self_us",
+					"or_partial_ok",   # FP_OR_COMMIT_PARTIAL: 1 = partial GPU path armed, 0 = whole-rebuild fallback
 					"wf_collapse_ms", "wf_solve_ms", "wf_reclust_ms", "wf_ftr_edit_fires",
 					"wf_sed_note_ms", "wf_sed_cls_ms"]:   # FP_STRUCT_EDIT_DEBOUNCE v2 (§6): edit-frame enqueue + deferred-classifier cost
 				if (wm as Dictionary).has(_wk):

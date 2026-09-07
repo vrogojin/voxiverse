@@ -6385,6 +6385,11 @@ func worst_frame_markers() -> Dictionary:
 			if _or_sub is Dictionary:
 				for _sk in (_or_sub as Dictionary):
 					out[_sk] = int((_or_sub as Dictionary)[_sk])
+			# FP_OR_COMMIT_PARTIAL telemetry: did the boot color-quant/layout self-check PASS (partial GPU path active,
+			# 1) or degrade to the whole-arena rebuild (0)? Lets a live WebGL2 run CONFIRM partial is active rather than
+			# inferring it from wf_or_commit_us. Present only under FP_WF_TIER_ATTR ⇒ absent off ⇒ byte-identical.
+			if _orbit_relief.has_method("partial_ok"):
+				out["or_partial_ok"] = (1 if _orbit_relief.partial_ok() else 0)
 		out["wf_ring_disp_us"] = _wf_ring_disp_us
 		out["wf_ring_swap_us"] = _wf_ring_swap_us
 		# F4: "fired and helped" vs "never fired" sensors — flip defers (far-tree tier) + ascent-release luxury arms (ring).

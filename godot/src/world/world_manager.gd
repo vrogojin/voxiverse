@@ -4451,7 +4451,11 @@ func worst_frame_markers() -> Dictionary:
 			smooth_v2_commit_ms = float((m as Dictionary).get("smooth_v2_commit_ms", 0.0))
 			ftr_rb = int((m as Dictionary).get("ftr_rb", 0))
 			st_rb = int((m as Dictionary).get("st_rb", 0))
-			for k in ["wf_ftr_us", "wf_or_us", "wf_ring_disp_us", "wf_ring_swap_us", "ft_flip_defers", "shell_ascent_lazy_arms"]:
+			for k in ["wf_ftr_us", "wf_or_us", "wf_ring_disp_us", "wf_ring_swap_us", "ft_flip_defers", "shell_ascent_lazy_arms",
+					# FP_WORST_FRAME_ATTR (measurement-only): the orbit-relief step() sub-timing decomposition (present only
+					# under FP_WF_TIER_ATTR ⇒ absent keys not forwarded ⇒ byte-identical off).
+					"wf_or_reap_us", "wf_or_scan_us", "wf_or_evict_us", "wf_or_col_us", "wf_or_tex_us",
+					"wf_or_height_us", "wf_or_dispatch_us", "wf_or_commit_us", "wf_or_self_us"]:
 				if (m as Dictionary).has(k):
 					wf_tier[k] = int((m as Dictionary)[k])
 	var out := {

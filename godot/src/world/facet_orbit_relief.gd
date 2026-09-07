@@ -522,6 +522,23 @@ var _committed_tiles: Dictionary = {}   ## fid -> true (already written into the
 var _commit_dirty := false
 var _last_commit_ms := 0
 
+# FP_WORST_FRAME_ATTR MEASUREMENT-ONLY sub-timing (docs/COSMOS-SURFACE-ENTRY-SPIKE-DESIGN.md): a COMPLETE,
+# NON-OVERLAPPING decomposition of step()'s main-thread cost (µs) so the ~100 ms surface-entry `wf_or_us` burst can
+# be attributed to a single per-op term (col-cache snapshot / height snapshot / tex decode / dispatch / scan / reap /
+# evict / commit). Reset at each step() start; `_wf_or_self_us` is the WHOLE step() self-time, so the 8 disjoint
+# buckets plus the residual (`self - Σbuckets` = dispatch-loop scan + slot bookkeeping + misc) sum EXACTLY to it. The
+# Time.get_ticks_usec() reads are unconditional (cheap, the `_dbg_*_ms` precedent); only the SURFACING is flag-gated
+# (see `wf_sub_timings` + facet_far_ring.gd's worst_frame_markers). Pure instrumentation — zero behaviour change.
+var _wf_or_reap_us := 0        ## the completion-reap loop at the top of step()
+var _wf_or_scan_us := 0        ## _recompute_want / _recompute_want_staged (the whole want-set recompute)
+var _wf_or_evict_us := 0       ## the dwell-eviction loop
+var _wf_or_col_us := 0         ## Σ _col_cache_for(f) over tiles dispatched this step
+var _wf_or_tex_us := 0         ## Σ _tex_decode(f) over tiles dispatched this step
+var _wf_or_height_us := 0      ## Σ height_bytes(f)/height_grid(f) snapshot over tiles dispatched this step
+var _wf_or_dispatch_us := 0    ## Σ WorkerThreadPool.add_task(...) over tiles dispatched this step
+var _wf_or_commit_us := 0      ## the _commit() call (when it fires)
+var _wf_or_self_us := 0        ## whole step() self-time (Σ8 buckets + residual == this)
+
 ## Construct the ONE MeshInstance3D (child of `ring`, sharing its placement transform), the worker slot pool,
 ## the persistent arena, and seed `_want`/`_want_order`. `ring` is the owning FacetFarRing (needs
 ## `shell_offsurface()`/`shell_emit_axis()`/`shell_emit_thetah()` and its `_col_cache` — see `_col_cache_for`
@@ -731,8 +748,19 @@ func _col_cache_for(fid: int) -> PackedColorArray:
 ## is false: the resident mesh is a frozen, static draw, exactly as `set_active` above already promises.
 ## Called once per `FacetFarRing._process`, alongside `_smooth_v2.step()`.
 func step() -> void:
+	var _wf_t0 := Time.get_ticks_usec()   # FP_WORST_FRAME_ATTR: whole-step self-time datum (measurement-only)
+	_wf_or_reap_us = 0
+	_wf_or_scan_us = 0
+	_wf_or_evict_us = 0
+	_wf_or_col_us = 0
+	_wf_or_tex_us = 0
+	_wf_or_height_us = 0
+	_wf_or_dispatch_us = 0
+	_wf_or_commit_us = 0
+	_wf_or_self_us = 0
 	if _sn == 0 or _relief_data == null:
 		return
+	var _wf_t := Time.get_ticks_usec()   # reap-phase datum
 	for i in range(_sn):
 		if int(_s_fid[i]) < 0 or not WorkerThreadPool.is_task_completed(int(_s_task[i])):
 			continue
@@ -751,6 +779,7 @@ func step() -> void:
 		else:
 			_free_arena_slot(fid)   # refusal / no longer wanted — release its reserved slot immediately
 		# a genuine completion with `_want.has(fid)` KEEPS its slot (still reserved, about to be committed).
+	_wf_or_reap_us = Time.get_ticks_usec() - _wf_t
 	var ring := _ring as FacetFarRing
 	var offsurf := ring.shell_offsurface()
 	# FP_ORBIT_RELIEF_SURFACE_HIDE (COSMOS-FAR-NEAR-COVERAGE-DESIGN §3.1): the frozen on-surface mesh rides
@@ -761,13 +790,17 @@ func step() -> void:
 	if CubeSphere.FP_ORBIT_RELIEF_SURFACE_HIDE and _mi != null:
 		_mi.visible = offsurf   # on-surface: hidden; off-surface: shown (frozen tiles intact)
 	if not offsurf:
+		_wf_or_self_us = Time.get_ticks_usec() - _wf_t0   # measurement-only: on-surface self-time (reap + visibility)
 		return   # WS1a: on-surface — no recompute, no dwell-eviction, no dispatch, no commit. Frozen.
 	# FP_OR_FLIP_STAGE: amortise the up-crossing want-set scan across frames (see `_recompute_want_staged`). Off ⇒
 	# the verbatim synchronous throttled recompute (byte-identical — the else branch is the untouched original).
+	_wf_t = Time.get_ticks_usec()   # scan-phase datum
 	if CubeSphere.FP_OR_FLIP_STAGE:
 		_recompute_want_staged(_active_fid)
 	else:
 		_recompute_want(_active_fid, false)   # throttled axis-drift recompute (no-op most calls)
+	_wf_or_scan_us = Time.get_ticks_usec() - _wf_t
+	_wf_t = Time.get_ticks_usec()   # evict-phase datum
 	if not _leaving.is_empty():
 		var to_evict := []
 		for fid in _leaving.keys():
@@ -782,6 +815,7 @@ func step() -> void:
 				_tiles.erase(fid)
 				_commit_dirty = true
 			_free_arena_slot(fid)
+	_wf_or_evict_us = Time.get_ticks_usec() - _wf_t
 	var _or_disp := 0   # FP_OR_FLIP_STAGE dispatch tally (only read under the flag — inert/unused when off)
 	for fid in _want_order:
 		var f := int(fid)
@@ -793,18 +827,30 @@ func step() -> void:
 		var arena_slot := _alloc_arena_slot(f)
 		if arena_slot < 0:
 			break   # arena momentarily full (transient dwell overlap) — the remainder waits too
+		var _wf_c := Time.get_ticks_usec()               # col-snapshot datum (measurement-only)
 		var coarse_col := _col_cache_for(f)              # main-thread snapshot — safe hand-off (§0)
+		_wf_or_col_us += Time.get_ticks_usec() - _wf_c
 		var vert_base := arena_slot * VERTS_PER_TILE     # WS1b: baked into the worker's own idx output
+		var _wf_x := Time.get_ticks_usec()               # tex-decode datum (measurement-only)
 		var tex := _tex_decode(f)                        # WS2: [face,a,b,k] — main-thread decode, plain ints to the worker
+		_wf_or_tex_us += Time.get_ticks_usec() - _wf_x
 		_s_fid[slot] = f
 		if CubeSphere.FP_OR_WORKER_DECODE:
+			var _wf_h := Time.get_ticks_usec()           # height-snapshot datum (measurement-only)
 			var raw := _relief_data.height_bytes(f)      # main-thread ~2178-B memcpy snapshot — worker decodes it (§0)
+			_wf_or_height_us += Time.get_ticks_usec() - _wf_h
+			var _wf_d := Time.get_ticks_usec()           # dispatch datum (measurement-only)
 			_s_task[slot] = WorkerThreadPool.add_task(Callable(self, "_build_worker_raw").bind(
 				slot, f, raw, coarse_col, vert_base, int(tex[0]), int(tex[1]), int(tex[2]), int(tex[3])), true, "orbitrelieftile")
+			_wf_or_dispatch_us += Time.get_ticks_usec() - _wf_d
 		else:
+			var _wf_h := Time.get_ticks_usec()           # height-snapshot datum (measurement-only)
 			var heights := _relief_data.height_grid(f)   # main-thread snapshot — safe hand-off (§0, WS1d-cached)
+			_wf_or_height_us += Time.get_ticks_usec() - _wf_h
+			var _wf_d := Time.get_ticks_usec()           # dispatch datum (measurement-only)
 			_s_task[slot] = WorkerThreadPool.add_task(Callable(self, "_build_worker").bind(
 				slot, f, heights, coarse_col, vert_base, int(tex[0]), int(tex[1]), int(tex[2]), int(tex[3])), true, "orbitrelieftile")
+			_wf_or_dispatch_us += Time.get_ticks_usec() - _wf_d
 		# FP_OR_FLIP_STAGE: cap the main-thread snapshot cost (height_grid/col/tex + add_task) per step so a
 		# post-publish burst of newly-wanted facets can't land all `_sn` dispatches — each with its own
 		# height_grid cache-miss — on ONE frame. Fewer dispatched now ⇒ the remainder fills next step; the reap
@@ -816,10 +862,13 @@ func step() -> void:
 	if _commit_dirty:
 		var now_ms := Time.get_ticks_msec()
 		if should_commit(_commit_dirty, now_ms, _last_commit_ms, CubeSphere.ORBIT_RELIEF_COMMIT_MS):
+			var _wf_cm := Time.get_ticks_usec()   # commit datum (measurement-only)
 			_commit()
+			_wf_or_commit_us = Time.get_ticks_usec() - _wf_cm
 			_last_commit_ms = now_ms
 		# else: _commit_dirty stays true (rate-cap window not yet open) — the NEXT eligible step() call retries;
 		# nothing is silently dropped.
+	_wf_or_self_us = Time.get_ticks_usec() - _wf_t0   # measurement-only: whole off-surface step self-time
 
 func _free_slot() -> int:
 	for i in range(_sn):
@@ -937,6 +986,25 @@ func resident_bytes() -> int:
 ## How many facets are ACTUALLY drawn right now (not merely built/queued — `_tiles.size()` for that).
 func tile_count() -> int:
 	return _committed_tiles.size()
+
+## FP_WORST_FRAME_ATTR MEASUREMENT-ONLY: the last step()'s sub-timing decomposition (µs). A leaf-int dict; the
+## caller (FacetFarRing.worst_frame_markers) merges it alongside `wf_or_us` ONLY under the flag ⇒ off-telemetry
+## byte-identical. The 8 named buckets are DISJOINT (each times a distinct region/op of step(), no overlap);
+## `wf_or_self_us` is the whole step() self-time, so `wf_or_self_us − Σ(8 buckets)` is the unattributed residual
+## (dispatch-loop candidate scan + `_free_slot`/`_inflight`/`_alloc_arena_slot` bookkeeping + visibility set + the
+## should_commit gate). Reads the vars step() last wrote — same frame the ring last timed `wf_or_us`.
+func wf_sub_timings() -> Dictionary:
+	return {
+		"wf_or_reap_us": _wf_or_reap_us,
+		"wf_or_scan_us": _wf_or_scan_us,
+		"wf_or_evict_us": _wf_or_evict_us,
+		"wf_or_col_us": _wf_or_col_us,
+		"wf_or_tex_us": _wf_or_tex_us,
+		"wf_or_height_us": _wf_or_height_us,
+		"wf_or_dispatch_us": _wf_or_dispatch_us,
+		"wf_or_commit_us": _wf_or_commit_us,
+		"wf_or_self_us": _wf_or_self_us,
+	}
 
 ## WS3 live sun wiring (mirrors `FacetSmoothV2.set_sun_dir`): feed the current Sun direction into THIS instance's
 ## OWN material (a separate ShaderMaterial from V2's/the shell's) so its terminator tracks live time. No-op if the

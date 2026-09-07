@@ -6377,6 +6377,14 @@ func worst_frame_markers() -> Dictionary:
 	if CubeSphere.FP_WF_TIER_ATTR:
 		out["wf_ftr_us"] = _wf_ftr_us
 		out["wf_or_us"] = _wf_or_us
+		# FP_WORST_FRAME_ATTR (measurement-only): the orbit-relief step() sub-timing decomposition — a complete,
+		# non-overlapping split of `wf_or_us` into per-op buckets (reap/scan/evict/col/tex/height/dispatch/commit) +
+		# `wf_or_self_us` (whole step; residual = self − Σbuckets). Merged only under FP_WF_TIER_ATTR ⇒ off-byte-identical.
+		if _orbit_relief != null:
+			var _or_sub = _orbit_relief.wf_sub_timings()
+			if _or_sub is Dictionary:
+				for _sk in (_or_sub as Dictionary):
+					out[_sk] = int((_or_sub as Dictionary)[_sk])
 		out["wf_ring_disp_us"] = _wf_ring_disp_us
 		out["wf_ring_swap_us"] = _wf_ring_swap_us
 		# F4: "fired and helped" vs "never fired" sensors — flip defers (far-tree tier) + ascent-release luxury arms (ring).

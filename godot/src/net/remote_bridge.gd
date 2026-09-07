@@ -730,6 +730,9 @@ func _capture_worst_frame_snapshot() -> Dictionary:
 			# (nested StructuralSolver.solve), wf_reclust_ms (tracker _recluster_all, debounced later frame), and the
 			# cumulative wf_ftr_edit_fires (edits that bump edit_count → far-tree rebuild). Absent off-flag ⇒ byte-identical.
 			for _wk in ["wf_ftr_us", "wf_or_us", "wf_ring_disp_us", "wf_ring_swap_us", "ft_flip_defers", "shell_ascent_lazy_arms",
+					# FP_WORST_FRAME_ATTR (measurement-only): orbit-relief step() sub-timing decomposition of wf_or_us.
+					"wf_or_reap_us", "wf_or_scan_us", "wf_or_evict_us", "wf_or_col_us", "wf_or_tex_us",
+					"wf_or_height_us", "wf_or_dispatch_us", "wf_or_commit_us", "wf_or_self_us",
 					"wf_collapse_ms", "wf_solve_ms", "wf_reclust_ms", "wf_ftr_edit_fires",
 					"wf_sed_note_ms", "wf_sed_cls_ms"]:   # FP_STRUCT_EDIT_DEBOUNCE v2 (§6): edit-frame enqueue + deferred-classifier cost
 				if (wm as Dictionary).has(_wk):

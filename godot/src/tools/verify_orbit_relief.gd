@@ -96,6 +96,7 @@ func _initialize() -> void:
 			_gate_part_pack()
 			_gate_part_eq()
 			_gate_part_degen()
+			_gate_part_evict()
 	else:
 		_ok(true, "G-OR-DATA-EQ/BYTES/WELD/SEAM/COMMIT-COST/SUSPEND: skipped this run (needs FP_ORBIT_RELIEF + FP_GLOBAL_RELIEF_DATA both sed-toggled true)")
 
@@ -1001,5 +1002,73 @@ func _gate_part_degen() -> void:
 	_ok(mirror_zero, "G-OR-PART-DEGEN: the evicted slot's position byte-mirror region is ALL zero (uploads a zero-area region)")
 	_ok(relief._gpu_dirty_slots.has(slot), "G-OR-PART-DEGEN: the evicted slot is marked GPU-dirty (uploaded on the next commit)")
 	_ok(not relief._fid_slot.has(fid) and relief._slot_fid[slot] == -1, "G-OR-PART-DEGEN: the slot is released — in no committed fid's mapping")
+
+	ring.free()
+
+# --- G-OR-PART-EVICT (P1 #1): a surviving committed neighbour re-sinks its edge when its neighbour is evicted --------
+# Decode a packed position vertex out of the vertex byte-mirror (little-endian f32×3 at stride _or_vstride).
+func _mirror_vpos(relief: FacetOrbitRelief, slot: int, k: int) -> Vector3:
+	var base := (slot * FOR_.VERTS_PER_TILE + k) * relief._or_vstride
+	return Vector3(relief._arena_vbytes.decode_float(base), relief._arena_vbytes.decode_float(base + 4), relief._arena_vbytes.decode_float(base + 8))
+
+func _gate_part_evict() -> void:
+	var fid_a := 12
+	var fid_b := FA.seam_neighbour(fid_a, FA.S_EAST)   # A's EAST edge (i=cells) shares B's WEST edge (i=0)
+	_ok(fid_b >= 0, "G-OR-PART-EVICT: fixture — facet %d has a real EAST neighbour" % fid_a)
+	if fid_b < 0:
+		return
+	var rd := GlobalReliefData.new()
+	rd.setup()
+	rd.bake_facet(fid_a)
+	rd.bake_facet(fid_b)
+	var ring := FacetFarRing.new(); ring._active_fid = fid_a; _force_offsurface(ring)
+	var relief := FacetOrbitRelief.new(); relief.setup_instance(ring, fid_a, rd)
+	_ok(relief._or_partial_ok, "G-OR-PART-EVICT: the partial path is armed (self-check passed)")
+
+	var cells := FOR_.ORBIT_RELIEF_CELLS
+	var stride := cells + 1
+	var mid := int(cells / 2)
+	var scale := float(FacetAtlas.R_BLOCKS)
+	var sink := TierPlace.backstop_sink()
+	var b_west_k := mid * stride + 0                    # B's WEST-edge INTERIOR node (i=0, j=mid) — on no other cardinal edge
+	var b_raw := (_bt(fid_b, rd.height_grid(fid_b), PackedColorArray(), 0)["pos"] as PackedVector3Array)[b_west_k]
+
+	# Commit A alone, then admit + commit B: now A & B share an edge that both render UN-SUNK (each other's neighbour).
+	relief._want[fid_a] = true
+	relief._tiles[fid_a] = _bt(fid_a, rd.height_grid(fid_a), PackedColorArray(), relief._alloc_arena_slot(fid_a) * FOR_.VERTS_PER_TILE)
+	relief._commit_dirty = true
+	relief._commit()
+	relief._want[fid_b] = true
+	var slot_b: int = relief._alloc_arena_slot(fid_b)
+	relief._tiles[fid_b] = _bt(fid_b, rd.height_grid(fid_b), PackedColorArray(), slot_b * FOR_.VERTS_PER_TILE)
+	relief._commit_dirty = true
+	relief._commit()
+	_ok(relief._committed_tiles.has(fid_a) and relief._committed_tiles.has(fid_b), "G-OR-PART-EVICT: A and B are both committed")
+	var vbase_b := slot_b * FOR_.VERTS_PER_TILE
+	var b_before := relief._arena_pos[vbase_b + b_west_k]
+	var mirror_before := _mirror_vpos(relief, slot_b, b_west_k)
+	_ok(absf(b_before.length() - b_raw.length()) <= EPS * scale,
+		"G-OR-PART-EVICT: precondition — B's shared WEST edge is UN-SUNK while A is committed (Δ=%.4f)" % absf(b_before.length() - b_raw.length()))
+
+	# Evict A exactly as step()'s dwell-eviction does: drop it from _tiles + free its arena slot, but LEAVE it in
+	# _committed_tiles so _commit's sync loop is what detects the eviction. Admit NO new tile — the bug's trigger.
+	relief._tiles.erase(fid_a)
+	relief._free_arena_slot(fid_a)
+	relief._commit_dirty = true
+	relief._commit()
+	_ok(not relief._committed_tiles.has(fid_a), "G-OR-PART-EVICT: A is evicted from the committed set (no new tile admitted)")
+	_ok(relief._committed_tiles.has(fid_b), "G-OR-PART-EVICT: B survives the eviction")
+
+	# THE FIX: B's former-shared WEST edge must now be SUNK (A gone → frontier), in BOTH the typed arena AND the
+	# packed mirror. Fails on the pre-fix code (B never re-entered `to_write`, so its edge stays protruding-unsunk).
+	var b_after := relief._arena_pos[vbase_b + b_west_k]
+	_ok(absf((b_before.length() - b_after.length()) - sink) <= EPS * scale,
+		"G-OR-PART-EVICT: B's former-shared WEST edge is now SUNK by exactly backstop_sink() in the typed arena (Δsink=%.4f, want %.4f)" % [b_before.length() - b_after.length(), sink])
+	var mirror_after := _mirror_vpos(relief, slot_b, b_west_k)
+	_ok(mirror_after.distance_to(b_after) <= EPS * scale,
+		"G-OR-PART-EVICT: B's packed MIRROR at the re-sunk edge matches the sunk typed position (the slot was marked dirty & re-packed) — Δ=%.6f" % mirror_after.distance_to(b_after))
+	_ok(mirror_after.distance_to(mirror_before) > 1.0,
+		"G-OR-PART-EVICT: B's mirror WEST edge actually CHANGED on the neighbour's eviction (not a stale no-op) — Δ=%.2f" % mirror_after.distance_to(mirror_before))
+	_ok(relief._gpu_dirty_slots.is_empty(), "G-OR-PART-EVICT: _gpu_dirty_slots is drained after the commit (B's region was uploaded)")
 
 	ring.free()

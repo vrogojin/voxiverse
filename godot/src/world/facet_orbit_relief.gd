@@ -672,14 +672,18 @@ func _or_build_persistent_surface() -> void:
 	m.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)
 	# §2.5 conservative AABB centred on origin enclosing the whole shell — the all-degenerate initial surface would
 	# auto-compute a POINT aabb at the origin, and region updates never recompute it ⇒ the tier would cull invisibly.
-	# `r_max·2` is datum + a generous relief margin (relief ≪ datum); an oversize box only makes culling MORE
-	# conservative (never a false hide), a strict superset of the full-rebuild aabb (which always includes the origin
-	# zeroed free-slot verts). Matches "effectively never fully culled from orbit regardless".
+	# P1 #2: derive the half-extent from the RELIEF-HEIGHT DOMAIN, not a heuristic multiple of the datum. Every tile
+	# vertex is `d·(r_datum + relief)` with |d|==1 and `relief = maxf(0, h − SEA_LEVEL)·FacetFarRing.RELIEF` (the SAME
+	# scale build_tile uses); `h` is a GlobalReliefData s16, so `relief ≤ (32767 − SEA_LEVEL)·RELIEF`. Hence every
+	# possible vertex radius ≤ max_r_datum + that bound, and sunk verts move INWARD (smaller radius) — so this box is a
+	# PROVEN superset of every relief vertex for any height the s16 store can hold (free-slot verts sit at the origin,
+	# also inside). Conservative but never a false frustum cull, whatever the DEM later bakes. Set ONCE at setup.
 	var r_max := 0.0
 	var nfac := FacetAtlas.facet_count()
 	for fid in range(nfac):
 		r_max = maxf(r_max, FacetAtlas.r_of(fid))
-	var ext := maxf(r_max, 1.0) * 2.0
+	var relief_max := float(32767 - TerrainConfig.SEA_LEVEL) * FacetFarRing.RELIEF   # s16 max relief height × the relief scale
+	var ext := r_max + maxf(relief_max, 0.0) + 1.0                                   # +1 block float-safety margin
 	m.custom_aabb = AABB(Vector3(-ext, -ext, -ext), Vector3(2.0 * ext, 2.0 * ext, 2.0 * ext))
 	_mi.mesh = m
 	_or_mesh_rid = m.get_rid()
@@ -1107,9 +1111,17 @@ func _build_worker_raw(slot: int, fid: int, raw: PackedByteArray, coarse_col: Pa
 ## index remap) every single commit.
 func _commit() -> void:
 	_ensure_arena()
+	# (1) Sync evictions. COLLECT the removed committed fids first (P1 #1): a surviving committed NEIGHBOUR of an
+	# evicted tile now borders an empty frontier where the tile was, so its `edge_sink_mask` toward the gone tile must
+	# flip to SUNK — otherwise it keeps an unsunk edge and protrudes/cracks where the neighbour vanished. WS4's
+	# `to_write` (newly-added ∪ their neighbours) does NOT cover this when a commit evicts without admitting anything.
+	# This runs on BOTH paths (typed arena is re-sunk either way ⇒ OFF whole-rebuild and ON mirror stay byte-identical).
+	var removed: Array = []
 	for fid in _committed_tiles.keys():
 		if not _tiles.has(fid):
-			_committed_tiles.erase(fid)
+			removed.append(int(fid))
+	for f in removed:
+		_committed_tiles.erase(f)
 	var newly_added: Array = []
 	var added := 0
 	for fid in _tiles.keys():
@@ -1128,6 +1140,12 @@ func _commit() -> void:
 			var nb := FacetAtlas.seam_neighbour(f, slot_dir)
 			if _committed_tiles.has(nb):
 				to_write[nb] = true   # an already-committed neighbour's sink mask may have just changed
+	# P1 #1: every still-committed cardinal neighbour of an EVICTED tile must re-sink the edge that faced it.
+	for f in removed:
+		for slot_dir in [FacetAtlas.S_WEST, FacetAtlas.S_EAST, FacetAtlas.S_SOUTH, FacetAtlas.S_NORTH]:
+			var nb := FacetAtlas.seam_neighbour(f, slot_dir)
+			if _committed_tiles.has(nb):
+				to_write[nb] = true   # surviving neighbour of a gone tile: its former-shared edge is now a frontier
 	for fid in to_write.keys():
 		var f := int(fid)
 		var slot: int = _fid_slot.get(f, -1)

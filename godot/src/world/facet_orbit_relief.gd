@@ -361,6 +361,46 @@ const IDX_PER_TILE := ORBIT_RELIEF_CELLS * ORBIT_RELIEF_CELLS * 6              #
 static func arena_bytes() -> int:
 	return CubeSphere.ORBIT_RELIEF_MAX_TILES * (VERTS_PER_TILE * (12 + 16 + 8 + 8) + IDX_PER_TILE * 4)
 
+## FP_OR_COMMIT_PARTIAL §2.4 — pack N verts' POSITIONS into the vertex-buffer byte layout (pos-only, stride 12: three
+## little-endian f32). PURE/static so verify_orbit_relief's G-OR-PART-PACK can byte-compare it against Godot's OWN
+## add_surface_from_arrays packing directly. Godot packs an uncompressed VERTEX-only surface as a raw f32×3 memcpy
+## per vertex (rendering_server.cpp) — `encode_float`'s little-endian write matches on every target (x86/ARM/WASM LE).
+static func pack_vertex_bytes(pos: PackedVector3Array) -> PackedByteArray:
+	var n := pos.size()
+	var out := PackedByteArray()
+	out.resize(n * 12)
+	for k in range(n):
+		var base := k * 12
+		out.encode_float(base, pos[k].x)
+		out.encode_float(base + 4, pos[k].y)
+		out.encode_float(base + 8, pos[k].z)
+	return out
+
+## FP_OR_COMMIT_PARTIAL §2.4 — pack N verts' COLOR+UV+UV2 into the attribute-buffer byte layout (stride 20: COLOR
+## RGBA8 at 0, UV f32×2 at 4, UV2 f32×2 at 12 — the offsets asserted against `mesh_surface_get_format_offset` at
+## setup, never assumed). PURE/static (G-OR-PART-PACK). The color quantization is the EXACT formula from
+## `RenderingServer::mesh_create_surface_data_from_arrays`'s ARRAY_COLOR case in the pinned 4.4.1 source:
+## `uint8_t(CLAMP(c * 255.0, 0.0, 255.0))` — a C++ truncating cast, which `int(clampf(c*255.0, 0.0, 255.0))`
+## reproduces exactly (clamped ⇒ non-negative ⇒ truncation == the u8 cast, incl. the 0.5×255=127.5→127 boundary).
+## The self-check (§2.7) byte-verifies this rather than trusting it — a future engine bump that changed the pack
+## would flip `_or_partial_ok` false and fall back, never corrupt.
+static func pack_attr_bytes(col: PackedColorArray, uv: PackedVector2Array, uv2: PackedVector2Array) -> PackedByteArray:
+	var n := col.size()
+	var out := PackedByteArray()
+	out.resize(n * 20)
+	for k in range(n):
+		var base := k * 20
+		var c := col[k]
+		out[base + 0] = int(clampf(c.r * 255.0, 0.0, 255.0))
+		out[base + 1] = int(clampf(c.g * 255.0, 0.0, 255.0))
+		out[base + 2] = int(clampf(c.b * 255.0, 0.0, 255.0))
+		out[base + 3] = int(clampf(c.a * 255.0, 0.0, 255.0))
+		out.encode_float(base + 4, uv[k].x)
+		out.encode_float(base + 8, uv[k].y)
+		out.encode_float(base + 12, uv2[k].x)
+		out.encode_float(base + 16, uv2[k].y)
+	return out
+
 # =====================================================================================================================
 # WS3 THE SHADER — G3's OWN material (deliberately NOT `FacetSmoothV2.make_material()`): hardcodes the SAME
 # radial-normal-only law V2's DEFAULT (non-LIT) tail already uses (`n = normalize(wp − centre)`,
@@ -522,6 +562,20 @@ var _committed_tiles: Dictionary = {}   ## fid -> true (already written into the
 var _commit_dirty := false
 var _last_commit_ms := 0
 
+# FP_OR_COMMIT_PARTIAL (docs/COSMOS-ORBIT-RELIEF-COMMIT-DESIGN.md — THE real surface-entry fix): a PERSISTENT surface
+# updated per-changed-slot via RenderingServer region uploads, instead of a whole-arena add_surface_from_arrays every
+# commit (~111 ms WASM). Two packed CPU byte-mirrors pre-pack each slot's bytes at write time so a region upload is a
+# memcpy slice. The static index buffer never changes (eviction collapses VERTICES). All vars are inert with the flag
+# off (never allocated / written) — byte-identical. `_or_partial_ok` gates the whole ON path: the boot self-check
+# (§2.7) sets it, and ANY layout/quant mismatch leaves it false ⇒ verbatim whole-arena rebuild (degrade, not corrupt).
+var _or_partial_ok := false                              ## boot self-check passed AND the persistent surface is built
+var _or_mesh_rid: RID = RID()                            ## cached _mi.mesh.get_rid() for the RS region calls
+var _or_vstride := 0                                     ## bytes/vertex in the vertex buffer (asserted == 12)
+var _or_astride := 0                                     ## bytes/vertex in the attribute buffer (asserted == 20)
+var _arena_vbytes: PackedByteArray = PackedByteArray()   ## packed pos mirror: cap × 1089 × 12 (~5.0 MB, ON only)
+var _arena_abytes: PackedByteArray = PackedByteArray()   ## packed RGBA8+uv+uv2 mirror: cap × 1089 × 20 (~8.4 MB, ON only)
+var _gpu_dirty_slots: Dictionary = {}                    ## slot -> true; slots whose mirror bytes changed since last commit
+
 # FP_WORST_FRAME_ATTR MEASUREMENT-ONLY sub-timing (docs/COSMOS-SURFACE-ENTRY-SPIKE-DESIGN.md): a COMPLETE,
 # NON-OVERLAPPING decomposition of step()'s main-thread cost (µs) so the ~100 ms surface-entry `wf_or_us` burst can
 # be attributed to a single per-op term (col-cache snapshot / height snapshot / tex decode / dispatch / scan / reap /
@@ -561,6 +615,12 @@ func setup_instance(ring: Node3D, active_fid: int, rd: GlobalReliefData) -> void
 	_s_result.resize(_sn)
 	_s_mutex = Mutex.new()
 	_ensure_arena()
+	# FP_OR_COMMIT_PARTIAL: build the ONE persistent surface (all-degenerate, static indices already filled by
+	# _ensure_arena), cache its RID/strides, set the conservative custom_aabb, and run the pack self-check — all ONCE
+	# at boot (behind the splash). Off ⇒ never called; setup byte-identical. Must run after _ensure_arena (indices) and
+	# after `_mi.mesh` exists (assigned just above).
+	if CubeSphere.FP_OR_COMMIT_PARTIAL:
+		_or_build_persistent_surface()
 	_recompute_want(active_fid, true)
 
 ## WS1b: allocate the fixed-size arena (once). Every triangle starts DEGENERATE (all 3 indices point at vertex
@@ -578,6 +638,123 @@ func _ensure_arena() -> void:
 	_slot_fid = PackedInt32Array(); _slot_fid.resize(cap); _slot_fid.fill(-1)
 	_free_arena_slots = range(cap)
 	_arena_ready = true
+	# FP_OR_COMMIT_PARTIAL §2.3/§2.4: fill the STATIC per-slot index pattern for ALL slots (grid pattern +
+	# slot·VERTS_PER_TILE — fid-independent, byte-for-byte what build_tile bakes for whatever tile later lands here;
+	# never touched again — eviction collapses VERTICES to origin, not indices) and allocate the two packed CPU
+	# byte-mirrors (zero-filled by resize — matches the all-zero initial surface). Off ⇒ this block never runs;
+	# `_arena_idx` stays all-degenerate (fill(0) above) and the mirrors stay empty — byte-identical.
+	if CubeSphere.FP_OR_COMMIT_PARTIAL:
+		var base_idx := _grid_indices(ORBIT_RELIEF_CELLS, ORBIT_RELIEF_CELLS + 1)
+		for slot in range(cap):
+			var ib := slot * IDX_PER_TILE
+			var vbase := slot * VERTS_PER_TILE
+			for k in range(IDX_PER_TILE):
+				_arena_idx[ib + k] = base_idx[k] + vbase
+		_arena_vbytes = PackedByteArray(); _arena_vbytes.resize(cap * VERTS_PER_TILE * 12)
+		_arena_abytes = PackedByteArray(); _arena_abytes.resize(cap * VERTS_PER_TILE * 20)
+
+## FP_OR_COMMIT_PARTIAL §2.2/§2.5/§2.7 — the ONE-TIME persistent-surface setup (boot, behind the splash). Uploads
+## the all-degenerate (all-zero-vertex) arena ONCE via the SAME verbatim add_surface_from_arrays the OFF commit uses
+## (static indices already in `_arena_idx`), then caches the surface RID, resolves the vertex/attribute strides from
+## the format oracles, sets a conservative custom_aabb (region updates never recompute it — §2.5), and runs the pack
+## self-check. `_or_partial_ok` is left true ONLY when the layout is exactly the expected pos-only-12B /
+## color+uv+uv2-20B and the hand-pack byte-matches Godot's own — any mismatch degrades every commit to the verbatim
+## whole-arena rebuild (never corruption). Called ONLY under the flag (from setup_instance).
+func _or_build_persistent_surface() -> void:
+	var arr := []
+	arr.resize(Mesh.ARRAY_MAX)
+	arr[Mesh.ARRAY_VERTEX] = _arena_pos
+	arr[Mesh.ARRAY_COLOR] = _arena_col
+	arr[Mesh.ARRAY_TEX_UV] = _arena_uv
+	arr[Mesh.ARRAY_TEX_UV2] = _arena_uv2
+	arr[Mesh.ARRAY_INDEX] = _arena_idx
+	var m := ArrayMesh.new()
+	m.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)
+	# §2.5 conservative AABB centred on origin enclosing the whole shell — the all-degenerate initial surface would
+	# auto-compute a POINT aabb at the origin, and region updates never recompute it ⇒ the tier would cull invisibly.
+	# `r_max·2` is datum + a generous relief margin (relief ≪ datum); an oversize box only makes culling MORE
+	# conservative (never a false hide), a strict superset of the full-rebuild aabb (which always includes the origin
+	# zeroed free-slot verts). Matches "effectively never fully culled from orbit regardless".
+	var r_max := 0.0
+	var nfac := FacetAtlas.facet_count()
+	for fid in range(nfac):
+		r_max = maxf(r_max, FacetAtlas.r_of(fid))
+	var ext := maxf(r_max, 1.0) * 2.0
+	m.custom_aabb = AABB(Vector3(-ext, -ext, -ext), Vector3(2.0 * ext, 2.0 * ext, 2.0 * ext))
+	_mi.mesh = m
+	_or_mesh_rid = m.get_rid()
+	var vcount := _arena_pos.size()
+	var fmt := m.surface_get_format(0)
+	_or_vstride = int(RenderingServer.mesh_surface_get_format_vertex_stride(fmt, vcount))
+	_or_astride = int(RenderingServer.mesh_surface_get_format_attribute_stride(fmt, vcount))
+	var off_col := int(RenderingServer.mesh_surface_get_format_offset(fmt, vcount, Mesh.ARRAY_COLOR))
+	var off_uv := int(RenderingServer.mesh_surface_get_format_offset(fmt, vcount, Mesh.ARRAY_TEX_UV))
+	var off_uv2 := int(RenderingServer.mesh_surface_get_format_offset(fmt, vcount, Mesh.ARRAY_TEX_UV2))
+	var layout_ok := _or_vstride == 12 and _or_astride == 20 and off_col == 0 and off_uv == 4 and off_uv2 == 12
+	var pack_ok := _or_pack_self_check()
+	_or_partial_ok = layout_ok and pack_ok
+	if not _or_partial_ok:
+		push_warning("FacetOrbitRelief.FP_OR_COMMIT_PARTIAL: layout/pack self-check failed (vstride=%d astride=%d off=%d/%d/%d layout_ok=%s pack_ok=%s) — falling back to the verbatim whole-arena rebuild for this session" % [_or_vstride, _or_astride, off_col, off_uv, off_uv2, str(layout_ok), str(pack_ok)])
+
+## FP_OR_COMMIT_PARTIAL §2.7/§4 G-OR-PART-PACK — the pack byte-equality self-check. Hand-pack one synthetic slot's
+## worth of verts (non-trivial colors, incl. the 0.5×255 quant boundary, + varied uv/uv2), build a scratch ArrayMesh
+## from the SAME typed arrays via add_surface_from_arrays, read `mesh_get_surface` back, and byte-compare its
+## vertex_data/attribute_data against the hand-pack. True only on an exact match. (The dummy headless rasterizer
+## retains SurfaceData, so this runs in the gate too; on GLES3/WebGL2 it reads back via glGetBufferSubData once.)
+func _or_pack_self_check() -> bool:
+	var n := VERTS_PER_TILE
+	var pos := PackedVector3Array(); pos.resize(n)
+	var col := PackedColorArray(); col.resize(n)
+	var uv := PackedVector2Array(); uv.resize(n)
+	var uv2 := PackedVector2Array(); uv2.resize(n)
+	for k in range(n):
+		pos[k] = Vector3(float(k) * 0.5 - 3.0, float(k) * -0.25 + 1.0, float(k) * 0.125)
+		# k==127 gives r exactly 127.5/255 → the 0.5×255 truncation boundary; the /255 columns exercise every u8.
+		col[k] = Color(float(k % 256) / 255.0, (127.5 if k == 127 else 64.0) / 255.0, float((k * 7) % 256) / 255.0, 1.0)
+		uv[k] = Vector2(float(k) * 0.0011, 1.0 - float(k) * 0.0007)
+		uv2[k] = Vector2(float(k % 6), 0.0)
+	var vb := pack_vertex_bytes(pos)
+	var ab := pack_attr_bytes(col, uv, uv2)
+	var arr := []
+	arr.resize(Mesh.ARRAY_MAX)
+	arr[Mesh.ARRAY_VERTEX] = pos
+	arr[Mesh.ARRAY_COLOR] = col
+	arr[Mesh.ARRAY_TEX_UV] = uv
+	arr[Mesh.ARRAY_TEX_UV2] = uv2
+	arr[Mesh.ARRAY_INDEX] = _grid_indices(ORBIT_RELIEF_CELLS, ORBIT_RELIEF_CELLS + 1)
+	var sm := ArrayMesh.new()
+	sm.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)
+	var sd = RenderingServer.mesh_get_surface(sm.get_rid(), 0)
+	if typeof(sd) != TYPE_DICTIONARY:
+		return false
+	var vdata: PackedByteArray = sd.get("vertex_data", PackedByteArray())
+	var adata: PackedByteArray = sd.get("attribute_data", PackedByteArray())
+	if vdata.size() != vb.size() or adata.size() != ab.size():
+		return false
+	return vdata == vb and adata == ab
+
+## FP_OR_COMMIT_PARTIAL §2.4 — pack ONE slot's (sink-masked) data into the two CPU byte-mirrors at the slot's byte
+## offset (`slot·VERTS_PER_TILE·stride`). Called from `_write_arena_slot` under the flag, in lockstep with the typed
+## arena write, so a commit's region upload is just a `slice()` memcpy — zero per-vertex work beyond this. Offsets
+## 0/4/12 are the asserted attribute layout (`_or_partial_ok` requires it).
+func _pack_slot_into_mirrors(slot: int, pos: PackedVector3Array, col: PackedColorArray, uv: PackedVector2Array, uv2: PackedVector2Array) -> void:
+	var voff := slot * VERTS_PER_TILE * _or_vstride
+	var aoff := slot * VERTS_PER_TILE * _or_astride
+	for k in range(VERTS_PER_TILE):
+		var vbk := voff + k * _or_vstride
+		_arena_vbytes.encode_float(vbk, pos[k].x)
+		_arena_vbytes.encode_float(vbk + 4, pos[k].y)
+		_arena_vbytes.encode_float(vbk + 8, pos[k].z)
+		var abk := aoff + k * _or_astride
+		var c := col[k]
+		_arena_abytes[abk + 0] = int(clampf(c.r * 255.0, 0.0, 255.0))
+		_arena_abytes[abk + 1] = int(clampf(c.g * 255.0, 0.0, 255.0))
+		_arena_abytes[abk + 2] = int(clampf(c.b * 255.0, 0.0, 255.0))
+		_arena_abytes[abk + 3] = int(clampf(c.a * 255.0, 0.0, 255.0))
+		_arena_abytes.encode_float(abk + 4, uv[k].x)
+		_arena_abytes.encode_float(abk + 8, uv[k].y)
+		_arena_abytes.encode_float(abk + 12, uv2[k].x)
+		_arena_abytes.encode_float(abk + 16, uv2[k].y)
 
 ## Reserve (or return the already-reserved) arena slot for `fid`. -1 if the arena is momentarily full (a
 ## transient dwell-eviction overlap, not a hard error — the caller's dispatch loop simply waits for a later
@@ -605,6 +782,19 @@ func _free_arena_slot(fid: int) -> void:
 	_free_arena_slots.append(slot)
 
 func _degenerate_slot(slot: int) -> void:
+	# FP_OR_COMMIT_PARTIAL §2.3: the index buffer is STATIC (no index-region API) — collapse the slot's VERTICES to
+	# the origin instead (all triangles become zero-area ⇒ rasterize nothing, exactly like index-degeneration) and
+	# zero its position byte-mirror + mark it GPU-dirty so the next off-surface commit uploads the zeroed region.
+	# Indices stay untouched. Off ⇒ the verbatim index-collapse below (byte-identical).
+	if CubeSphere.FP_OR_COMMIT_PARTIAL and _or_partial_ok:
+		var vb := slot * VERTS_PER_TILE
+		for k in range(VERTS_PER_TILE):
+			_arena_pos[vb + k] = Vector3.ZERO
+		var vo := slot * VERTS_PER_TILE * _or_vstride
+		for bi in range(VERTS_PER_TILE * _or_vstride):
+			_arena_vbytes[vo + bi] = 0
+		_gpu_dirty_slots[slot] = true
+		return
 	var vbase := slot * VERTS_PER_TILE
 	var ibase := slot * IDX_PER_TILE
 	for k in range(IDX_PER_TILE):
@@ -945,16 +1135,33 @@ func _commit() -> void:
 			continue
 		var mask := edge_sink_mask(f, _committed_tiles)
 		_write_arena_slot(slot, _tiles[f], mask)
-	var arr := []
-	arr.resize(Mesh.ARRAY_MAX)
-	arr[Mesh.ARRAY_VERTEX] = _arena_pos
-	arr[Mesh.ARRAY_COLOR] = _arena_col
-	arr[Mesh.ARRAY_TEX_UV] = _arena_uv
-	arr[Mesh.ARRAY_TEX_UV2] = _arena_uv2
-	arr[Mesh.ARRAY_INDEX] = _arena_idx
-	var m := ArrayMesh.new()
-	m.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)
-	_mi.mesh = m
+	if not CubeSphere.FP_OR_COMMIT_PARTIAL or not _or_partial_ok:
+		# (4) VERBATIM whole-arena rebuild — the byte-off path AND the §2.7 self-check fallback (degrade, not corrupt).
+		var arr := []
+		arr.resize(Mesh.ARRAY_MAX)
+		arr[Mesh.ARRAY_VERTEX] = _arena_pos
+		arr[Mesh.ARRAY_COLOR] = _arena_col
+		arr[Mesh.ARRAY_TEX_UV] = _arena_uv
+		arr[Mesh.ARRAY_TEX_UV2] = _arena_uv2
+		arr[Mesh.ARRAY_INDEX] = _arena_idx
+		var m := ArrayMesh.new()
+		m.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)
+		_mi.mesh = m
+	else:
+		# FP_OR_COMMIT_PARTIAL (4') O(changed slots): flush every GPU-dirty slot as two glBufferSubData-backed region
+		# uploads (the per-slot mirror bytes, pre-packed by _write_arena_slot / zeroed by _degenerate_slot). The
+		# persistent surface + static index buffer already exist (built once at setup) — NO whole-arena re-pack, no
+		# per-commit pack/alloc/AABB-scan, no full re-upload. All calls stay MAIN-thread (queued to the render side
+		# identically to the OFF mesh assign).
+		var vlen := VERTS_PER_TILE * _or_vstride
+		var alen := VERTS_PER_TILE * _or_astride
+		for dslot in _gpu_dirty_slots.keys():
+			var s := int(dslot)
+			var voff := s * vlen
+			var aoff := s * alen
+			RenderingServer.mesh_surface_update_vertex_region(_or_mesh_rid, 0, voff, _arena_vbytes.slice(voff, voff + vlen))
+			RenderingServer.mesh_surface_update_attribute_region(_or_mesh_rid, 0, aoff, _arena_abytes.slice(aoff, aoff + alen))
+		_gpu_dirty_slots.clear()
 	_commit_dirty = _committed_tiles.size() != _tiles.size()
 
 ## Write ONE tile's (sink-masked) data into its reserved arena slot. `tile["idx"]` is already offset by this
@@ -975,13 +1182,29 @@ func _write_arena_slot(slot: int, tile: Dictionary, sink_edges: int) -> void:
 		_arena_col[vbase + k] = tcol[k]
 		_arena_uv[vbase + k] = tuv[k]
 		_arena_uv2[vbase + k] = tuv2[k]
-	for k in range(IDX_PER_TILE):
-		_arena_idx[ibase + k] = tidx[k]
+	# FP_OR_COMMIT_PARTIAL §2.3/§2.4: the static index buffer already holds this slot's pattern (identical to
+	# `tile["idx"]` = grid + slot·VERTS_PER_TILE) and never changes — SKIP the 6144-iteration index copy, and instead
+	# pack this slot's sunk positions + attributes into the CPU byte-mirrors and mark it GPU-dirty. Off ⇒ the verbatim
+	# index copy below (byte-identical); the mirror path is dead.
+	if CubeSphere.FP_OR_COMMIT_PARTIAL and _or_partial_ok:
+		_pack_slot_into_mirrors(slot, spos, tcol, tuv, tuv2)
+		_gpu_dirty_slots[slot] = true
+	else:
+		for k in range(IDX_PER_TILE):
+			_arena_idx[ibase + k] = tidx[k]
 
 ## NEVER-OOM telemetry: the arena's FIXED resident byte cost (allocated once at full capacity, §`arena_bytes`)
 ## — 0 until `setup_instance` has run.
 func resident_bytes() -> int:
-	return arena_bytes() if _arena_ready else 0
+	if not _arena_ready:
+		return 0
+	# FP_OR_COMMIT_PARTIAL adds the two packed CPU byte-mirrors (~13.4 MB) to the resident ledger — but REMOVES the
+	# recurring per-commit 22.8 MB transient (old mesh + fresh whole-arena pack), so steady-state heap improves. Off ⇒
+	# the mirrors are empty (never allocated) and this is `arena_bytes()` verbatim.
+	var b := arena_bytes()
+	if CubeSphere.FP_OR_COMMIT_PARTIAL and _or_partial_ok:
+		b += _arena_vbytes.size() + _arena_abytes.size()
+	return b
 
 ## How many facets are ACTUALLY drawn right now (not merely built/queued — `_tiles.size()` for that).
 func tile_count() -> int:

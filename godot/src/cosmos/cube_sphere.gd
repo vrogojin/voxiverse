@@ -1118,6 +1118,28 @@ const OR_FLIP_DISPATCH_MAX := 3      # max tiles dispatched per step under the f
 ## verify_orbit_relief.gd (G-OR-WDEC: round-trip + degrade + tile byte-equality + structural no-off-thread-read scans).
 const FP_OR_WORKER_DECODE := false
 
+## FP_OR_COMMIT_PARTIAL (docs/COSMOS-ORBIT-RELIEF-COMMIT-DESIGN.md — the surface-entry PRIMARY, THE real orbit-relief
+## fix). `FacetOrbitRelief._commit()` rebuilds the WHOLE fixed 384-tile arena into a fresh ArrayMesh via
+## add_surface_from_arrays + full GPU re-upload EVERY commit — O(MAX_TILES) regardless of how few slots changed
+## (measured wf_or_commit_us=111,220µs = the entire surface-entry residual; ~22.8 MB of fresh WASM dlmalloc buffers
+## packed + a full re-upload + AABB scan + a 2× transient). This flag replaces it with a PERSISTENT surface built
+## ONCE at boot (behind the splash) + per-changed-slot `RenderingServer.mesh_surface_update_vertex_region` /
+## `..._attribute_region` uploads (glBufferSubData-backed, core WebGL2): per-commit cost becomes O(changed slots)
+## — a few ms typical, the 111 ms burst gone from the flip. The index buffer is STATIC (no index-region API; the
+## per-slot grid pattern is fid-independent, filled once — eviction collapses VERTICES to origin, not indices); a
+## conservative custom_aabb is set ONCE (region updates never recompute it — without it the all-zero initial
+## surface culls to a point = silent blank); two packed CPU byte-mirrors (`_arena_vbytes` pos 12B/vert +
+## `_arena_abytes` RGBA8+uv+uv2 20B/vert) are written in the same per-slot loop as `_write_arena_slot` and uploaded
+## as a memcpy slice. A boot self-check byte-compares one hand-packed slot against Godot's OWN
+## add_surface_from_arrays packing (guards the u8 color-quant match + layout on any exotic driver) → on ANY mismatch
+## `_or_partial_ok=false` and every commit takes the verbatim whole-arena rebuild (degrade, never corrupt). The
+## RENDERED result is byte-identical to the full rebuild (same committed tiles/verts/colors/uvs/sink masks). All
+## RenderingServer calls stay MAIN-thread (workers still only produce tile dicts). Off ⇒ `_commit()` is the verbatim
+## whole-arena add_surface_from_arrays, no persistent surface / mirrors / RS-region work, setup unchanged —
+## byte-identical (FLAT verify_feature.gd 6042/0). Gate: verify_orbit_relief.gd (G-OR-PART-PACK/EQ/DEGEN +
+## G-OR-COMMIT-COST extension).
+const FP_OR_COMMIT_PARTIAL := false
+
 ## FP_ORBIT_RELIEF_SURFACE_HIDE (docs/COSMOS-FAR-NEAR-COVERAGE-DESIGN.md §3.1 — kills the far-over-near mountain
 ## protrusion) — G3's on-surface SUSPEND (`FacetOrbitRelief.step()` WS1a) freezes recompute/commit below
 ## OFFSURFACE_Y but leaves the last committed mesh VISIBLE and UN-SUNK at its coarse 13-block DEM pitch, so on a

@@ -92,6 +92,10 @@ func _initialize() -> void:
 		_gate_commit_cost()
 		_gate_suspend()
 		_gate_wdec()
+		if CubeSphere.FP_OR_COMMIT_PARTIAL:
+			_gate_part_pack()
+			_gate_part_eq()
+			_gate_part_degen()
 	else:
 		_ok(true, "G-OR-DATA-EQ/BYTES/WELD/SEAM/COMMIT-COST/SUSPEND: skipped this run (needs FP_ORBIT_RELIEF + FP_GLOBAL_RELIEF_DATA both sed-toggled true)")
 
@@ -705,7 +709,24 @@ func _gate_commit_cost() -> void:
 			_ok(body.find("merge_tiles") == -1, "G-OR-COMMIT-COST: _commit()'s body never calls FacetSmoothV2.merge_tiles (WS1b — no whole-set re-merge)")
 			_ok(body.find("SurfaceTool") == -1, "G-OR-COMMIT-COST: _commit()'s body never references SurfaceTool")
 			_ok(body.find("generate_normals") == -1, "G-OR-COMMIT-COST: _commit()'s body never calls generate_normals")
-			_ok(body.find("add_surface_from_arrays") != -1, "G-OR-COMMIT-COST: _commit() still commits via the SAFE high-level add_surface_from_arrays API")
+			_ok(body.find("add_surface_from_arrays") != -1, "G-OR-COMMIT-COST: _commit() still commits via the SAFE high-level add_surface_from_arrays API (the byte-off / fallback whole-arena rebuild branch)")
+			# G-OR-COMMIT-COST extension (FP_OR_COMMIT_PARTIAL §4): the ON-branch (the `else:` under the
+			# `if not ... or not _or_partial_ok:` guard) does its GPU work with per-slot region updates and NEVER
+			# calls add_surface_from_arrays — the token that would betray a whole-arena re-pack sneaking into the
+			# partial path. Extract the else-branch by finding the guard line then taking lines up to the next
+			# dedent-to-`_commit_dirty` tail.
+			var guard := body.find("if not CubeSphere.FP_OR_COMMIT_PARTIAL or not _or_partial_ok:")
+			_ok(guard >= 0, "G-OR-COMMIT-COST: found the _commit() partial/fallback branch guard")
+			if guard >= 0:
+				var else_at := body.find("\n\telse:", guard)
+				var tail_at := body.find("\n\t_commit_dirty =", guard)
+				_ok(else_at >= 0 and tail_at > else_at, "G-OR-COMMIT-COST: found the _commit() ON-branch (else:) and its tail")
+				if else_at >= 0 and tail_at > else_at:
+					var on_branch := body.substr(else_at, tail_at - else_at)
+					_ok(on_branch.find("mesh_surface_update_vertex_region") != -1 and on_branch.find("mesh_surface_update_attribute_region") != -1,
+						"G-OR-COMMIT-COST: the ON commit path uploads via RenderingServer.mesh_surface_update_{vertex,attribute}_region (O(changed slots))")
+					_ok(on_branch.find("add_surface_from_arrays") == -1,
+						"G-OR-COMMIT-COST: the ON commit path NEVER calls add_surface_from_arrays (no whole-arena re-pack in the partial path)")
 
 	# The batch cap: mark the WHOLE 384-tile want-set as already BUILT (bypassing real dispatch — this gate only
 	# needs to prove the COMMIT-time batching, not re-prove dispatch pacing, already covered by the dispatch test
@@ -775,5 +796,210 @@ func _gate_suspend() -> void:
 	_force_offsurface(ring)
 	relief.step()
 	_ok(not relief._want.is_empty(), "G-OR-SUSPEND: the FIRST off-surface step() recomputes a real want-set (resumes normal operation)")
+
+	ring.free()
+
+# --- G-OR-PART-PACK (FP_OR_COMMIT_PARTIAL §2.7/§4): the CPU byte-pack byte-equals Godot's OWN mesh packing -----------
+func _gate_part_pack() -> void:
+	var n := FOR_.VERTS_PER_TILE
+	var pos := PackedVector3Array(); pos.resize(n)
+	var col := PackedColorArray(); col.resize(n)
+	var uv := PackedVector2Array(); uv.resize(n)
+	var uv2 := PackedVector2Array(); uv2.resize(n)
+	for k in range(n):
+		pos[k] = Vector3(float(k) * 0.5 - 3.0, float(k) * -0.25 + 1.0, float(k) * 0.125)
+		# k==127 → g == 127.5/255, the exact 0.5×255 truncation boundary the u8 quant must round DOWN (→127).
+		col[k] = Color(float(k % 256) / 255.0, (127.5 if k == 127 else 64.0) / 255.0, float((k * 7) % 256) / 255.0, 1.0)
+		uv[k] = Vector2(float(k) * 0.0011, 1.0 - float(k) * 0.0007)
+		uv2[k] = Vector2(float(k % 6), 0.0)
+	var vb := FOR_.pack_vertex_bytes(pos)
+	var ab := FOR_.pack_attr_bytes(col, uv, uv2)
+
+	# Build a scratch mesh through the SAME add_surface_from_arrays the OFF commit uses, read the packed buffers back.
+	var arr := []
+	arr.resize(Mesh.ARRAY_MAX)
+	arr[Mesh.ARRAY_VERTEX] = pos
+	arr[Mesh.ARRAY_COLOR] = col
+	arr[Mesh.ARRAY_TEX_UV] = uv
+	arr[Mesh.ARRAY_TEX_UV2] = uv2
+	arr[Mesh.ARRAY_INDEX] = FOR_._grid_indices(FOR_.ORBIT_RELIEF_CELLS, FOR_.ORBIT_RELIEF_CELLS + 1)
+	var sm := ArrayMesh.new()
+	sm.add_surface_from_arrays(Mesh.PRIMITIVE_TRIANGLES, arr)
+
+	# The stride/offset oracles must agree with the §2.4 table (pos-only 12B; RGBA8@0 + uv@4 + uv2@12, stride 20).
+	var vcount := n
+	var fmt := sm.surface_get_format(0)
+	var vstride := int(RenderingServer.mesh_surface_get_format_vertex_stride(fmt, vcount))
+	var astride := int(RenderingServer.mesh_surface_get_format_attribute_stride(fmt, vcount))
+	var off_col := int(RenderingServer.mesh_surface_get_format_offset(fmt, vcount, Mesh.ARRAY_COLOR))
+	var off_uv := int(RenderingServer.mesh_surface_get_format_offset(fmt, vcount, Mesh.ARRAY_TEX_UV))
+	var off_uv2 := int(RenderingServer.mesh_surface_get_format_offset(fmt, vcount, Mesh.ARRAY_TEX_UV2))
+	_ok(vstride == 12 and astride == 20, "G-OR-PART-PACK: strides are pos-only 12B / attr 20B (got %d / %d)" % [vstride, astride])
+	_ok(off_col == 0 and off_uv == 4 and off_uv2 == 12, "G-OR-PART-PACK: attribute offsets are COLOR@0 UV@4 UV2@12 (got %d/%d/%d)" % [off_col, off_uv, off_uv2])
+
+	var sd = RenderingServer.mesh_get_surface(sm.get_rid(), 0)
+	_ok(typeof(sd) == TYPE_DICTIONARY, "G-OR-PART-PACK: mesh_get_surface returns SurfaceData (dummy rasterizer retains it)")
+	var vdata: PackedByteArray = sd.get("vertex_data", PackedByteArray())
+	var adata: PackedByteArray = sd.get("attribute_data", PackedByteArray())
+	_ok(vdata.size() == vb.size() and adata.size() == ab.size(),
+		"G-OR-PART-PACK: readback buffer sizes match the hand-pack (v %d==%d, a %d==%d)" % [vdata.size(), vb.size(), adata.size(), ab.size()])
+	_ok(vdata == vb, "G-OR-PART-PACK: hand-packed vertex bytes byte-equal Godot's own add_surface_from_arrays packing")
+	_ok(adata == ab, "G-OR-PART-PACK: hand-packed attribute bytes (RGBA8 quant + uv/uv2) byte-equal Godot's own packing")
+
+	# Falsifier: perturb ONE packed byte ⇒ the compare fails at exactly that byte, nowhere else.
+	var ab_bad := ab.duplicate()
+	ab_bad[43] = ab_bad[43] ^ 0xFF
+	var first_diff := -1
+	for i in range(ab_bad.size()):
+		if ab_bad[i] != adata[i]:
+			first_diff = i
+			break
+	_ok(ab_bad != adata and first_diff == 43, "G-OR-PART-PACK: one-byte-perturb falsifier — the compare diverges at exactly byte 43 (got %d) — not vacuous" % first_diff)
+
+# --- G-OR-PART-EQ (FP_OR_COMMIT_PARTIAL §4): the ON region-path render is byte-identical to the OFF whole rebuild ----
+func _pv3_slice_eq(a: PackedVector3Array, b: PackedVector3Array, lo: int, hi: int) -> bool:
+	for k in range(lo, hi):
+		if a[k] != b[k]:
+			return false
+	return true
+
+func _admit_both(on: FacetOrbitRelief, off: FacetOrbitRelief, fid: int, rd: GlobalReliefData) -> void:
+	# Admit `fid` to BOTH arms with the SAME arena slot (both free-stacks pop in lockstep) + mark dirty.
+	var slot_on := on._alloc_arena_slot(fid)
+	var slot_off := off._alloc_arena_slot(fid)
+	_ok(slot_on == slot_off, "G-OR-PART-EQ: arms allocate fid %d the SAME arena slot (%d==%d)" % [fid, slot_on, slot_off])
+	on._want[fid] = true
+	off._want[fid] = true
+	on._tiles[fid] = _bt(fid, rd.height_grid(fid), PackedColorArray(), slot_on * FOR_.VERTS_PER_TILE)
+	off._tiles[fid] = _bt(fid, rd.height_grid(fid), PackedColorArray(), slot_off * FOR_.VERTS_PER_TILE)
+	on._commit_dirty = true
+	off._commit_dirty = true
+
+func _compare_arms(on: FacetOrbitRelief, off: FacetOrbitRelief, label: String) -> void:
+	# OFF arm's freshly-rebuilt whole-arena readback — the ground-truth packed bytes.
+	var sd = RenderingServer.mesh_get_surface(off._mi.mesh.get_rid(), 0)
+	var off_vdata: PackedByteArray = sd.get("vertex_data", PackedByteArray()) if typeof(sd) == TYPE_DICTIONARY else PackedByteArray()
+	var off_adata: PackedByteArray = sd.get("attribute_data", PackedByteArray()) if typeof(sd) == TYPE_DICTIONARY else PackedByteArray()
+	var vpt := FOR_.VERTS_PER_TILE
+	var ipt := FOR_.IDX_PER_TILE
+	var vlen := vpt * on._or_vstride
+	var alen := vpt * on._or_astride
+	var all_typed_eq := true
+	var all_idx_eq := true
+	var all_bytes_eq := true
+	var checked := 0
+	for fid in on._committed_tiles.keys():
+		var f := int(fid)
+		if not off._committed_tiles.has(f):
+			all_typed_eq = false
+			continue
+		var slot: int = on._fid_slot[f]
+		_ok(off._fid_slot.get(f, -1) == slot, "G-OR-PART-EQ[%s]: committed fid %d shares slot %d across arms" % [label, f, slot])
+		var vlo := slot * vpt
+		var vhi := vlo + vpt
+		# (a) typed arena (pos/col/uv/uv2) byte-equal across arms.
+		if not (_pv3_slice_eq(on._arena_pos, off._arena_pos, vlo, vhi) \
+			and on._arena_col.slice(vlo, vhi) == off._arena_col.slice(vlo, vhi) \
+			and on._arena_uv.slice(vlo, vhi) == off._arena_uv.slice(vlo, vhi) \
+			and on._arena_uv2.slice(vlo, vhi) == off._arena_uv2.slice(vlo, vhi)):
+			all_typed_eq = false
+		# ON's static idx == OFF's built idx at this slot.
+		var ilo := slot * ipt
+		if on._arena_idx.slice(ilo, ilo + ipt) != off._arena_idx.slice(ilo, ilo + ipt):
+			all_idx_eq = false
+		# (b) ON's mirror region bytes == OFF's mesh_get_surface packed bytes at the same slot offset.
+		var voff := slot * vlen
+		var aoff := slot * alen
+		if on._arena_vbytes.slice(voff, voff + vlen) != off_vdata.slice(voff, voff + vlen):
+			all_bytes_eq = false
+		if on._arena_abytes.slice(aoff, aoff + alen) != off_adata.slice(aoff, aoff + alen):
+			all_bytes_eq = false
+		checked += 1
+	_ok(checked > 0, "G-OR-PART-EQ[%s]: at least one committed fid compared (%d)" % [label, checked])
+	_ok(all_typed_eq, "G-OR-PART-EQ[%s]: every committed slot's typed arena (pos/col/uv/uv2) is byte-equal across the OFF and ON arms" % label)
+	_ok(all_idx_eq, "G-OR-PART-EQ[%s]: ON's STATIC index buffer equals OFF's built idx at every committed slot" % label)
+	_ok(all_bytes_eq, "G-OR-PART-EQ[%s]: ON's mirror region bytes byte-equal OFF's whole-rebuild packed vertex/attribute data at every committed slot (RENDER byte-identical)" % label)
+
+func _gate_part_eq() -> void:
+	var fid_a := 12
+	var fid_b := FA.seam_neighbour(fid_a, FA.S_EAST)
+	_ok(fid_b >= 0, "G-OR-PART-EQ: fixture — facet %d has a real EAST neighbour" % fid_a)
+	if fid_b < 0:
+		return
+	var rd := GlobalReliefData.new()
+	rd.setup()
+	rd.bake_facet(fid_a)
+	rd.bake_facet(fid_b)
+
+	var ring_on := FacetFarRing.new(); ring_on._active_fid = fid_a; _force_offsurface(ring_on)
+	var ring_off := FacetFarRing.new(); ring_off._active_fid = fid_a; _force_offsurface(ring_off)
+	var on := FacetOrbitRelief.new(); on.setup_instance(ring_on, fid_a, rd)
+	var off := FacetOrbitRelief.new(); off.setup_instance(ring_off, fid_a, rd)
+	_ok(on._or_partial_ok, "G-OR-PART-EQ: the ON arm's boot self-check passed (partial path armed)")
+	off._or_partial_ok = false   # force the OFF arm onto the verbatim whole-arena rebuild every commit
+
+	# Sequence: commit A alone → admit+commit B (adjacent, flips A's EAST sink mask) → evict A → re-admit+commit A.
+	_admit_both(on, off, fid_a, rd)
+	on._commit(); off._commit()
+	_compare_arms(on, off, "A-alone")
+
+	_admit_both(on, off, fid_b, rd)
+	on._commit(); off._commit()
+	_compare_arms(on, off, "A+B (seam-heal)")
+
+	# Eviction of A on BOTH arms (ON: vertex-collapse + mirror-zero; OFF: index-collapse), then re-admit + commit.
+	on._committed_tiles.erase(fid_a); on._tiles.erase(fid_a); on._want.erase(fid_a); on._free_arena_slot(fid_a)
+	off._committed_tiles.erase(fid_a); off._tiles.erase(fid_a); off._want.erase(fid_a); off._free_arena_slot(fid_a)
+	on._commit_dirty = true; off._commit_dirty = true
+	on._commit(); off._commit()
+	_admit_both(on, off, fid_a, rd)
+	on._commit(); off._commit()
+	# B is committed here; A may need a second capped commit if the batch cap bit (it won't at 2 tiles) — converge.
+	var guard := 0
+	while (on._commit_dirty or off._commit_dirty) and guard < 8:
+		on._commit(); off._commit(); guard += 1
+	_compare_arms(on, off, "re-admit-A")
+
+	ring_on.free()
+	ring_off.free()
+
+# --- G-OR-PART-DEGEN (FP_OR_COMMIT_PARTIAL §2.3/§4): an evicted slot collapses to zero-area, mirror all-zero ---------
+func _gate_part_degen() -> void:
+	var fid := 12
+	var rd := GlobalReliefData.new()
+	rd.setup()
+	rd.bake_facet(fid)
+	var ring := FacetFarRing.new(); ring._active_fid = fid; _force_offsurface(ring)
+	var relief := FacetOrbitRelief.new(); relief.setup_instance(ring, fid, rd)
+	_ok(relief._or_partial_ok, "G-OR-PART-DEGEN: the partial path is armed (self-check passed)")
+
+	relief._want[fid] = true
+	var slot: int = relief._alloc_arena_slot(fid)
+	relief._tiles[fid] = _bt(fid, rd.height_grid(fid), PackedColorArray(), slot * FOR_.VERTS_PER_TILE)
+	relief._commit_dirty = true
+	relief._commit()
+	_ok(relief._committed_tiles.has(fid), "G-OR-PART-DEGEN: fixture — fid committed into slot %d" % slot)
+
+	# Evict → _free_arena_slot → _degenerate_slot (ON: collapses VERTICES + zeroes the mirror + marks dirty).
+	relief._committed_tiles.erase(fid); relief._tiles.erase(fid); relief._want.erase(fid)
+	relief._free_arena_slot(fid)
+
+	var vpt := FOR_.VERTS_PER_TILE
+	var vlo := slot * vpt
+	var pos_zero := true
+	for k in range(vlo, vlo + vpt):
+		if relief._arena_pos[k] != Vector3.ZERO:
+			pos_zero = false
+			break
+	_ok(pos_zero, "G-OR-PART-DEGEN: the evicted slot's typed positions are ALL collapsed to origin (every triangle zero-area)")
+	var voff := slot * vpt * relief._or_vstride
+	var mirror_zero := true
+	for b in range(voff, voff + vpt * relief._or_vstride):
+		if relief._arena_vbytes[b] != 0:
+			mirror_zero = false
+			break
+	_ok(mirror_zero, "G-OR-PART-DEGEN: the evicted slot's position byte-mirror region is ALL zero (uploads a zero-area region)")
+	_ok(relief._gpu_dirty_slots.has(slot), "G-OR-PART-DEGEN: the evicted slot is marked GPU-dirty (uploaded on the next commit)")
+	_ok(not relief._fid_slot.has(fid) and relief._slot_fid[slot] == -1, "G-OR-PART-DEGEN: the slot is released — in no committed fid's mapping")
 
 	ring.free()

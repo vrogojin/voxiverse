@@ -1085,6 +1085,26 @@ const ORBIT_RELIEF_COMMIT_MS := 500          # min ms between commits (array-con
 const ORBIT_RELIEF_COMMIT_TILES := 24        # max NEW tiles folded into the live mesh per commit (bounds the upload too)
 const ORBIT_RELIEF_FALLBACK_REACH_RAD := 0.7853981633974483   # deg_to_rad(45.0): on-surface/no-horizon-yet angular reach
 
+## FP_OR_FLIP_STAGE (docs/COSMOS-SURFACE-ENTRY-SPIKE-DESIGN.md — the surface-entry SECONDARY, orbit-relief tier).
+## The surface-entry up-crossing (alt OFFSURFACE_Y, offsurf false→true) unfreezes `FacetOrbitRelief.step()` after a
+## long on-surface freeze that left the axis-drift throttle stale, so the throttled `_recompute_want` always runs a
+## FULL want-set scan in ONE frame — a scan-dominated ~15-35ms WASM burst (measured 1.15ms native scan / 0.14ms
+## sort over all 3456 facets, ×WASM). This flag AMORTISES that scan across frames (`_recompute_want_staged`): the
+## scan runs under a per-step `OR_FLIP_STAGE_US` time box (polled once per `OR_FLIP_STAGE_CHUNK` facets), the OLD
+## want-set keeps serving until the scan completes (frozen resident mesh stays drawn — no hole, no coverage change),
+## and the finish-frame sort/truncate/publish is byte-identical to the synchronous `_recompute_want`. It ALSO caps
+## per-step dispatch at `OR_FLIP_DISPATCH_MAX` so a post-publish burst of newly-wanted facets can't fire all `_sn`
+## height_grid-cache-miss snapshots on one frame. CONVERGENCE: the scan advances ≥ one CHUNK per step ⇒ finishes in
+## ≤ ceil(3456/CHUNK) steps, then the existing `_sn`/dispatch-cap loop fills every wanted tile — no livelock, no
+## permanent hole. Only the THROTTLED (force=false) step path is staged — init and facet-crossing force-recomputes
+## stay synchronous (verbatim). Off ⇒ `step()` calls the verbatim synchronous `_recompute_want`, the dispatch cap is
+## never checked, and none of the `_or_stage_*` state is written — byte-identical. Gate: verify_orbit_relief.gd
+## (G-OR-SUSPEND unchanged: staging lives entirely on the off-surface path, after the on-surface early-return).
+const FP_OR_FLIP_STAGE := false
+const OR_FLIP_STAGE_US := 3000       # per-step µs time box for the staged want-set scan (native scans all in 1 frame; WASM spreads over ~7)
+const OR_FLIP_STAGE_CHUNK := 128     # facets scanned between time-box polls (amortises the clock read; also the min advance/step ⇒ termination bound)
+const OR_FLIP_DISPATCH_MAX := 3      # max tiles dispatched per step under the flag (spreads the post-publish snapshot burst; still `_sn`-bounded)
+
 ## FP_ORBIT_RELIEF_SURFACE_HIDE (docs/COSMOS-FAR-NEAR-COVERAGE-DESIGN.md §3.1 — kills the far-over-near mountain
 ## protrusion) — G3's on-surface SUSPEND (`FacetOrbitRelief.step()` WS1a) freezes recompute/commit below
 ## OFFSURFACE_Y but leaves the last committed mesh VISIBLE and UN-SUNK at its coarse 13-block DEM pitch, so on a

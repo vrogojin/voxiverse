@@ -470,6 +470,23 @@ var _leaving: Dictionary = {}         ## fid -> dwell steps remaining before evi
 
 var _last_axis_recompute_ms := 0
 
+# FP_OR_FLIP_STAGE (docs/COSMOS-SURFACE-ENTRY-SPIKE-DESIGN.md — the surface-entry SECONDARY, orbit-relief tier):
+# the surface-entry up-crossing (offsurf false→true) unfreezes step() and runs a FULL `_recompute_want` in ONE
+# frame after a long on-surface freeze left `_last_axis_recompute_ms` stale (throttle always passes) — a
+# scan-dominated ~15-35ms WASM burst (`want_set` scans every facet: measured 1.15ms native scan / 0.14ms sort,
+# ×WASM). This state AMORTISES that scan across frames: only the THROTTLED (force=false) step-driven recompute is
+# staged — the force=true paths (init/`set_active` crossing) stay verbatim (synchronous). While a stage runs the
+# OLD `_want`/`_want_order` keep serving (the frozen resident set stays drawn — no hole), and when the scan
+# completes the sort/truncate/publish is byte-identical to `_recompute_want`. All vars inert with the flag off.
+var _or_stage_active := false                 ## a staged want-set scan is in progress
+var _or_stage_i := 0                           ## next facet index into the scan
+var _or_stage_axis := Vector3.ZERO             ## frozen emit axis for THIS scan (snapshotted at stage start)
+var _or_stage_theta_h := 0.0                   ## frozen horizon angle for THIS scan
+var _or_stage_reach := 0.0                     ## frozen angular reach (theta_h, or the fallback if none)
+var _or_stage_active_fid := -1                 ## the active fid this scan was seeded for
+var _or_stage_excluded: Dictionary = {}        ## active fid + its V2 hop footprint (computed once at stage start)
+var _or_stage_picked: Array = []               ## accumulating [priority, fid] pairs (sorted+truncated at finish)
+
 # worker slots (single-writer of _s_fid/_s_task on main pre-dispatch; the worker writes only _s_result[i] under the mutex)
 var _sn := 0
 var _s_fid: PackedInt32Array = PackedInt32Array()
@@ -582,6 +599,11 @@ func _recompute_want(active: int, force: bool) -> void:
 	if not force and now_ms - _last_axis_recompute_ms < CubeSphere.ORBIT_RELIEF_AXIS_MS:
 		return
 	_last_axis_recompute_ms = now_ms
+	# FP_OR_FLIP_STAGE: a synchronous force-recompute (a facet crossing via set_active, or init) supersedes any
+	# in-progress staged scan — cancel it so its stale-input publish can never clobber the fresh want-set below.
+	# Gated by the flag so this function stays byte-identical when off (a stage is never started ⇒ nothing to cancel).
+	if CubeSphere.FP_OR_FLIP_STAGE:
+		_or_stage_active = false
 	var ring := _ring as FacetFarRing
 	var axis_a: Array = ring.shell_emit_axis()
 	var axis := Vector3(axis_a[0], axis_a[1], axis_a[2]) if axis_a.size() == 3 and (axis_a[0] != 0.0 or axis_a[1] != 0.0 or axis_a[2] != 0.0) else centre_dir_cached(active)
@@ -603,6 +625,82 @@ func _recompute_want(active: int, force: bool) -> void:
 			_leaving[fid] = EVICT_DWELL_STEPS
 	_want = new_want
 	_want_order = order
+
+## FP_OR_FLIP_STAGE — the surface-entry SECONDARY (docs/COSMOS-SURFACE-ENTRY-SPIKE-DESIGN.md). The AMORTISED twin
+## of `_recompute_want`'s throttled (force=false) path: instead of scanning every facet + sorting in ONE frame
+## (the ~15-35ms WASM up-crossing burst), spread the scan across frames under a `OR_FLIP_STAGE_US` per-step time
+## box, publishing the SAME sort/truncate result only once the whole facet set has been scanned. While a stage is
+## in flight the OLD `_want`/`_want_order` keep serving unchanged (frozen resident mesh stays drawn — no hole);
+## dispatch/eviction/commit downstream see no change until the atomic publish at the end. CONVERGENCE: the inner
+## scan always advances ≥ one `OR_FLIP_STAGE_CHUNK` per call (the time box is only checked AFTER a full chunk), so
+## `_or_stage_i` reaches `facet_count()` in ≤ ceil(n/CHUNK) steps → deterministic finish, never a livelock. A
+## crossing / init mid-stage force-recompute (`_recompute_want`) cancels the stale stage (`_or_stage_active=false`
+## there) before publishing its own fresh set. Only ever called under the flag (step()'s else keeps the verbatim
+## synchronous `_recompute_want(_active_fid, false)`), so it is dead code with the flag off — byte-identical.
+func _recompute_want_staged(active: int) -> void:
+	if not _or_stage_active:
+		# Start a new stage only when the SAME axis-drift throttle the sync path uses has elapsed (crossings force
+		# a sync recompute via set_active, never this path). Stamp the timestamp at stage START (mirrors sync).
+		var now_ms := Time.get_ticks_msec()
+		if now_ms - _last_axis_recompute_ms < CubeSphere.ORBIT_RELIEF_AXIS_MS:
+			return
+		_last_axis_recompute_ms = now_ms
+		var ring := _ring as FacetFarRing
+		var axis_a: Array = ring.shell_emit_axis()
+		_or_stage_axis = Vector3(axis_a[0], axis_a[1], axis_a[2]) if axis_a.size() == 3 and (axis_a[0] != 0.0 or axis_a[1] != 0.0 or axis_a[2] != 0.0) else centre_dir_cached(active)
+		_or_stage_theta_h = ring.shell_emit_thetah()
+		_or_stage_reach = _or_stage_theta_h if _or_stage_theta_h >= 0.0 else CubeSphere.ORBIT_RELIEF_FALLBACK_REACH_RAD
+		var v2_hop_h := CubeSphere.V2_HOP_H_REACH if CubeSphere.FP_SMOOTH_V2_REACH else CubeSphere.V2_HOP_H
+		_or_stage_excluded = {active: true}
+		for fid in FacetSmoothV2.hop_annulus(active, 0, v2_hop_h):
+			_or_stage_excluded[int(fid)] = true
+		_or_stage_active_fid = active
+		_or_stage_i = 0
+		_or_stage_picked = []
+		_or_stage_active = true
+	# Advance the scan under a per-step time box (chunked so the clock is polled once per CHUNK, not per facet —
+	# this replicates want_set's candidate loop EXACTLY: same excluded set, reach, priority key, insertion order).
+	var n := FacetAtlas.facet_count()
+	var t0 := Time.get_ticks_usec()
+	while _or_stage_i < n:
+		var chunk_end := mini(_or_stage_i + CubeSphere.OR_FLIP_STAGE_CHUNK, n)
+		while _or_stage_i < chunk_end:
+			var f := _or_stage_i
+			_or_stage_i += 1
+			if _or_stage_excluded.has(f):
+				continue
+			var cd := centre_dir_cached(f)
+			var dot := clampf(cd.dot(_or_stage_axis), -1.0, 1.0)
+			var phi := acos(dot)
+			if phi > _or_stage_reach:
+				continue
+			_or_stage_picked.append([priority(phi, _or_stage_theta_h), f])
+		if Time.get_ticks_usec() - t0 >= CubeSphere.OR_FLIP_STAGE_US:
+			break
+	if _or_stage_i < n:
+		return   # scan not finished — keep serving the OLD want-set this frame (frozen mesh, no hole)
+	# Finished: sort/truncate/publish — IDENTICAL to want_set's tail + _recompute_want's publish (byte-for-byte
+	# the result a synchronous `_recompute_want(active, false)` at the stage-start inputs would have produced).
+	_or_stage_picked.sort()
+	if _or_stage_picked.size() > CubeSphere.ORBIT_RELIEF_MAX_TILES:
+		_or_stage_picked.resize(CubeSphere.ORBIT_RELIEF_MAX_TILES)
+	var order := PackedInt32Array()
+	order.resize(_or_stage_picked.size())
+	for i in range(_or_stage_picked.size()):
+		order[i] = int((_or_stage_picked[i] as Array)[1])
+	var new_want := {}
+	for fid in order:
+		new_want[int(fid)] = true
+	for fid in new_want.keys():
+		_leaving.erase(fid)
+	for fid in _tiles.keys():
+		if not new_want.has(fid) and not _leaving.has(fid):
+			_leaving[fid] = EVICT_DWELL_STEPS
+	_want = new_want
+	_want_order = order
+	_or_stage_active = false
+	_or_stage_picked = []
+	_or_stage_excluded = {}
 
 ## §2.1/WS1a: the ONLY force-recompute trigger besides the axis-drift throttle — a facet crossing. On-surface,
 ## this ONLY records the new active fid — no recompute, no eviction, no dispatch: the resident mesh stays frozen
@@ -662,7 +760,12 @@ func step() -> void:
 		_mi.visible = offsurf   # on-surface: hidden; off-surface: shown (frozen tiles intact)
 	if not offsurf:
 		return   # WS1a: on-surface — no recompute, no dwell-eviction, no dispatch, no commit. Frozen.
-	_recompute_want(_active_fid, false)   # throttled axis-drift recompute (no-op most calls)
+	# FP_OR_FLIP_STAGE: amortise the up-crossing want-set scan across frames (see `_recompute_want_staged`). Off ⇒
+	# the verbatim synchronous throttled recompute (byte-identical — the else branch is the untouched original).
+	if CubeSphere.FP_OR_FLIP_STAGE:
+		_recompute_want_staged(_active_fid)
+	else:
+		_recompute_want(_active_fid, false)   # throttled axis-drift recompute (no-op most calls)
 	if not _leaving.is_empty():
 		var to_evict := []
 		for fid in _leaving.keys():
@@ -677,6 +780,7 @@ func step() -> void:
 				_tiles.erase(fid)
 				_commit_dirty = true
 			_free_arena_slot(fid)
+	var _or_disp := 0   # FP_OR_FLIP_STAGE dispatch tally (only read under the flag — inert/unused when off)
 	for fid in _want_order:
 		var f := int(fid)
 		if _tiles.has(f) or _inflight(f):
@@ -694,6 +798,14 @@ func step() -> void:
 		_s_fid[slot] = f
 		_s_task[slot] = WorkerThreadPool.add_task(Callable(self, "_build_worker").bind(
 			slot, f, heights, coarse_col, vert_base, int(tex[0]), int(tex[1]), int(tex[2]), int(tex[3])), true, "orbitrelieftile")
+		# FP_OR_FLIP_STAGE: cap the main-thread snapshot cost (height_grid/col/tex + add_task) per step so a
+		# post-publish burst of newly-wanted facets can't land all `_sn` dispatches — each with its own
+		# height_grid cache-miss — on ONE frame. Fewer dispatched now ⇒ the remainder fills next step; the reap
+		# above frees the slots, so it still converges (bounded by `_sn` either way). Off ⇒ never checked (verbatim).
+		if CubeSphere.FP_OR_FLIP_STAGE:
+			_or_disp += 1
+			if _or_disp >= CubeSphere.OR_FLIP_DISPATCH_MAX:
+				break
 	if _commit_dirty:
 		var now_ms := Time.get_ticks_msec()
 		if should_commit(_commit_dirty, now_ms, _last_commit_ms, CubeSphere.ORBIT_RELIEF_COMMIT_MS):

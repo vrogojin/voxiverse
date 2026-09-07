@@ -13,7 +13,9 @@ extends RefCounted
 ## from a worker (safe: the atlas is built once at `warm_up()` and never mutated during gameplay). `GlobalReliefData`
 ## itself, by contrast, IS mutated live (the G2 pacer keeps baking facets during gameplay) — so its heights are
 ## NEVER read directly by a worker; the caller extracts a private per-facet snapshot (`height_grid`, main-thread
-## only) BEFORE dispatch. The shell's `_col_cache` (also live-mutated) gets the same snapshot treatment for its
+## only) BEFORE dispatch — or, under FP_OR_WORKER_DECODE, a raw `height_bytes` byte-slice snapshot (also main-thread,
+## a cheaper ~2178-B memcpy) that the worker decodes with the pure static `GlobalReliefData.decode_height_bytes`; the
+## worker still touches no live instance. The shell's `_col_cache` (also live-mutated) gets the same snapshot treatment for its
 ## colour contribution. `build_tile` therefore touches only: (a) write-once atlas statics, safe to call from a
 ## worker, and (b) plain value-type `PackedInt32Array`/`PackedColorArray` snapshots the main thread already
 ## copied out — no shared live object crosses the thread boundary at all.
@@ -791,13 +793,18 @@ func step() -> void:
 		var arena_slot := _alloc_arena_slot(f)
 		if arena_slot < 0:
 			break   # arena momentarily full (transient dwell overlap) — the remainder waits too
-		var heights := _relief_data.height_grid(f)      # main-thread snapshot — safe hand-off (§0, WS1d-cached)
 		var coarse_col := _col_cache_for(f)              # main-thread snapshot — safe hand-off (§0)
 		var vert_base := arena_slot * VERTS_PER_TILE     # WS1b: baked into the worker's own idx output
 		var tex := _tex_decode(f)                        # WS2: [face,a,b,k] — main-thread decode, plain ints to the worker
 		_s_fid[slot] = f
-		_s_task[slot] = WorkerThreadPool.add_task(Callable(self, "_build_worker").bind(
-			slot, f, heights, coarse_col, vert_base, int(tex[0]), int(tex[1]), int(tex[2]), int(tex[3])), true, "orbitrelieftile")
+		if CubeSphere.FP_OR_WORKER_DECODE:
+			var raw := _relief_data.height_bytes(f)      # main-thread ~2178-B memcpy snapshot — worker decodes it (§0)
+			_s_task[slot] = WorkerThreadPool.add_task(Callable(self, "_build_worker_raw").bind(
+				slot, f, raw, coarse_col, vert_base, int(tex[0]), int(tex[1]), int(tex[2]), int(tex[3])), true, "orbitrelieftile")
+		else:
+			var heights := _relief_data.height_grid(f)   # main-thread snapshot — safe hand-off (§0, WS1d-cached)
+			_s_task[slot] = WorkerThreadPool.add_task(Callable(self, "_build_worker").bind(
+				slot, f, heights, coarse_col, vert_base, int(tex[0]), int(tex[1]), int(tex[2]), int(tex[3])), true, "orbitrelieftile")
 		# FP_OR_FLIP_STAGE: cap the main-thread snapshot cost (height_grid/col/tex + add_task) per step so a
 		# post-publish burst of newly-wanted facets can't land all `_sn` dispatches — each with its own
 		# height_grid cache-miss — on ONE frame. Fewer dispatched now ⇒ the remainder fills next step; the reap
@@ -833,6 +840,17 @@ func _inflight(fid: int) -> bool:
 ## `_want`/`_tiles`/any other instance field (single-writer discipline, mirrors `FacetSmoothV2._build_worker`).
 func _build_worker(slot: int, fid: int, heights: PackedInt32Array, coarse_col: PackedColorArray, vert_base: int, face: int, a: int, b: int, k: int) -> void:
 	var tile := build_tile(fid, heights, coarse_col, vert_base, face, a, b, k)
+	_s_mutex.lock()
+	_s_result[slot] = tile
+	_s_mutex.unlock()
+
+## FP_OR_WORKER_DECODE worker entry: identical to `_build_worker` except the 1089-node s16 DECODE runs HERE (off main)
+## on its own private raw-byte snapshot, via the pure STATIC `GlobalReliefData.decode_height_bytes`. Touches ONLY its
+## bound value args + that static decoder — NEVER the live `GlobalReliefData` instance, `_relief_data`, `height_grid`,
+## or any cache (a worker Dictionary write would be exactly the race the tier's single-writer discipline forbids).
+## Writes ONLY `_s_result[slot]` under the mutex, same as `_build_worker`.
+func _build_worker_raw(slot: int, fid: int, raw: PackedByteArray, coarse_col: PackedColorArray, vert_base: int, face: int, a: int, b: int, k: int) -> void:
+	var tile := build_tile(fid, GlobalReliefData.decode_height_bytes(raw), coarse_col, vert_base, face, a, b, k)
 	_s_mutex.lock()
 	_s_result[slot] = tile
 	_s_mutex.unlock()

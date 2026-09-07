@@ -1105,6 +1105,19 @@ const OR_FLIP_STAGE_US := 3000       # per-step µs time box for the staged want
 const OR_FLIP_STAGE_CHUNK := 128     # facets scanned between time-box polls (amortises the clock read; also the min advance/step ⇒ termination bound)
 const OR_FLIP_DISPATCH_MAX := 3      # max tiles dispatched per step under the flag (spreads the post-publish snapshot burst; still `_sn`-bounded)
 
+## FP_OR_WORKER_DECODE (docs/COSMOS-ORBIT-RELIEF-HEIGHT-DECODE-DESIGN.md — the surface-entry PRIMARY, orbit-relief tier).
+## The dispatch loop's real up-crossing burst is `_relief_data.height_grid(f)` — 1089 main-thread `decode_s16` reads
+## (~33ms/facet WASM, cache-cold), up to `OR_FLIP_DISPATCH_MAX` cache-miss snapshots on the flip frame ⇒ ~100ms. This
+## flag moves the 1089-node s16 DECODE off the main thread: the caller hands the worker a cheap ~2178-byte raw-byte
+## SLICE (`GlobalReliefData.height_bytes(f)`, a main-thread memcpy) and `_build_worker_raw` decodes it worker-side via
+## the pure static `GlobalReliefData.decode_height_bytes`. The main thread keeps only the ~µs memcpy. SAFE because
+## `bake_facet` (the only writer of `_heights`) runs main-thread-only (design §2), so the slice is strictly serialized
+## with any bake — torn-free. COMPOSES with FP_OR_FLIP_STAGE (disjoint terms: this removes the decode, FLIP_STAGE the
+## want-scan). Off ⇒ the dispatch else-branch is the VERBATIM shipped `height_grid` + `_build_worker` path, `height_bytes`/
+## `decode_height_bytes`/`_build_worker_raw` are dead code — byte-identical (FLAT verify_feature.gd 6042/0). Gate:
+## verify_orbit_relief.gd (G-OR-WDEC: round-trip + degrade + tile byte-equality + structural no-off-thread-read scans).
+const FP_OR_WORKER_DECODE := false
+
 ## FP_ORBIT_RELIEF_SURFACE_HIDE (docs/COSMOS-FAR-NEAR-COVERAGE-DESIGN.md §3.1 — kills the far-over-near mountain
 ## protrusion) — G3's on-surface SUSPEND (`FacetOrbitRelief.step()` WS1a) freezes recompute/commit below
 ## OFFSURFACE_Y but leaves the last committed mesh VISIBLE and UN-SUNK at its coarse 13-block DEM pitch, so on a

@@ -42,6 +42,16 @@ extends SceneTree
 ##   G-OR-SUSPEND (WS1a) — on-surface (`shell_offsurface()` false): `step()` performs zero recompute/dispatch/
 ##                        commit past the initial reap — the resident/committed set is BYTE-IDENTICAL before and
 ##                        after. Off-surface: normal operation (dispatch + commit) resumes immediately.
+##   G-OR-WDEC (FP_OR_WORKER_DECODE) — the off-thread height decode (docs/COSMOS-ORBIT-RELIEF-HEIGHT-DECODE-DESIGN.md):
+##                        (1) round-trip — `decode_height_bytes(height_bytes(fid))` == `height_grid(fid)` at all 1089
+##                        nodes for a baked fid, + one-byte-perturb falsifier (that node differs, nowhere else);
+##                        (2) degrade — un-baked fid, fresh no-setup instance (empty slice), and out-of-range fid all
+##                        decode to 1089 zeros == `height_grid`'s zero grid (§3.2's empty-corner); (3) build_tile
+##                        byte-equality — the raw-path tile == the height_grid-path tile (baked + un-baked fid);
+##                        (4) structural — `_build_worker_raw` has no `_relief_data`/`height_grid` token,
+##                        `decode_height_bytes` is `static`, `global_relief_data.gd` has no `WorkerThreadPool` token
+##                        (pins the main-thread-bake invariant the whole safety argument rests on); (5) byte-off —
+##                        the dispatch else-branch is the verbatim `height_grid` call (FLAT 6042/0 checked separately).
 ##
 ## RUN (needs FACETED + FP_GLOBAL_RELIEF_DATA sed-toggled true for the ON-path gates, per the design's
 ## dependency on G2):
@@ -81,6 +91,7 @@ func _initialize() -> void:
 		_gate_seam()
 		_gate_commit_cost()
 		_gate_suspend()
+		_gate_wdec()
 	else:
 		_ok(true, "G-OR-DATA-EQ/BYTES/WELD/SEAM/COMMIT-COST/SUSPEND: skipped this run (needs FP_ORBIT_RELIEF + FP_GLOBAL_RELIEF_DATA both sed-toggled true)")
 
@@ -325,6 +336,125 @@ func _gate_texture() -> void:
 					break
 			_ok("\n".join(body2).find("_orbit_relief.set_fine_map(tex)") != -1,
 				"G-OR-TEXTURE: FacetFarRing.set_fine_map forwards the SAME tex to _orbit_relief.set_fine_map")
+
+# --- G-OR-WDEC (FP_OR_WORKER_DECODE): off-thread height decode is byte-equal to the height_grid oracle -----------------
+func _grids_equal(a: PackedInt32Array, b: PackedInt32Array) -> bool:
+	if a.size() != b.size():
+		return false
+	for k in range(a.size()):
+		if a[k] != b[k]:
+			return false
+	return true
+
+func _grid_all_zero(a: PackedInt32Array) -> bool:
+	for k in range(a.size()):
+		if a[k] != 0:
+			return false
+	return true
+
+func _tiles_equal(t1: Dictionary, t2: Dictionary) -> bool:
+	if t1.is_empty() or t2.is_empty():
+		return false
+	return t1["g"] == t2["g"] and t1["pos"] == t2["pos"] and t1["idx"] == t2["idx"] \
+		and t1["uv"] == t2["uv"] and t1["uv2"] == t2["uv2"] and t1["col"] == t2["col"]
+
+## Extract a function's body (by indentation, mirroring _gate_light's make_material scan) from a source file.
+func _func_body(path: String, sig_prefix: String) -> String:
+	var f := FileAccess.open(path, FileAccess.READ)
+	if f == null:
+		return ""
+	var lines := f.get_as_text().split("\n")
+	var in_body := false
+	var body_lines: Array = []
+	for line in lines:
+		if not in_body:
+			if line.begins_with(sig_prefix):
+				in_body = true
+			continue
+		if line.begins_with("\t") or line.strip_edges() == "":
+			body_lines.append(line)
+		else:
+			break
+	return "\n".join(body_lines)
+
+func _gate_wdec() -> void:
+	var NPF := GlobalReliefData.NODES_PER_FACET
+	var fid_baked := 12    # real terrain, same facet the other ON-path gates bake
+	var fid_unbaked := 20  # setup allocates its (zeroed) region but it is never baked
+	var rd := GlobalReliefData.new()
+	rd.setup()
+	_ok(rd.is_ready() and rd.bake_facet(fid_baked), "G-OR-WDEC: fixture — setup() + bake_facet(%d) succeed" % fid_baked)
+
+	# (1) Round-trip: decode_height_bytes(height_bytes(fid)) == height_grid(fid) at all 1089 nodes.
+	var raw := rd.height_bytes(fid_baked)
+	_ok(raw.size() == NPF * 2, "G-OR-WDEC: height_bytes returns the full %d-byte raw slice (Δ %d)" % [NPF * 2, raw.size()])
+	var grid := rd.height_grid(fid_baked)
+	var decoded := GlobalReliefData.decode_height_bytes(raw)
+	_ok(_grids_equal(decoded, grid), "G-OR-WDEC: round-trip — decode_height_bytes(height_bytes(fid)) == height_grid(fid) at all %d nodes (each == height_at)" % NPF)
+
+	# (1) Falsifier: perturb ONE byte of the snapshot ⇒ exactly that node differs, nowhere else.
+	var raw2 := rd.height_bytes(fid_baked)
+	var kp := 500
+	raw2[kp * 2] = raw2[kp * 2] ^ 0xFF
+	var dec2 := GlobalReliefData.decode_height_bytes(raw2)
+	var diff_count := 0
+	for k in range(NPF):
+		if dec2[k] != grid[k]:
+			diff_count += 1
+	_ok(dec2[kp] != grid[kp] and diff_count == 1, "G-OR-WDEC: one-byte-perturb falsifier — exactly node %d diverges, nowhere else (diffs=%d)" % [kp, diff_count])
+
+	# (2a) Degrade — un-baked fid: both paths all-zero and equal.
+	var grid_ub := rd.height_grid(fid_unbaked)
+	var dec_ub := GlobalReliefData.decode_height_bytes(rd.height_bytes(fid_unbaked))
+	_ok(_grid_all_zero(grid_ub) and _grids_equal(dec_ub, grid_ub), "G-OR-WDEC: degrade — un-baked fid decodes to %d zeros == height_grid's zero grid" % NPF)
+
+	# (2b) Degrade — fresh instance, no setup(): height_bytes empty, decode of it == height_grid (§3.2's empty corner).
+	var rd_fresh := GlobalReliefData.new()
+	var raw_fresh := rd_fresh.height_bytes(fid_baked)
+	var dec_fresh := GlobalReliefData.decode_height_bytes(raw_fresh)
+	var grid_fresh := rd_fresh.height_grid(fid_baked)
+	_ok(raw_fresh.is_empty(), "G-OR-WDEC: degrade — a no-setup instance's height_bytes is EMPTY (the naive-slice trap §3.2)")
+	_ok(_grid_all_zero(dec_fresh) and _grids_equal(dec_fresh, grid_fresh), "G-OR-WDEC: degrade — decode of the empty slice == height_grid's %d zeros (NOT a wrong-size {} refusal)" % NPF)
+
+	# (2c) Degrade — out-of-range fid: empty slice, decode == height_grid zero grid.
+	var oor := 9_999_999
+	var raw_oor := rd.height_bytes(oor)
+	var dec_oor := GlobalReliefData.decode_height_bytes(raw_oor)
+	_ok(raw_oor.is_empty() and _grids_equal(dec_oor, rd.height_grid(oor)) and _grid_all_zero(dec_oor), "G-OR-WDEC: degrade — out-of-range fid slice empty, decode == %d-zero height_grid" % NPF)
+
+	# (3) Tile byte-equality — the raw-decode path builds the SAME tile as the height_grid path (baked + un-baked).
+	var tile_raw := _bt(fid_baked, GlobalReliefData.decode_height_bytes(rd.height_bytes(fid_baked)), PackedColorArray(), 0)
+	var tile_hg := _bt(fid_baked, rd.height_grid(fid_baked), PackedColorArray(), 0)
+	_ok(_tiles_equal(tile_raw, tile_hg), "G-OR-WDEC: tile byte-equality (baked fid) — raw-path tile == height_grid-path tile (g/pos/idx/uv/uv2/col)")
+	var tile_raw_ub := _bt(fid_unbaked, GlobalReliefData.decode_height_bytes(rd.height_bytes(fid_unbaked)), PackedColorArray(), 0)
+	var tile_hg_ub := _bt(fid_unbaked, rd.height_grid(fid_unbaked), PackedColorArray(), 0)
+	_ok(_tiles_equal(tile_raw_ub, tile_hg_ub), "G-OR-WDEC: tile byte-equality (un-baked fid) — flat raw-path tile == height_grid-path tile")
+
+	# (4) Structural — the worker entry never touches the live GlobalReliefData; the decoder is static; G2 baking is main-thread.
+	var raw_body := _func_body("res://src/world/facet_orbit_relief.gd", "func _build_worker_raw(")
+	_ok(raw_body != "" and raw_body.find("_relief_data") == -1 and raw_body.find("height_grid") == -1,
+		"G-OR-WDEC: structural — _build_worker_raw's body has NO _relief_data/height_grid token (touches no live instance)")
+	var grd := FileAccess.open("res://src/world/global_relief_data.gd", FileAccess.READ)
+	_ok(grd != null, "G-OR-WDEC: opened global_relief_data.gd for the static source scan")
+	if grd != null:
+		var grd_text := grd.get_as_text()
+		_ok(grd_text.find("static func decode_height_bytes(") != -1, "G-OR-WDEC: structural — decode_height_bytes is declared static (worker-safe, pure)")
+		# Scan CODE only (comment portion stripped): the file legitimately NAMES WorkerThreadPool in two doc comments
+		# (one is the very note asserting the no-worker invariant), so the pin is on API USAGE, not the prose token.
+		var grd_code := ""
+		for line in grd_text.split("\n"):
+			var h := line.find("#")
+			grd_code += (line if h < 0 else line.substr(0, h)) + "\n"
+		_ok(grd_code.find("WorkerThreadPool") == -1 and grd_code.find("Thread") == -1, "G-OR-WDEC: structural — global_relief_data.gd has NO WorkerThreadPool/Thread USAGE in code (pins the main-thread-bake invariant §2 rests on)")
+
+	# (5) Byte-off — the dispatch OFF-branch is the verbatim height_grid call; the ON-branch uses height_bytes.
+	var forc := FileAccess.open("res://src/world/facet_orbit_relief.gd", FileAccess.READ)
+	if forc != null:
+		var for_text := forc.get_as_text()
+		_ok(for_text.find("_relief_data.height_grid(f)") != -1 and for_text.find("_build_worker\")") != -1,
+			"G-OR-WDEC: byte-off — the OFF dispatch branch is the verbatim height_grid + _build_worker call (FLAT 6042/0 checked separately)")
+		_ok(for_text.find("_relief_data.height_bytes(f)") != -1 and for_text.find("_build_worker_raw\")") != -1,
+			"G-OR-WDEC: the ON dispatch branch binds the raw height_bytes slice to _build_worker_raw")
 
 # --- G-OR-DATA-EQ: build_tile's stored heights == the GlobalReliefData oracle, falsifiable ----------------------------
 func _gate_data_eq() -> void:

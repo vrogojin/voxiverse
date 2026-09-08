@@ -206,6 +206,11 @@ var _cu_last_done := false          # the close-up compute slice just finished i
 var _bm_last_done := false          # the band compute slice just finished its facet (commit uploads + finalizes)
 var _main_bake_us := 0              # the bake work paid ON MAIN in the last update() (the G-TW-MAINCOST proof surface):
 									#   on-main path = the whole compute; worker path = orchestration + submit only (~0)
+# S4 (FP_SKIN_HANDOFF_PREWARM): the in-flight base unit was picked by the handoff class (vs the shot/coverage cursor).
+# Set on selection (worker + on-main), read at commit to advance the COMPLETION counter the G-SKIN-PRI gate asserts.
+var _job_base_handoff := false
+var _dbg_handoff_bakes := 0        # completed handoff-class bakes this session (gate/telemetry read-back)
+var _dbg_last_base_fid := -1       # the fid of the last COMPLETED base unit (G-SKIN-PRI queue-order read-back)
 
 # --- lifecycle -----------------------------------------------------------------------------------
 
@@ -529,6 +534,84 @@ var _frozen := false
 func set_frozen(frozen: bool) -> void:
 	_frozen = frozen
 
+# --- S3/S4 skin-handoff readiness (docs/COSMOS-LOD-DROPOUT-DESIGN.md §4) -------------------------
+## FP_SKIN_READY_GATE §4.1: is facet `fid`'s BASE page covered? The g1 shot (real shot incl trees, _shot_baked) when
+## FP_PAGES_SHOT serves, else the g0 palette floor (_baked). This is the coverage-sentinel surface — a facet whose base
+## texels are still alpha 0 draws the flat vertex-colour ring (no skin at all). Kept as its own predicate because the
+## S4 handoff bake CLASS produces exactly this surface (see _next_handoff_fid).
+func _base_covered(fid: int) -> bool:
+	return _shot_baked.has(fid) if _shot_on else _baked.has(fid)
+
+## FP_SKIN_READY_GATE §4.1: is facet `fid`'s SKIN actually baked for the card→skin handover — i.e. does the surface the
+## cards DISSOLVE INTO actually carry this facet's canopy/roof pixels yet? (Codex P1: the shipped predicate checked only
+## the base page, which is terrain colour WITHOUT the tree/roof replacement — it reported "ready" while the real skin was
+## still empty, so the tier released into a blank = the very dropout this gate fixes.) When the whole-planet FINE map is
+## live (FP_PLANET_MAP → _fm_on) it is the rung-3 canopy/roof speckle that OWNS the view above the hide line, so require
+## its tile COMMITTED (_fine_commit → _fine_baked) AND the base page present (else the sentinel shows the flat ring).
+## An edit (chop) erases _fine_baked (invalidate_far_skin) but not the base — so the hold correctly re-arms until the
+## fresh skin re-bakes. With no fine map, the g1 shot (trees baked in) / g0 base IS the whole far skin, so base coverage
+## alone defines readiness. Pure dict lookups ⇒ cheap per visible facet each (rate-capped) tier step. Unwired ⇒ the
+## tier's ready_frac degrades to 1.0 ⇒ the shipped pure-altitude hide (byte-identical).
+func handoff_ready(fid: int) -> bool:
+	if _fm_on:
+		return _fine_uploaded(fid) and _base_covered(fid)
+	return _base_covered(fid)
+
+## FP_SKIN_READY_GATE §4.1 (Codex GAP-B): is facet `fid`'s FINE tile actually on the GPU? `_fine_baked` is only CPU
+## residency (set at _fine_commit); the sub-page layer that holds the tile uploads on a THROTTLE (~1 layer / 15 frames,
+## `_fm_dirty` drained in _update_band_parallel), and the shell shader samples the GPU Texture2DArray — so a fid can be
+## `_fine_baked` while its layer is still dirty (un-uploaded) = a false-ready release into an empty skin. Require the
+## layer NOT dirty. Conservative (a co-resident neighbour re-dirtying the layer holds this fid a few frames too) but SAFE
+## (never releases into an un-uploaded tile); the throttle drains + the hold ceiling both bound the extra wait. The layer
+## index mirrors _fine_commit exactly.
+func _fine_uploaded(fid: int) -> bool:
+	if not _fine_baked.has(fid):
+		return false
+	var d := _decode(fid)
+	var layer := int(d[0]) * 4 + (int(d[2]) / _fm_quad) * 2 + (int(d[1]) / _fm_quad)
+	return not _fm_dirty.has(layer)
+
+## FP_SKIN_READY_GATE §4.1: the baked fraction of a supplied facet set (the tier's card-band handoff set). Empty set
+## ⇒ 1.0 (nothing to wait for ⇒ do not hold). Bounded by the set size (≤ the card-band facet count, ~180) — one dict
+## lookup each. Fed the tier's `_last_wanted` array (Array[int]) via the wired query.
+func ready_frac(fids) -> float:
+	var n: int = fids.size()
+	if n <= 0:
+		return 1.0
+	var r := 0
+	for f in fids:
+		if handoff_ready(int(f)):
+			r += 1
+	return float(r) / float(n)
+
+# --- S4 (FP_SKIN_HANDOFF_PREWARM) handoff priority class ------------------------------------------
+## §4.3: the nearest-emit-axis UN-READY facet inside the visible disc — the handoff unit to bake AHEAD of the g1 shot
+## cursor + g0 coverage sweep (but AFTER close-up + band: the near tiers must never starve). "Un-ready" is the SAME
+## predicate the readiness gate reads, so baking it directly drains the hold. Returns -1 when the whole nearest-axis
+## disc is already ready (⇒ fall through to the shipped shot/coverage order). Bounded 6·K² dot scan (microseconds),
+## capped to the facets actually facing the sub-camera point (dot ≥ HANDOFF_DOT_MIN) so a full-planet sweep never
+## masquerades as "handoff". `shot` out-param (via the return sign convention is avoided: the caller reads _shot_on).
+const HANDOFF_DOT_MIN := 0.30    # ~72° half-angle cap around the emit axis — the visible disc from the handoff band
+func _next_handoff_fid(axis: Array) -> int:
+	var ax := float(axis[0]); var ay := float(axis[1]); var az := float(axis[2])
+	if ax * ax + ay * ay + az * az <= 0.5:
+		return -1                       # no real emit axis ⇒ no handoff notion (degrade to the shipped order)
+	var best := -1
+	var best_dot := HANDOFF_DOT_MIN
+	var total := _base_all
+	for fid in range(total):
+		# This class BAKES the base page (bake_facet[_shot] below), so it selects by _base_covered — NOT handoff_ready.
+		# (Under a live fine map handoff_ready also requires _fine_baked, which the fine cursor drains; selecting on it
+		# here would loop forever re-baking an already-covered base whose fine tile is not this class's to produce.)
+		if _base_covered(fid):
+			continue                    # its base page is done ⇒ not a base-handoff unit
+		var c: Vector3 = _centre_pack[fid]
+		var dot := c.x * ax + c.y * ay + c.z * az
+		if dot > best_dot:
+			best_dot = dot
+			best = fid
+	return best
+
 ## COSMOS-BACKGROUND-PREBAKE: `frame_ms` is the caller's last-frame wall-clock cost (WorldManager._process's own
 ## real `delta`, never a Performance monitor — see the flag's doc comment) — threaded through to the governor
 ## unconditionally; it is only ever CONSULTED under FP_BG_PREBAKE, so passing 0.0 (the default) is byte-identical
@@ -567,7 +650,10 @@ func _update_main(emit_axis: Array, offsurface: bool, budget_ms: float, active_f
 		if _cu_on:
 			_recompute_want_sse(emit_axis, cam_dist)       # NO regime gate, NO evict-all
 			_bake_closeup_budgeted(start, budget_us)       # whatever budget the band left
-		_bake_base_progressive(start, budget_us, emit_axis)
+		if CubeSphere.FP_SKIN_HANDOFF_PREWARM and offsurface:
+			_bake_priority_budgeted(start, budget_us, emit_axis)   # S4: handoff → coverage in ONE budgeted loop
+		else:
+			_bake_base_progressive(start, budget_us, emit_axis)
 		_flush_base_uploads()
 		_flush_closeup_uploads()
 		var spent_sse := Time.get_ticks_usec() - start
@@ -605,10 +691,15 @@ func _update_main(emit_axis: Array, offsurface: bool, budget_ms: float, active_f
 	# whole-facet shot bake is heavy in GDScript (F2 risk); production runs it OFF-MAIN on the TH1 worker (the compute
 	# leaves the frame), and the flag is default-off pending the C++ surface_shot mirror. No-op off _shot_on ⇒ the page
 	# bake stays the g0 palette colour (boot + coverage byte-identical). Check-before-each like coverage.
-	if _shot_on:
-		_bake_shot_progressive(start, budget_us, emit_axis)
-	# Phase 2: progressive BASE coverage (g0 palette) with the remaining budget (whole-facet units, check-before-each).
-	_bake_base_progressive(start, budget_us, emit_axis)
+	# S4 (FP_SKIN_HANDOFF_PREWARM §4.3): the visible disc's un-ready facets bake BEFORE the g1 shot cursor + g0 coverage,
+	# folded into ONE budgeted loop (bounds the worst frame to budget + one unit). Off ⇒ the shipped shot+base pair.
+	if CubeSphere.FP_SKIN_HANDOFF_PREWARM and offsurface:
+		_bake_priority_budgeted(start, budget_us, emit_axis)
+	else:
+		if _shot_on:
+			_bake_shot_progressive(start, budget_us, emit_axis)
+		# Phase 2: progressive BASE coverage (g0 palette) with the remaining budget (whole-facet units, check-before-each).
+		_bake_base_progressive(start, budget_us, emit_axis)
 	# Bounded incremental uploads (main-thread RenderingServer touch): ≤ a few pages/layers per update.
 	_flush_base_uploads()
 	_flush_closeup_uploads()
@@ -672,6 +763,15 @@ func _select_worker_unit(offsurface: bool, emit_axis: Array, active_fid: int) ->
 		var bf := _next_band_to_bake()
 		if bf >= 0 and _begin_band_bake(bf):
 			_job_kind = "bm"; return true
+	# S4 (FP_SKIN_HANDOFF_PREWARM §4.3): the HANDOFF class — bake the nearest-axis UN-READY facet of the visible disc
+	# AHEAD of the g1 shot cursor + g0 coverage (but BELOW close-up + band above, and BELOW the edit-rebake which re-
+	# enters via the same shot/base cursors: the near tiers the player looks at, and cosmetic-latency-tolerant edits,
+	# keep their slots). Only off-surface (the handoff altitude band) and only under the flag ⇒ shipped order verbatim
+	# off. Baked as a shot when _shot_on (the readiness surface), else a g0 base — either drains handoff_ready.
+	if CubeSphere.FP_SKIN_HANDOFF_PREWARM and offsurface:
+		var hf := _next_handoff_fid(emit_axis)
+		if hf >= 0:
+			_job_base_fid = hf; _job_base_shot = _shot_on; _job_base_handoff = true; _job_kind = "base"; return true
 	# V3 (FP_PAGES_SHOT): the g1 shot rebake — upgrade a covered-but-un-shot facet to the real shot (nearest-axis first).
 	# Runs BEFORE g0 coverage (same order as the on-main cursor): the two generations ping-pong across worker round-trips
 	# — when the upgrade queue empties, coverage below adds a g0 facet, which the next round upgrades. Off _shot_on ⇒
@@ -679,12 +779,12 @@ func _select_worker_unit(offsurface: bool, emit_axis: Array, active_fid: int) ->
 	if _shot_on and _shot_baked.size() < _baked.size():
 		var sf := _next_shot_fid(emit_axis)
 		if sf >= 0:
-			_job_base_fid = sf; _job_base_shot = true; _job_kind = "base"; return true
+			_job_base_fid = sf; _job_base_shot = true; _job_base_handoff = false; _job_kind = "base"; return true
 	# Progressive base coverage (g0 palette) last.
 	if _baked.size() < _base_all:
 		var pf := _next_base_fid(emit_axis)
 		if pf >= 0:
-			_job_base_fid = pf; _job_base_shot = false; _job_kind = "base"; return true
+			_job_base_fid = pf; _job_base_shot = false; _job_base_handoff = false; _job_kind = "base"; return true
 	return false
 
 ## WORKER THREAD: run the in-flight unit's PIXEL compute into its staging Image only (NO RenderingServer / tree touch,
@@ -708,6 +808,9 @@ func _worker_compute_unit() -> void:
 func _worker_commit_unit() -> void:
 	match _job_kind:
 		"base":
+			_dbg_last_base_fid = _job_base_fid       # G-SKIN-PRI queue-order read-back
+			if _job_base_handoff:
+				_dbg_handoff_bakes += 1              # S4: a handoff-class bake completed
 			_commit_base_facet(_job_base_fid)
 			if _job_base_shot:
 				_shot_baked[_job_base_fid] = true   # V3: mark g1 shot coverage (single-writer on main)
@@ -719,6 +822,7 @@ func _worker_commit_unit() -> void:
 	_job_kind = ""
 	_job_base_fid = -1
 	_job_base_shot = false
+	_job_base_handoff = false
 	_job_inflight = false
 
 ## MAIN: upload facet `fid`'s base page (premultiply + mips already done on the worker) + mark it baked. Upload-only —
@@ -735,6 +839,49 @@ func _commit_base_facet(fid: int) -> void:
 			_rebuild_id_texture()
 		else:
 			_id_tex.update_layer(_id_pages[face], face)
+
+# --- S4 (FP_SKIN_HANDOFF_PREWARM) on-main unified priority pass -----------------------------------
+
+## §4.3: the on-main progressive schedule under the handoff flag — ONE check-before-each budgeted loop with the
+## priority: (1) HANDOFF (the visible disc's un-ready facets, nearest-axis) → (2) g1 SHOT upgrade → (3) g0 coverage.
+## Folding all three into a SINGLE loop (vs three sequential loops sharing the budget) is what keeps the worst frame
+## at budget + ONE unit: three loops could each squeeze a unit that started just under the line, doubling the overrun.
+## Replaces the shipped `_bake_shot_progressive + _bake_base_progressive` pair ONLY under the flag (off ⇒ those run
+## verbatim ⇒ byte-identical). `_shot_on` false ⇒ step 2 is skipped (g0 coverage path, same as shipped).
+func _bake_priority_budgeted(start: int, budget_us: int, axis: Array) -> void:
+	var do_handoff := true
+	while true:
+		if Time.get_ticks_usec() - start >= budget_us:
+			return
+		# (1) handoff: the nearest-axis un-ready facet of the visible disc (stop scanning once the disc is all ready).
+		if do_handoff:
+			var hf := _next_handoff_fid(axis)
+			if hf >= 0:
+				if _shot_on:
+					bake_facet_shot(hf)
+				else:
+					bake_facet(hf)
+				_base_dirty[face_of(hf)] = true
+				_dbg_last_base_fid = hf
+				_dbg_handoff_bakes += 1
+				continue
+			do_handoff = false          # disc converged ⇒ skip the 3456-facet scan on later iterations this call
+		# (2) g1 shot upgrade (covered-but-un-shot), nearest-axis — same as _bake_shot_progressive's unit.
+		if _shot_on and _shot_baked.size() < _baked.size():
+			var sf := _next_shot_fid(axis)
+			if sf >= 0:
+				bake_facet_shot(sf)
+				_base_dirty[face_of(sf)] = true
+				_dbg_last_base_fid = sf
+				continue
+		# (3) g0 progressive coverage.
+		if _baked.size() < _base_all:
+			var pf := _next_base_fid(axis)
+			if pf >= 0:
+				bake_facet(pf)
+				_base_dirty[face_of(pf)] = true
+				continue
+		return
 
 # --- Phase 2: progressive base-map coverage ------------------------------------------------------
 
@@ -1529,6 +1676,14 @@ func is_shot_baked(fid: int) -> bool:
 
 func shot_baked_count() -> int:
 	return _shot_baked.size()
+
+# --- S4 (FP_SKIN_HANDOFF_PREWARM) gate/telemetry surface (G-SKIN-PRI) -----------------------------
+func handoff_bakes() -> int:            # completed handoff-class bakes this session
+	return _dbg_handoff_bakes
+func last_base_fid() -> int:           # the fid of the last completed base/handoff/shot unit (queue-order read-back)
+	return _dbg_last_base_fid
+func frozen() -> bool:                  # S4: the baker's freeze state (early-un-freeze read-back)
+	return _frozen
 
 # --- Phase 4 close-up accessors + telemetry (gate + WorldManager surface) -------------------------
 

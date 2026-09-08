@@ -75,6 +75,7 @@ func _initialize() -> void:
 	else:
 		print("  (G-SHELL-PREWARM skipped — sed FP_SHELL_PREWARM = true to run S2)")
 	_gate_fall_hold(active)
+	_gate_ascent_lazy(active)
 	if CubeSphere.FP_WARM_TRUE_BUDGET:
 		_gate_true_budget_warm(active)
 	else:
@@ -669,6 +670,48 @@ func _gate_fall_hold(active: int) -> void:
 	_ok(on_count <= 2, "G-SHELL-FALLHOLD: hold ON schedules ≤ 2 re-emits over the whole fall (%d — essentially just engage)" % on_count)
 	_ok(off_count >= 5, "G-SHELL-FALLHOLD: hold OFF re-emits repeatedly (%d — each a synchronous _rebuild_full spike)" % off_count)
 	_ok(off_count >= 3 * on_count, "G-SHELL-FALLHOLD: hold ON cuts scheduled re-emits ≥ 3× vs shipped (%d → %d)" % [off_count, on_count])
+
+# ---------------- G-SHELL-ASCENT-LAZY (FP_SHELL_ASCENT_LAZY — the surface-entry spike S3) ----------------
+## The UPWARD floor release (was floored, now off-surface) must NOT arm a SAFETY re-emit — the resident floored cap is a
+## superset of the narrower un-floored cap on the same axis, so the conversion is a deferrable quality upgrade. Drive a
+## floored→off-surface edge on a fresh ring: with FP_SHELL_ASCENT_LAZY + FP_APPLIED_PROBE_CALM both on, the snapshot
+## commits (shell_offsurface true) but the re-emit parks on the LUXURY rail (no _pending), _orbit_emitted_once is set, and
+## the SHELL_ASCENT_LAZY_MAX_MS failsafe force-promotes it under an injected clock. Off (or CALM off ⇒ luxury param
+## ignored) ⇒ the shipped SAFETY arm (_pending immediately). Hermetic — debug hooks + injected clock, no _process/threads.
+func _gate_ascent_lazy(active: int) -> void:
+	print("  --- G-SHELL-ASCENT-LAZY (S3): the upward floor release defers on the luxury rail (superset-covered) ---")
+	var lazy_on := CubeSphere.FP_SHELL_ASCENT_LAZY and CubeSphere.FP_APPLIED_PROBE_CALM
+	var ring: Node3D = FFR.new()
+	ring.call("setup", active)
+	var c: Vector3 = _centres[active]
+	var d_surf := _R + 30.0                                    # near-surface (floored engage)
+	var d_high := _R / cos(deg_to_rad(22.0))                   # θ_h ≈ 22° ⇒ un-floored θ_emit ≈ 45° < 90° for ANY R (superset holds)
+	# First engage FLOORED (establishes _emit_floored_last = true, the resident 90° cap), then clear the first-engage arm.
+	ring.call("shell_set_camera_abs", [c.x, c.y, c.z], d_surf, true)
+	ring.call("debug_reset_pending")
+	# The ascent release: same axis (drift 0), higher altitude, floored → false.
+	ring.call("shell_set_camera_abs", [c.x, c.y, c.z], d_high, false)
+	_ok(bool(ring.call("shell_offsurface")),
+		"G-SHELL-ASCENT-LAZY: the release commits the snapshot (shell_offsurface true — regime/axis/cap advanced either way)")
+	if lazy_on:
+		_ok(not bool(ring.call("is_rebuild_pending")),
+			"G-SHELL-ASCENT-LAZY: no SAFETY _pending on the ascent edge (the re-emit is deferred)")
+		_ok(bool(ring.call("debug_pending_luxury")),
+			"G-SHELL-ASCENT-LAZY: the re-emit is parked on the LUXURY rail")
+		_ok(bool(ring.call("debug_orbit_emitted_once")),
+			"G-SHELL-ASCENT-LAZY: _orbit_emitted_once set (no forced first off-surface emit)")
+		var due := int(ring.call("debug_ascent_lazy_due_ms"))
+		_ok(due > 0, "G-SHELL-ASCENT-LAZY: the SHELL_ASCENT_LAZY_MAX_MS failsafe deadline is armed")
+		var fired := bool(ring.call("debug_ascent_lazy_failsafe", due + 1))
+		_ok(fired and bool(ring.call("is_rebuild_pending")) and not bool(ring.call("debug_pending_luxury")),
+			"G-SHELL-ASCENT-LAZY: the failsafe force-promotes the parked luxury arm to a real _pending")
+		_ok(int(ring.call("debug_ascent_lazy_due_ms")) == 0, "G-SHELL-ASCENT-LAZY: the failsafe deadline retires after the promote")
+	else:
+		_ok(bool(ring.call("is_rebuild_pending")),
+			"G-SHELL-ASCENT-LAZY(off): SAFETY _pending set immediately on the ascent edge (shipped)")
+		if CubeSphere.FP_SHELL_ASCENT_LAZY and not CubeSphere.FP_APPLIED_PROBE_CALM:
+			print("    (FP_SHELL_ASCENT_LAZY on but FP_APPLIED_PROBE_CALM off — the luxury arm degrades to SAFETY, byte-identical shipped)")
+	ring.queue_free()
 
 # ---------------- G-WARM-TRUE-BUDGET (FIX D, FP_WARM_TRUE_BUDGET / R1): the warm CONVERGES + doesn't re-warm under drift ----------------
 ## COSMOS-PERF FALL-COLLAPSE FIX D (R1) — the ROOT of the sh_wfail thrash in ALL modes (walk, fly, fall). The shipped

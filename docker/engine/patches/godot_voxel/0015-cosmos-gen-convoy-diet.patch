@@ -1,0 +1,147 @@
+COSMOS GEN-CONVOY Stage 1 (docs/COSMOS-GEN-CONVOY-DESIGN.md §4.B) — per-gen-task alloc-diet, byte-off.
+
+Build-#1 levers (lever 2, the VoxelBuffer object recycler, is HELD for Build #2 pending the §6 probe's
+verdict — see design §5 S1/S3). All runtime-gated via the cosmos setup(config) dict (forwarded from
+CubeSphere.FP_GEN_* consts), default off/0 => byte-identical to the current engine:
+  * lever 1 (gen_profs_tls): thread_local reuse of the generator's per-column `profs` scratch vector,
+    removing census site b1 (1 malloc + 1 free/block) off the global dlmalloc lock the workers convoy on.
+  * lever 3 (gen_pool_prewarm): one-time VoxelMemoryPool pre-warm of the 8 KiB TYPE channel class at setup
+    so the first ground crossing does not spill channel allocs to dlmalloc mid-spike (census a3).
+  * §6 probe enable: forwards gen_alloc_probe to the weak core probe switch (no-op if not compiled in).
+Applies on top of godot_voxel patch 0014.
+diff --git a/generators/cosmos/voxel_generator_cosmos.cpp b/generators/cosmos/voxel_generator_cosmos.cpp
+--- a/generators/cosmos/voxel_generator_cosmos.cpp
++++ b/generators/cosmos/voxel_generator_cosmos.cpp
+@@ -3,6 +3,12 @@
+ #include "cosmos_terrain.h"
+ #include "../../storage/voxel_buffer.h"
+ #include "../../storage/voxel_buffer_gd.h"
++#include "../../storage/voxel_memory_pool.h" // COSMOS GEN-CONVOY §4.B lever 3: channel-pool pre-warm
++
++// COSMOS GEN-CONVOY §6: weak-linked runtime enable for the core allocator-lock stall probe (defined in
++// core/os/memory.cpp only when the engine patch's `alloc_probe` scons option is on). Weak => this compiles
++// and links whether or not the core patch is present; skipped (nullptr) in a byte-off build.
++extern "C" __attribute__((weak)) void zn_vox_alloc_probe_set_enabled(bool p_enabled);
+ 
+ #include <core/variant/dictionary.h>
+ #include <core/math/vector2.h>
+@@ -98,6 +104,14 @@
+ 	p.gen_facet = int(config.get("gen_facet", -1));
+ 	p.flat_world = bool(config.get("flat_world", true));
+ 
++	// COSMOS GEN-CONVOY (docs/COSMOS-GEN-CONVOY-DESIGN.md §4.B/§6) — Stage-1 alloc-diet + probe toggles,
++	// forwarded from CubeSphere.FP_GEN_*. All default off/0 => byte-identical (the "not supplied => legacy"
++	// sentinel discipline). Rebuilt from the GDScript consts every world setup, so one build A/Bs on/off
++	// with no rebuild (sed-at-export flip of the consts, then re-export).
++	p.gen_profs_tls = bool(config.get("gen_profs_tls", false));
++	p.gen_pool_prewarm = int(config.get("gen_pool_prewarm", 0));
++	p.gen_alloc_probe = bool(config.get("gen_alloc_probe", false));
++
+ 	p.cube_arid = get_i32_param(config, "cube_arid");
+ 	p.gen_arid = get_i32_param(config, "gen_arid");
+ 	p.snow_arid = get_i32_param(config, "snow_arid");
+@@ -279,6 +293,18 @@
+ 		RWLockWrite wlock(_params_lock);
+ 		_params = p;
+ 	}
++
++	// COSMOS GEN-CONVOY side-effects, HERE — on the main thread, at setup, before any worker streams.
++	// lever 3: top the VoxelMemoryPool 16^3 TYPE-channel class (8192 B) up to the expected peak in-flight
++	// block count so the first ground crossing never spills channel allocs to dlmalloc mid-spike (census a3).
++	if (p.gen_pool_prewarm > 0) {
++		VoxelMemoryPool::get_singleton().prewarm(8192, uint32_t(p.gen_pool_prewarm));
++	}
++	// §6: enable the core allocator-lock stall probe accumulation (weak; no-op if not compiled in).
++	if (zn_vox_alloc_probe_set_enabled != nullptr) {
++		zn_vox_alloc_probe_set_enabled(p.gen_alloc_probe);
++	}
++
+ 	return true;
+ }
+ 
+@@ -2240,7 +2266,14 @@
+ 	}
+ 
+ 	// Per-column profile pass. profs[z*size.x + x] = Vector4(g, biome, c, t); track max_h.
+-	std::vector<Vector4> profs;
++	// COSMOS GEN-CONVOY (docs/COSMOS-GEN-CONVOY-DESIGN.md §4.B lever 1): when gen_profs_tls is set, reuse a
++	// thread_local scratch vector (cleared-not-freed — the module idiom, streams/voxel_block_serializer.cpp
++	// :29-39) instead of a fresh per-block std::vector, removing the ONE generator heap alloc+free per block
++	// (census b1) off the global dlmalloc lock. Byte-identical: resize + fill overwrites every element, same
++	// values/order; capacity is retained and bounded (<= a block face = 32*32 Vector4 = 16 KiB/thread).
++	static thread_local std::vector<Vector4> tls_profs;
++	std::vector<Vector4> local_profs;
++	std::vector<Vector4> &profs = p.gen_profs_tls ? tls_profs : local_profs;
+ 	profs.resize(size.x * size.z);
+ 	int max_h = -0x7fffffff;
+ 	for (int z = 0; z < size.z; ++z) {
+diff --git a/generators/cosmos/voxel_generator_cosmos.h b/generators/cosmos/voxel_generator_cosmos.h
+--- a/generators/cosmos/voxel_generator_cosmos.h
++++ b/generators/cosmos/voxel_generator_cosmos.h
+@@ -457,6 +457,15 @@
+ 		int gen_facet = -1;
+ 		bool flat_world = true;
+ 
++		// COSMOS GEN-CONVOY (docs/COSMOS-GEN-CONVOY-DESIGN.md §4.B/§6) — Stage-1 per-gen-task alloc-diet +
++		// probe toggles, mirroring CubeSphere.FP_GEN_*. All default off/0 => byte-identical. gen_alloc_probe
++		// drives the PROCESS-GLOBAL core-probe enable (set once from setup() on the main thread); the others
++		// are read per-call / at-setup on this generator. (Lever 2, the VoxelBuffer object recycler, is held
++		// for Build #2 pending the probe's verdict — see COSMOS-GEN-CONVOY-DESIGN §5 S1/S3.)
++		bool gen_profs_tls = false;   // lever 1: thread_local reuse of the profs scratch vector (census b1)
++		int gen_pool_prewarm = 0;     // lever 3: VoxelMemoryPool 8 KiB TYPE-class pre-warm block count (0=off)
++		bool gen_alloc_probe = false; // §6: enable the core allocator-lock stall probe accumulation
++
+ 		// World-shape flags, snapshotted from CubeSphere at setup. Consts in GDScript; frozen ints
+ 		// here, because a `const` there is a runtime value to us.
+ 		bool faceted = false;
+diff --git a/storage/voxel_memory_pool.h b/storage/voxel_memory_pool.h
+--- a/storage/voxel_memory_pool.h
++++ b/storage/voxel_memory_pool.h
+@@ -65,6 +65,13 @@
+ 	uint8_t *allocate(size_t size);
+ 	void recycle(uint8_t *block, size_t size);
+ 
++	// COSMOS GEN-CONVOY (docs/COSMOS-GEN-CONVOY-DESIGN.md §4.B lever 3): top the free-list for `size` up to
++	// `count` cached blocks, once, at generator setup (main thread) — so the first ground crossing (or any
++	// burst above the prior high-water mark) does not spill channel allocs to the global dlmalloc lock
++	// mid-spike. Idempotent (ensures the class holds >= count free blocks; never grows past count on a
++	// re-call). The pool self-warms and is never trimmed on the runtime path, so this holds session-wide.
++	void prewarm(size_t size, unsigned int count);
++
+ 	void clear_unused_blocks();
+ 
+ 	void debug_print();
+diff --git a/storage/voxel_memory_pool.cpp b/storage/voxel_memory_pool.cpp
+--- a/storage/voxel_memory_pool.cpp
++++ b/storage/voxel_memory_pool.cpp
+@@ -182,6 +182,30 @@
+ 	_used_memory -= size;
+ }
+ 
++void VoxelMemoryPool::prewarm(size_t size, unsigned int count) {
++	// COSMOS GEN-CONVOY §4.B lever 3. Only the pooled size classes benefit; oversize allocations are never
++	// pooled (see allocate()), so a size past the highest supported class is a no-op rather than a leak.
++	if (size == 0 || size > get_highest_supported_size()) {
++		return;
++	}
++	const unsigned int pot = get_pool_index_from_size(size);
++	Pool &pool = _pot_pools[pot];
++	const size_t capacity = get_size_from_pool_index(pot);
++	MutexLock lock(pool.mutex);
++	// Ensure the free-list holds at least `count` blocks; idempotent so repeated setups (facet flips) never
++	// over-grow. These mallocs are paid HERE, on the main thread at setup, precisely so the workers do not
++	// pay them on the global dlmalloc lock during a streaming burst. Accounting mirrors clear()/allocate():
++	// each cached block adds `capacity` to _total_memory (get_size_from_pool_index(pot)), and stays _used=0.
++	while (pool.blocks.size() < count) {
++		uint8_t *block = (uint8_t *)ZN_ALLOC(capacity * sizeof(uint8_t));
++		if (block == nullptr) {
++			break;
++		}
++		pool.blocks.push_back(block);
++		_total_memory += capacity;
++	}
++}
++
+ void VoxelMemoryPool::clear_unused_blocks() {
+ 	for (unsigned int pot = 0; pot < _pot_pools.size(); ++pot) {
+ 		Pool &pool = _pot_pools[pot];

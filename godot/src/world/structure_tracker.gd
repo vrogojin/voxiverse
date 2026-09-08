@@ -37,11 +37,24 @@ var _reg: Dictionary = {}                     # root edit_key → registry recor
 
 var _snow_ids: Dictionary = {}               # material ids the snowfall sim writes — EXCLUDED from clustering (§4.1)
 var _rev_counter := 0                         # monotone rev source (bumped per cluster mutation — the far delta signal)
+# FP_STRUCT_EDIT_DEBOUNCE: the PUBLISHED (far-visible) version + per-root revs. version()/_make_record serve these
+# under the flag; publish() latches them from the truth (`_rev_counter`/`cl["rev"]`). `_last_noted_root` is the cluster
+# root the most recent note_cell/note_removed touched (−1 if none) — WorldManager reads it to upsert its pending map.
+var _version_pub := 0
+var _rev_pub: Dictionary = {}
+var _last_noted_root := -1
 var _dirty := false                           # a removal happened; a recluster is pending
 var _dirty_at_ms := 0                         # Time.get_ticks_msec() when _dirty was first set (debounce anchor)
 var _saturated := false                       # hit STRUCT_TRACK_MAX (telemetry-degrade, log-once)
 var _reg_saturated := false                   # hit STRUCT_REG_MAX (telemetry-degrade, log-once)
 var _dbg_recluster_count := 0                 # gate read-back: number of reclusters run
+# FP_WORST_FRAME_ATTR (docs/COSMOS-FAR-EDIT-DEBOUNCE-DESIGN.md §5): the last _recluster_all() self-time (µs), FRAME-STAMPED
+# so the worst-frame snapshot attributes the debounced full re-flood to the frame it actually ran on (a later frame than the
+# break — the recluster is STRUCT_RECLUSTER_MS-debounced). Timed unconditionally (cheap get_ticks_usec pair); only READ under
+# the flag via wf_reclust_us(). _recluster_all BFS-floods ALL tracked cells (every near village cell), so this is the O(total
+# tracked) term — the prime freeze suspect the marker isolates.
+var _wf_reclust_us := 0
+var _wf_reclust_frame := -1
 
 
 func _init() -> void:
@@ -64,6 +77,8 @@ func _qualifies_mat(mat: int) -> bool:
 ## `_write_cell` tail: the cell now carries `packed`. Place (qualifying, newly tracked), material-swap (qualifying,
 ## already tracked), or remove (non-qualifying — dug air / snow — over a tracked cell).
 func note_cell(ek: int, packed: int) -> void:
+	if CubeSphere.FP_STRUCT_EDIT_DEBOUNCE:
+		_last_noted_root = -1                    # reset; set below to the affected clustered root (WorldManager reads it)
 	var mat := CellCodec.mat(packed)
 	var qual := _qualifies_mat(mat)
 	var tracked: bool = _cell_mat.has(ek)
@@ -75,6 +90,8 @@ func note_cell(ek: int, packed: int) -> void:
 			return                               # degrade, never grow
 		_cell_mat[ek] = mat
 		_add_cell(ek, mat)
+		if CubeSphere.FP_STRUCT_EDIT_DEBOUNCE:
+			_last_noted_root = _find(ek)
 	elif qual and tracked:
 		if _cell_mat[ek] != mat:                 # material swap in place — connectivity unchanged, histogram + rev shift
 			var old_mat: int = _cell_mat[ek]
@@ -86,6 +103,8 @@ func note_cell(ek: int, packed: int) -> void:
 				_histo_inc(cl["mats"], mat)
 				cl["rev"] = _bump_rev()
 				_sync_registration(root)
+				if CubeSphere.FP_STRUCT_EDIT_DEBOUNCE:
+					_last_noted_root = root
 	elif tracked:                                # non-qualifying over a tracked cell ⇒ removal
 		note_removed(ek)
 
@@ -93,6 +112,8 @@ func note_cell(ek: int, packed: int) -> void:
 ## `sim_revert_cell` (the ONLY `_edits` erase) + the removal path of `note_cell`: the cell is no longer a placed
 ## structure cell. Erase it; mark DIRTY (a removal can split a component) for the debounced recluster (§4.2).
 func note_removed(ek: int) -> void:
+	if CubeSphere.FP_STRUCT_EDIT_DEBOUNCE:
+		_last_noted_root = -1
 	if not _cell_mat.has(ek):
 		return
 	var root := _find(ek)
@@ -104,6 +125,8 @@ func note_removed(ek: int) -> void:
 		_histo_dec(cl["mats"], mat)
 		cl["rev"] = _bump_rev()
 		_sync_registration(root)
+		if CubeSphere.FP_STRUCT_EDIT_DEBOUNCE:
+			_last_noted_root = root               # the removed cell's cluster — pending gate uses its (over-covering) bbox
 	if not _dirty:
 		_dirty = true
 		_dirty_at_ms = Time.get_ticks_msec()
@@ -116,7 +139,12 @@ func tick(now_ms: int) -> void:
 		return
 	if now_ms - _dirty_at_ms < CubeSphere.STRUCT_RECLUSTER_MS:
 		return
+	# FP_WORST_FRAME_ATTR §5: self-time the full re-flood + stamp the frame it ran, so RemoteBridge attributes the spike
+	# to THIS frame (the recluster lands on a later frame than the break). Unconditional (the _dbg_recluster_count precedent).
+	var _wf_t0 := Time.get_ticks_usec()
 	_recluster_all()
+	_wf_reclust_us = Time.get_ticks_usec() - _wf_t0
+	_wf_reclust_frame = Engine.get_frames_drawn()
 	_dirty = false
 
 
@@ -266,13 +294,17 @@ func _sync_registration(root: int) -> void:
 ## §3 record shape (source-agnostic — P1 GEN villages produce the same). Fresh dict each call (the far tier snapshots).
 func _make_record(root: int) -> Dictionary:
 	var cl: Dictionary = _clusters[root]
+	# FP_STRUCT_EDIT_DEBOUNCE (§3.2): serve the PUBLISHED rev (masking REV only — bbox/count are current) so a legitimate
+	# GEN-side version bump (a crossing) that resnapshots mid-build re-materializes the record with the pre-edit rev ⇒
+	# _ensure_bake (keyed (root, rev)) keeps the cached pre-edit bake, no re-decimate. Off ⇒ `cl["rev"]` verbatim.
+	var rev := int(_rev_pub.get(root, 0)) if CubeSphere.FP_STRUCT_EDIT_DEBOUNCE else int(cl["rev"])
 	return {
 		"source": SOURCE_PLAYER,
 		"root": root,
 		"fid": int(cl["fid"]),
 		"bmin": cl["bmin"],
 		"bmax": cl["bmax"],
-		"rev": int(cl["rev"]),
+		"rev": rev,
 		"count": int(cl["count"]),
 		"mats": (cl["mats"] as Dictionary).duplicate(),
 		"max_extent": _max_extent(cl["bmin"], cl["bmax"]),
@@ -325,11 +357,58 @@ func rev_sum() -> int:
 		s += int(_reg[root]["rev"])
 	return s
 
+## FP_STRUCT_REG_EPOCH: an O(1) change token for the far tier's version-gated prelude. `_rev_counter` is monotone
+## and bumped on every cluster mutation (make-set/union/note_cell/note_removed/recluster); folding in `_reg.size()`
+## (bounded < STRUCT_REG_MAX) also catches a pure add/remove that keeps the rev-sum. Avoids the O(N) rev_sum() scan.
+func version() -> int:
+	if CubeSphere.FP_STRUCT_EDIT_DEBOUNCE:
+		return _version_pub                       # far-visible version advances only at publish() (player departed + idle)
+	return _rev_counter * 1024 + _reg.size()
+
+## FP_STRUCT_EDIT_DEBOUNCE: the cluster root the most recent note_cell/note_removed touched (−1 if the edit did not
+## affect a clustered structure). WorldManager reads this at the choke tail to key its pending debounce map.
+func last_noted_root() -> int:
+	return _last_noted_root
+
+## FP_STRUCT_EDIT_DEBOUNCE: {fid, bmin, bmax} for a live cluster root (for the pending map's world-AABB); {} if absent.
+func structure_bbox(root: int) -> Dictionary:
+	if not _clusters.has(root):
+		return {}
+	var cl: Dictionary = _clusters[root]
+	return {"fid": int(cl["fid"]), "bmin": cl["bmin"], "bmax": cl["bmax"]}
+
+## FP_STRUCT_EDIT_DEBOUNCE (§3.2): latch the PUBLISHED version + per-root revs from the truth (whole-tracker granularity,
+## §6 R3). Called from WorldManager._sed_publish when any tracker structure's debounce gate opens. After this,
+## version()/_make_record serve the current revs so the far tier re-bakes the changed player build exactly once.
+func publish() -> void:
+	_version_pub = _rev_counter * 1024 + _reg.size()
+	# latch the published revs FIRST (so _make_record below serves the NEW rev)…
+	for root in _clusters:
+		_rev_pub[root] = int((_clusters[root] as Dictionary)["rev"])
+	# …then RE-MAKE the registered records so registry() serves the published rev (Fable P0 / Codex P1): without this,
+	# _reg[root] keeps the pre-edit rev and _ensure_bake's (root, rev) key matches the cached PRE-edit bake ⇒ the
+	# player-build hole never appears far. Re-making with the freshly-latched _rev_pub advances the served rev by exactly
+	# the departure's worth of damage.
+	for root in _reg.keys():
+		if _clusters.has(root):
+			_reg[root] = _make_record(root)
+	# PRUNE _rev_pub to live cluster roots — reclusters rename roots, orphaning stale published-rev entries (leak).
+	if _rev_pub.size() > _clusters.size():
+		var drop: Array = []
+		for root in _rev_pub.keys():
+			if not _clusters.has(root):
+				drop.append(root)
+		for root in drop:
+			_rev_pub.erase(root)
+
 func tracked_count() -> int: return _cell_mat.size()
 func registry_count() -> int: return _reg.size()
 func is_saturated() -> bool: return _saturated
 func is_reg_saturated() -> bool: return _reg_saturated
 func recluster_count() -> int: return _dbg_recluster_count
+## FP_WORST_FRAME_ATTR §5: the last _recluster_all() self-time (µs), reported ONLY on the frame it actually ran (frame-
+## stamped) so a later worst frame that carried no recluster reads 0, not a stale spike. Cheap leaf; only READ under the flag.
+func wf_reclust_us() -> int: return _wf_reclust_us if _wf_reclust_frame == Engine.get_frames_drawn() else 0
 func is_dirty() -> bool: return _dirty
 
 ## NEVER-OOM ledger (§8): dict-entry arithmetic across the tracked-cell store + union-find + cluster records + registry.
@@ -339,4 +418,4 @@ func total_bytes() -> int:
 	var parent_b := _parent.size() * 48
 	var cluster_b := _clusters.size() * 160
 	var reg_b := _reg.size() * 224
-	return cell_b + parent_b + cluster_b + reg_b
+	return cell_b + parent_b + cluster_b + reg_b + _rev_pub.size() * 48   # FP_STRUCT_EDIT_DEBOUNCE: published revs (0 off-flag)

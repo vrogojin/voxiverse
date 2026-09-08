@@ -135,6 +135,12 @@ var _last_rebuild_cam := Vector3.ZERO   # camera pos (absolute) at the last real
 var _last_rebuild_cache_epoch := -1     # _cache_epoch at the last real rebuild
 var _last_rebuild_edits_rev := -1       # edit revision at the last real rebuild
 var _last_rebuild_shell := false        # FP_FT_SHELL_BAND: the zone (S vs B) of the last real rebuild — a zone flip re-arms exactly one
+## FP_FT_SHELL_FLIP_CALM (docs/COSMOS-SURFACE-ENTRY-SPIKE-DESIGN.md S2): a zone flip is PENDING — latched (not force-armed)
+## so the rebuild rides the normal paced/credit-gated path (FT_FLIP_MAX_MS failsafe), and the rung-1 mesh set stays visible
+## until the first zone-B card buffer commits clears it (no [R0,448) gap). Only read/written under the flag ⇒ byte-identical off.
+var _flip_pending := false
+var _flip_pending_ms := 0
+var _dbg_flip_defers := 0               # FP_WF_TIER_ATTR (F4): cumulative zone-flip DEFERS — "fired and helped" vs "never fired" sensor
 var _dbg_shell_zone := -1               # FP_FT_SHELL_BAND A/B readback: last computed zone (0=S,1=B,2=O; -1 off)
 var _dbg_shell_h := 0.0                 # last camera radial altitude the zone law saw
 var _dbg_shell_offsurf := false         # last shell_offsurface() the zone law saw
@@ -180,6 +186,40 @@ var _guard_dirty_card := false          # card buffer zeroed this guard pass (ca
 ## `_last_rebuild_wall_ms`. Both updated on every real rebuild (any path). Read only under the flag ⇒ byte-identical off.
 var _last_rebuild_wall_ms := 0
 var _stale_ref_cam := Vector3.ZERO
+
+## FP_FT_STALE_PARKED (docs/COSMOS-LOD-DROPOUT-DESIGN.md §3.2, Stage S1): the trees' pending-restore latch — the converse
+## of the cull-only FP_FT_NEAR_GUARD (which only ever HIDES). Recomputed fresh each `_compute_nearcull_fp` pass: set true
+## whenever a near-presence probe DISAGREES with the committed visibility — COVERED on a still-SHOWN tree (a hide wants to
+## start) or NOT_COVERED on a dwell-held HIDDEN tree (a restore wants to advance). Pure read (never mutates a dwell
+## streak). It feeds `_stale_override` (§3.1) and OR-folds into `_rebuild_inputs_changed`, so a cull streak frozen at
+## credit 0 under a PARKED camera drains at the ≤0.5 Hz wall-clock floor instead of stalling unbounded. Read/written only
+## under FP_FT_STALE_PARKED ⇒ byte-identical off (never set, never read).
+var _ft_cull_pending := false
+
+## FP_SKIN_READY_GATE (docs/COSMOS-LOD-DROPOUT-DESIGN.md §4, Stage S3): the card→skin handoff readiness query. Fed once
+## by WorldManager (only under the flag) → `_skin_ready_query.call(_last_wanted) -> float` returns the baked FRACTION of
+## the card-band handoff set (FacetTexBaker.ready_frac). Unset ⇒ `_skin_ready_frac()` returns 1.0 ⇒ the hold never
+## arms ⇒ the shipped pure-altitude zone-O hide verbatim (byte-identical). Read only under the flag.
+var _skin_ready_query: Callable = Callable()
+## FP_SKIN_READY_GATE §4.2 (Codex P0): the EMITTED-card handoff set — the DISTINCT facets that actually rendered a card
+## instance in the last _rebuild_cards commit (populated at the real _write_card sink, published atomically with the
+## card buffer). This — NOT the over-broad `_last_wanted` scan (which includes wanted-but-capped-out / near-culled
+## facets that render nothing) — is what the tier is genuinely holding, so it is the set whose skin readiness gates the
+## release. Empty ⇒ nothing on screen to hold ⇒ ready_frac 1.0 ⇒ no hold. Only touched under the flag (byte-off: the
+## empty dict is allocated once at construct and never cleared/written off-flag).
+var _skin_hold_fids: Dictionary = {}
+var _dbg_skin_hold := false             # S3 gate read-back: the card→skin hold was active last step
+var _dbg_skin_ready_frac := 1.0         # S3 gate read-back: the handoff set's baked fraction last step
+# FP_WORST_FRAME_ATTR (docs/COSMOS-LOD-DROPOUT-DESIGN.md §6): drawable-gap + hold telemetry for the live A/B. gap_ms =
+# accumulated wall-time the tier was in the DROPOUT state (off-surface, in the card band, with NO drawable cards AND the
+# replacement skin not yet ready) — the exact user-visible bug; gap_worst_ms = the longest single such contiguous run
+# (the A arm should show 2-30 s, the B arm ≤ ~2 s); hold_ms = time the readiness gate held cards. Only written under the
+# flag (leaf ints/floats, read only under the flag ⇒ byte-identical off).
+var _dbg_gap_ms := 0
+var _dbg_gap_worst_ms := 0
+var _dbg_hold_ms := 0
+var _dbg_gap_run_ms := 0                 # current contiguous gap run (ms), folded into worst on exit
+var _dbg_telem_last_ms := 0             # wall clock at the last telemetry tick (0 = un-primed)
 
 # =====================================================================================================================
 # Shader — HEAD + VoxiLight.shade_glsl() + TAIL. Alpha-scissor (discard), opaque (no sort), cull_disabled (the
@@ -354,6 +394,13 @@ static func mesh_shader_code() -> String:
 			"float _sn = step(1.5, INSTANCE_CUSTOM.y);\n\tfloat _hue = fract(INSTANCE_CUSTOM.y);\n\tfloat jit = 1.0 + (_hue - 0.5) * 0.08;")
 		tail = tail.replace("v_col = vec4(COLOR.rgb * voxi_shade(n, sun_dir) * jit, 1.0);",
 			"vec3 _alb = mix(COLOR.rgb, snow_tint, _sn * snow_amt * flag);\n\tv_col = vec4(_alb * voxi_shade(n, sun_dir) * jit, 1.0);")
+	# FP_FT_SHELL_FLIP_CALM (Fable F6): mirror the card shader's tier_fade splice into the MESH dither so a rung held
+	# visible into zone B (the flip-calm handoff) dissolves in lockstep with the cards instead of drawing full-opacity.
+	# The `> v_fade)` token lives only in _MESH_TAIL_FADE (FP_FAR_TREES_FADE), so guard on it. Gated on FP_FT_SHELL_FLIP_CALM
+	# so the mesh shader is byte-identical when the flag is off (shipped tail verbatim).
+	if CubeSphere.FP_FT_SHELL_FLIP_CALM and CubeSphere.FP_FT_SHELL_BAND and CubeSphere.FP_FAR_TREES_FADE:
+		head += "uniform float tier_fade = 1.0;\n"
+		tail = tail.replace("> v_fade)", "> v_fade * tier_fade)")
 	return head + VoxiLight.shade_glsl() + tail
 
 static func make_mesh_material() -> ShaderMaterial:
@@ -540,6 +587,47 @@ func _current_edits_rev() -> int:
 func set_near_query(q: Callable) -> void:
 	_near_query = q
 
+## FP_SKIN_READY_GATE §4.2: wire the card→skin readiness query (WorldManager → FacetTexBaker.ready_frac). Stored like the
+## near query; only read under the flag (byte-identical off — unset ⇒ _skin_ready_frac() == 1.0 ⇒ no hold).
+func set_skin_ready_query(q: Callable) -> void:
+	_skin_ready_query = q
+
+## FP_SKIN_READY_GATE §4.2: the baked fraction of THIS tier's EMITTED-card handoff set (`_skin_hold_fids` — the facets
+## that actually rendered a card last commit, NOT the over-broad `_last_wanted` want-scan; Codex P0). Unwired query OR an
+## empty emitted set ⇒ 1.0 (degrade to the shipped hide / nothing to hold). Called once per step, in the rate-capped
+## step(), so the ≤ card-instance-cap dict lookups inside ready_frac are negligible.
+func _skin_ready_frac() -> float:
+	if not _skin_ready_query.is_valid() or _skin_hold_fids.is_empty():
+		return 1.0
+	return float(_skin_ready_query.call(_skin_hold_fids.keys()))
+
+## FP_WORST_FRAME_ATTR (§6): accumulate the drawable-GAP + hold telemetry once per step (called before step()'s zone-O
+## early-return so the timer advances while the tier is hidden — precisely the gap state). A GAP is: off-surface, inside
+## the handoff altitude window, with NO DRAWABLE cards (node visible AND visible_instance_count > 0 — Codex: measure
+## drawable content, not just node.visible) AND the replacement skin not yet ready. Off ⇒ returns immediately (byte-off).
+func _skin_telem_tick(offsurf: bool, h: float) -> void:
+	if not CubeSphere.FP_WORST_FRAME_ATTR:
+		return
+	var now := Time.get_ticks_msec()
+	var dt := 0
+	if _dbg_telem_last_ms != 0:
+		dt = maxi(0, now - _dbg_telem_last_ms)
+	_dbg_telem_last_ms = now
+	if dt <= 0 or not CubeSphere.FP_FT_SHELL_BAND:
+		return
+	if _dbg_skin_hold:
+		_dbg_hold_ms += dt
+	var in_band := offsurf and h >= (CubeSphere.FT_SHELL_FADE_ALT - CubeSphere.SKIN_HANDOFF_MARGIN_ALT) \
+			and h < (CubeSphere.FT_SHELL_HOLD_MAX_ALT + 200.0)
+	var drawable := _mmi != null and _mmi.visible and _mm != null and _mm.visible_instance_count > 0
+	var skin_ok := _skin_ready_frac() >= CubeSphere.SKIN_READY_MIN
+	if in_band and not drawable and not skin_ok:
+		_dbg_gap_ms += dt
+		_dbg_gap_run_ms += dt
+		_dbg_gap_worst_ms = maxi(_dbg_gap_worst_ms, _dbg_gap_run_ms)
+	else:
+		_dbg_gap_run_ms = 0
+
 ## FP_FAR_TREES_NEARCULL §5.2-§5.3: should this tree's FAR impostor be EMITTED, given the NEAR field's ACTUAL mesh
 ## presence? Only the uncertainty annulus [FT_CULL_MIN, near_render_radius()+40] is probed (below ⇒ never emit — the near
 ## field owns it, no gap; above the max near-mesh extent ⇒ emit, no probe — near can't reach there; the near field never
@@ -582,6 +670,10 @@ func _nearcull_emit(fid: int, dist: float, bx: float, gy: float, bz: float) -> b
 ## (otherwise DELTA-skipped) rebuild. PURE READ: no dwell mutation (dwell advances only in the real rebuild, so the
 ## FT_CULL_DWELL count stays 'consecutive rebuilds'). Probes are capped at CULL_PROBE_CAP. Only called under the flag.
 func _compute_nearcull_fp(cam_abs: Vector3, wanted: Array) -> int:
+	# FP_FT_STALE_PARKED §3.2: recompute the pending-restore latch fresh each pass (set below on any presence/visibility
+	# disagreement). Reset here — before the is_valid early-out — so an unwired near-query settles it false. Off ⇒ untouched.
+	if CubeSphere.FP_FT_STALE_PARKED:
+		_ft_cull_pending = false
 	if not _near_query.is_valid():
 		return 0
 	var probe_hi := float(TerrainConfig.near_render_radius()) + 32.0 + 8.0
@@ -625,8 +717,12 @@ func _compute_nearcull_fp(cam_abs: Vector3, wanted: Array) -> int:
 			var dw := int(_cull_dwell.get(key, -1))
 			if st == NearPresence.COVERED:
 				fp ^= h
+				if CubeSphere.FP_FT_STALE_PARKED and dw < 0:
+					_ft_cull_pending = true          # §3.2: COVERED on a still-SHOWN tree ⇒ a hide wants to advance
 			elif st == NearPresence.NOT_COVERED and dw >= 0:
 				fp ^= _cull_mix(h, dw)
+				if CubeSphere.FP_FT_STALE_PARKED:
+					_ft_cull_pending = true          # §3.2: NOT_COVERED on a dwell-held HIDDEN tree ⇒ a restore wants to advance
 			elif st == NearPresence.UNKNOWABLE and dw >= 1:
 				fp ^= _cull_mix(h, dw) ^ FT_CULL_SALT_U
 	return fp
@@ -763,25 +859,38 @@ func _is_chopped(fid: int, bx: float, gy: float, bz: float) -> bool:
 ## behaviour). Under FP_FAR_TREES_COLORFIX (§4.2): any offsurf frame latches `_stale`, and the tier stays hidden
 ## on the offsurf→onsurf flip until the first completed rebuild clears the latch (correct-or-nothing, no stale-band
 ## garbage frame). Cleared by `_rebuild_*`'s caller (step / debug_rebuild) after the first real rebuild.
-func _apply_visibility(offsurf: bool, h := -1.0) -> void:
+func _apply_visibility(offsurf: bool, h := -1.0, hide_alt := -1.0) -> void:
+	# FP_SKIN_READY_GATE §4.2: the caller passes the EFFECTIVE zone-O boundary — the shipped FT_SHELL_HIDE_ALT normally,
+	# or FT_SHELL_HOLD_MAX_ALT while the card→skin hold is active (so zone B extends up to the ceiling: cards keep
+	# rendering above 600 while the skin bakes, and _stale is NOT latched). Default -1 ⇒ FT_SHELL_HIDE_ALT (byte-off).
+	var hi := hide_alt if hide_alt >= 0.0 else CubeSphere.FT_SHELL_HIDE_ALT
 	# FP_FT_SHELL_BAND §3: the three-zone altitude law. Off (or no `h` supplied — the default -1 keeps existing call
 	# sites/gates on the shipped path) ⇒ the binary offsurf⇒hide below, byte-identical.
 	if CubeSphere.FP_FT_SHELL_BAND and h >= 0.0:
 		if not offsurf:
 			# ZONE S (surface): cards + meshes shown unless the COLORFIX stale latch holds (shipped).
 			var show_s := not (CubeSphere.FP_FAR_TREES_COLORFIX and _stale)
+			# FP_FT_SHELL_FLIP_CALM §S2.2 (descent mirror, Fable F2): on a B→S flip the card MMI still holds the zone-B
+			# [R0,2400] buffer, which would DOUBLE-RENDER over the resident mesh rung [R0,448). While the flip is pending
+			# (the last rebuild was zone B), keep the CARDS hidden + the meshes up until the zone-S rebuild repartitions
+			# (mesh [R0,448) + cards [448,2400]) and clears _flip_pending. Off ⇒ both shown (shipped, byte-identical).
+			var descent_pending := CubeSphere.FP_FT_SHELL_FLIP_CALM and _flip_pending and _last_rebuild_shell
 			if _mmi != null:
-				_mmi.visible = show_s
+				_mmi.visible = show_s and not descent_pending
 			for mmi in _mesh_mmis:
 				(mmi as MultiMeshInstance3D).visible = show_s
-		elif h < CubeSphere.FT_SHELL_HIDE_ALT:
+		elif h < hi:
 			# ZONE B (shell band): CARDS visible + LIVE (no _stale latch — the set stays live); mesh rung HIDDEN. A
 			# de-orbit O→B keeps _stale until the first zone-B rebuild clears it (correct-or-nothing, §4.2).
 			var show_b := not (CubeSphere.FP_FAR_TREES_COLORFIX and _stale)
 			if _mmi != null:
 				_mmi.visible = show_b
+			# FP_FT_SHELL_FLIP_CALM §S2.2: keep the rung-1 mesh set VISIBLE while a zone flip is pending (the first zone-B
+			# card buffer has not committed yet) so the S→B handoff never opens a [R0,448) gap — the meshes hold real
+			# geometry (drawn one frame ago). Cleared the instant the zone-B rebuild commits (step()). Off ⇒ hidden (shipped).
+			var keep_mesh := CubeSphere.FP_FT_SHELL_FLIP_CALM and _flip_pending and show_b
 			for mmi in _mesh_mmis:
-				(mmi as MultiMeshInstance3D).visible = false
+				(mmi as MultiMeshInstance3D).visible = keep_mesh
 		else:
 			# ZONE O (orbit): hidden + frozen; latch _stale so a later descent shows nothing until a fresh rebuild.
 			if CubeSphere.FP_FAR_TREES_COLORFIX:
@@ -808,20 +917,47 @@ func step(settled := true, credit_ok := true, cam_render := Vector3.ZERO) -> voi
 	# (§4.2): trees show ON-surface only" — the whole node hidden + the set frozen — verbatim below (byte-identical).
 	var offsurf := (_ring as FacetFarRing).shell_offsurface()
 	var h := (_ring as FacetFarRing).shell_cam_alt() if CubeSphere.FP_FT_SHELL_BAND else -1.0
-	var shell_mode := CubeSphere.FP_FT_SHELL_BAND and offsurf and h < CubeSphere.FT_SHELL_HIDE_ALT
+	# FP_SKIN_READY_GATE §4.2 (S3): the card→skin HOLD — do NOT hand the view to the fine-map skin (zone O) until the
+	# handoff set's skin is baked (ready_frac ≥ SKIN_READY_MIN), up to the hard ceiling FT_SHELL_HOLD_MAX_ALT. Armed
+	# early (from FADE_ALT − MARGIN) so the tier_fade never sinks below SKIN_HOLD_FADE while the skin is un-ready. Only
+	# under FP_FT_SHELL_BAND (the shell band is where the handoff lives); unwired baker ⇒ frac 1.0 ⇒ never holds ⇒
+	# byte-identical. `hide_alt` = the effective zone-O boundary the visibility + shell_mode use while holding.
+	var hold := false
+	if CubeSphere.FP_SKIN_READY_GATE and CubeSphere.FP_FT_SHELL_BAND and offsurf \
+			and h >= (CubeSphere.FT_SHELL_FADE_ALT - CubeSphere.SKIN_HANDOFF_MARGIN_ALT) \
+			and h < CubeSphere.FT_SHELL_HOLD_MAX_ALT:
+		_dbg_skin_ready_frac = _skin_ready_frac()
+		hold = _dbg_skin_ready_frac < CubeSphere.SKIN_READY_MIN
+	_dbg_skin_hold = hold
+	var hide_alt := CubeSphere.FT_SHELL_HOLD_MAX_ALT if hold else CubeSphere.FT_SHELL_HIDE_ALT
+	var shell_mode := CubeSphere.FP_FT_SHELL_BAND and offsurf and h < hide_alt
 	# FP_FT_SHELL_BAND A/B readback: latch the computed zone (0=S,1=B,2=O; -1 flag off) + offsurf/h for a confound-free
 	# live telemetry probe (shell_band_state()). Cheap unconditional writes; only READ under the flag → byte-identical off.
-	_dbg_shell_zone = (-1 if not CubeSphere.FP_FT_SHELL_BAND else (0 if not offsurf else (1 if h < CubeSphere.FT_SHELL_HIDE_ALT else 2)))
+	_dbg_shell_zone = (-1 if not CubeSphere.FP_FT_SHELL_BAND else (0 if not offsurf else (1 if h < hide_alt else 2)))
 	_dbg_shell_h = h
 	_dbg_shell_offsurf = offsurf
-	_apply_visibility(offsurf, h)
+	# FP_FT_SHELL_FLIP_CALM §S2: latch a zone flip BEFORE the visibility apply so the flip frame keeps the rung-1 mesh
+	# visible (no gap) while the paced zone-B rebuild is deferred. No-op unless the flag is live.
+	_note_shell_flip(shell_mode)
+	_apply_visibility(offsurf, h, hide_alt)
+	_skin_telem_tick(offsurf, h)   # FP_WORST_FRAME_ATTR: gap/hold accounting BEFORE the zone-O early-return (byte-off)
 	if offsurf and not shell_mode:
 		return
 	# FP_FT_SHELL_BAND §3.3: drive the tier dissolve uniform every frame (cheap, no rebuild) — 1.0 in zone S, ramping to 0
 	# over [FADE_ALT, HIDE_ALT] in zone B so the tier hands off to the rung-3 speckle. Off / no material ⇒ never set.
 	if CubeSphere.FP_FT_SHELL_BAND and _material != null:
 		var tf := (1.0 - smoothstep(CubeSphere.FT_SHELL_FADE_ALT, CubeSphere.FT_SHELL_HIDE_ALT, h)) if shell_mode else 1.0
+		# FP_SKIN_READY_GATE §4.2: while holding, clamp the dissolve to SKIN_HOLD_FADE so the cards stay clearly present
+		# over the whole fade band + the extended hold (above HIDE_ALT the smoothstep is already 1 ⇒ tf 0 ⇒ clamped up).
+		# Released the step the skin becomes ready (hold flips false) ⇒ the natural ramp resumes ⇒ cards fade within a step.
+		if hold:
+			tf = maxf(tf, CubeSphere.SKIN_HOLD_FADE)
 		_material.set_shader_parameter("tier_fade", tf)
+		# FP_FT_SHELL_FLIP_CALM (Fable F6): under the flip-calm handoff the rung-1 mesh set can stay VISIBLE into zone B
+		# (held until the card buffer commits). Drive the SAME tier_fade on the mesh material so a held rung fades in
+		# lockstep with the cards instead of drawing full-opacity — no un-faded pop near HIDE_ALT. No-op / no material off.
+		if CubeSphere.FP_FT_SHELL_FLIP_CALM and _mesh_material != null:
+			_mesh_material.set_shader_parameter("tier_fade", tf)
 	var cam_abs := _cam_to_absolute(cam_render)            # one absolute-frame camera — guard, staleness floor + rebuild all reuse it
 	# FP_FT_NEAR_GUARD §1 (task #132): the bounded cull-only double-render guard runs BEFORE the settle/credit return, so it
 	# heals far-over-near even while the client sits at stream credit 0 (the ~30fps regime where the rebuild — and thus the
@@ -886,15 +1022,38 @@ func step(settled := true, credit_ok := true, cam_render := Vector3.ZERO) -> voi
 	# `_apply_visibility` shows the (now correct-band) tier. Off ⇒ inert (_stale is never set). See `_apply_visibility`.
 	if CubeSphere.FP_FAR_TREES_COLORFIX:
 		_stale = false
+	# FP_FT_SHELL_FLIP_CALM §S2.2: the zone rebuild just committed the correct-zone buffer, so the pending flip is
+	# resolved — clear it and RE-APPLY visibility THIS frame (visibility already ran at the top with _flip_pending true,
+	# keeping the mesh up) so the rung-1 mesh hides now the cards are resident, with no one-frame mesh+card double-render.
+	if CubeSphere.FP_FT_SHELL_FLIP_CALM and _flip_pending:
+		_flip_pending = false
+		_apply_visibility(offsurf, h)
 	_note_rebuilt(now, cam_abs)   # FP_FT_STALE_REBUILD §4.1: reset the staleness floor's reference (no-op read off)
 
 ## FP_FT_STALE_REBUILD §4.1: should the credit gate be overridden to let ONE real rebuild through at credit 0? True only
 ## under the flag, settled, credit 0, and the camera moved > FT_STALE_MOVE from the last rebuild AND ≥ FT_STALE_MS since it
 ## — a hard ≤0.5 Hz floor. Off ⇒ always false (byte-identical credit gate). Extracted so the gate can drive it directly.
 func _stale_override(settled: bool, credit_ok: bool, cam_abs: Vector3) -> bool:
-	if not (CubeSphere.FP_FT_STALE_REBUILD and settled and not credit_ok):
+	if not (settled and not credit_ok):
 		return false
-	return Time.get_ticks_msec() - _last_rebuild_wall_ms >= FT_STALE_MS and cam_abs.distance_to(_stale_ref_cam) > FT_STALE_MOVE
+	# FP_FT_SHELL_FLIP_CALM §S2.1 (Codex P0-1 / Fable F3): an EXPIRED pending flip MUST force its rebuild through the
+	# credit gate even when parked at credit 0 — else step() returns here (before _rebuild_inputs_changed can evaluate the
+	# FT_FLIP_MAX_MS failsafe) and the flip latch persists unbounded (a permanent stale band). Independent of
+	# FP_FT_STALE_REBUILD and NOT subject to the FT_STALE_MS floor (FT_FLIP_MAX_MS is its own rate bound; it fires once,
+	# then _flip_pending clears). Off ⇒ the term is false (the flag short-circuits) ⇒ byte-identical below.
+	if CubeSphere.FP_FT_SHELL_FLIP_CALM and _flip_pending \
+			and Time.get_ticks_msec() - _flip_pending_ms >= CubeSphere.FT_FLIP_MAX_MS:
+		return true
+	if not CubeSphere.FP_FT_STALE_REBUILD:
+		return false
+	if Time.get_ticks_msec() - _last_rebuild_wall_ms < FT_STALE_MS:
+		return false                                          # the ≤0.5 Hz wall-clock floor (BOTH arms — never removed)
+	# FP_FT_STALE_PARKED §3.1 (S1): drop the FT_STALE_MOVE conjunct so the floor fires for a PARKED camera too, but gate it
+	# on (moved ∨ _stale ∨ _ft_cull_pending) so a fully-settled parked camera with NOTHING latched/pending re-admits no
+	# rebuilds (the cost bound). Off ⇒ the shipped `moved > FT_STALE_MOVE` conjunct verbatim (byte-identical credit gate).
+	if CubeSphere.FP_FT_STALE_PARKED:
+		return cam_abs.distance_to(_stale_ref_cam) > FT_STALE_MOVE or _stale or _ft_cull_pending
+	return cam_abs.distance_to(_stale_ref_cam) > FT_STALE_MOVE
 
 ## FP_FT_STALE_REBUILD §4.1: record that a real rebuild just ran — resets the staleness floor (time + reference camera) so
 ## a still camera never re-triggers and a moving one rebuilds at most every FT_STALE_MS. Cheap unconditional write; the
@@ -902,6 +1061,17 @@ func _stale_override(settled: bool, credit_ok: bool, cam_abs: Vector3) -> bool:
 func _note_rebuilt(now_ms: int, cam_abs: Vector3) -> void:
 	_last_rebuild_wall_ms = now_ms
 	_stale_ref_cam = cam_abs
+
+## FP_FT_SHELL_FLIP_CALM §S2.1: latch a zone (S↔B) flip as PENDING — served by the paced/credit-gated rebuild path + the
+## FT_FLIP_MAX_MS failsafe, NOT force-armed. Idempotent (the timestamp is stamped once per flip so the failsafe clock
+## measures from the flip). Called from step() (before _apply_visibility, so the flip frame's visibility already sees the
+## latch) AND from _rebuild_inputs_changed (so debug_step latches too). No-op unless the flag is live.
+func _note_shell_flip(shell_mode: bool) -> void:
+	if CubeSphere.FP_FT_SHELL_FLIP_CALM and CubeSphere.FP_FT_SHELL_BAND \
+			and shell_mode != _last_rebuild_shell and not _flip_pending:
+		_flip_pending = true
+		_flip_pending_ms = Time.get_ticks_msec()
+		_dbg_flip_defers += 1                                  # F4: a flip was deferred (not force-armed) this crossing
 
 # --- enumeration worker (one facet / job) ---------------------------------------------------------------------------
 
@@ -1062,13 +1232,30 @@ func _rebuild_inputs_changed(cam_abs: Vector3, shell_mode := false, h := 0.0) ->
 	# and re-arm exactly one rebuild on a zone (S↔B) flip. Off / zone S ⇒ the shipped threshold + no zone term (byte-identical).
 	if shell_mode:
 		move_thr = maxf(CubeSphere.FT_DELTA_MOVE_HYST, CubeSphere.FT_SHELL_MOVE_FRAC * h)
+	# FP_FT_WALK_CALM (docs/COSMOS-FARTIER-WALK-DESIGN.md §2.2 Step B, Lever 1): raise the camera re-arm to
+	# FT_CALM_MARGIN·0.5 (16 blk), paired with the FT_CALM_MARGIN band-edge slack in _rebuild_cards/_rebuild_meshes so a
+	# sub-margin walk emits the identical resident set. Superseded-by-max over MOVE_HYST/shell; degrades to the shipped
+	# threshold when a cap was hit last rebuild (nearest-first ordering is then genuinely camera-dependent). Off ⇒ untouched.
+	if CubeSphere.FP_FT_WALK_CALM and not (_capped or _mesh_capped):
+		move_thr = maxf(move_thr, CubeSphere.FT_CALM_MARGIN * 0.5)
+	# FP_FT_SHELL_FLIP_CALM §S2.1: the raw zone flip no longer force-arms a rebuild. Latch it PENDING (here too, so
+	# debug_step latches) and drop it from the immediate-change set; the flip is then served by the normal levers below
+	# (camera move / cache / edits) OR the FT_FLIP_MAX_MS failsafe. Off ⇒ the shipped `shell_mode != _last_rebuild_shell`
+	# term verbatim (byte-identical).
+	_note_shell_flip(shell_mode)
+	var flip_term: bool
+	if CubeSphere.FP_FT_SHELL_FLIP_CALM:
+		flip_term = _flip_pending and (Time.get_ticks_msec() - _flip_pending_ms >= CubeSphere.FT_FLIP_MAX_MS)
+	else:
+		flip_term = CubeSphere.FP_FT_SHELL_BAND and shell_mode != _last_rebuild_shell
 	var changed := (not _have_rebuilt) \
-		or (CubeSphere.FP_FT_SHELL_BAND and shell_mode != _last_rebuild_shell) \
+		or flip_term \
 		or cam_abs.distance_to(_last_rebuild_cam) >= move_thr \
 		or _cache_epoch != _last_rebuild_cache_epoch \
 		or _current_edits_rev() != _last_rebuild_edits_rev \
 		or (CubeSphere.FP_FAR_TREES_COLORFIX and _stale) \
-		or (not shell_mode and CubeSphere.FP_FAR_TREES_NEARCULL and _pending_nearcull_fp != _last_rebuild_nearcull_fp)
+		or (not shell_mode and CubeSphere.FP_FAR_TREES_NEARCULL and _pending_nearcull_fp != _last_rebuild_nearcull_fp) \
+		or (CubeSphere.FP_FT_STALE_PARKED and _ft_cull_pending)
 	if changed:
 		_have_rebuilt = true
 		_last_rebuild_cam = cam_abs
@@ -1131,6 +1318,12 @@ func _rebuild_cards(cam_abs: Vector3, wanted: Array, shell_mode := false) -> voi
 	buf.resize(cap * CARD_STRIDE)
 	var n := 0
 	var capped := false
+	# FP_SKIN_READY_GATE §4.2 (Codex P0): rebuild the EMITTED-card handoff set from the ACTUAL card sink below (a fid is
+	# added only when a card instance is truly written for it), published atomically with `buf`. Cleared here, before the
+	# emit loop; off ⇒ never touched (byte-identical). See _skin_hold_fids.
+	var gather_hold := CubeSphere.FP_SKIN_READY_GATE and CubeSphere.FP_FT_SHELL_BAND
+	if gather_hold:
+		_skin_hold_fids.clear()
 	for fid in wanted:
 		if n >= cap:
 			capped = true
@@ -1193,6 +1386,11 @@ func _rebuild_cards(cam_abs: Vector3, wanted: Array, shell_mode := false) -> voi
 			var snow := 1.0 if (raw & 8) != 0 else 0.0    # bit 3 = P3 snow flag (always 0 with SNOW off)
 			# .w carries the dither alpha under FADE (0.0 off); .z carries the snow flag (0.0 off) — byte-identical.
 			_write_card(buf, n * CARD_STRIDE, sx, sy, sz, rx, ry, rz, trunk_h, col, hue, alpha if fade else 0.0, snow, fb)
+			# FP_SKIN_READY_GATE §4.2 (Codex P0): this facet actually rendered a card ⇒ it is genuinely held → part of the
+			# skin-readiness handoff set. (Recorded at the true sink so capped-out / near-culled facets that emit nothing
+			# are excluded — the set equals what is on screen.)
+			if gather_hold:
+				_skin_hold_fids[int(fid)] = true
 			# FP_FT_NEAR_GUARD §1: when the mesh rung is OFF the cards own the near frontier, so record card impostors for the
 			# guard (mm_sel = −1 → the shared card MultiMesh; slot = n). With meshes ON, cards live ≥448 (never guard-relevant)
 			# so they're not recorded — the mesh capture owns the frontier. Only under the flag ⇒ byte-identical off.
@@ -1647,11 +1845,29 @@ func debug_step(wanted: Array, cam_abs: Vector3, shell_mode := false, h := 0.0) 
 		_nearcull_end()
 	if CubeSphere.FP_FAR_TREES_COLORFIX:
 		_stale = false
+	# FP_FT_SHELL_FLIP_CALM §S2.2: mirror step() — a completed rebuild resolves the pending flip (the gate re-checks
+	# visibility via debug_apply_visibility, so no re-apply here).
+	if CubeSphere.FP_FT_SHELL_FLIP_CALM:
+		_flip_pending = false
 	_note_rebuilt(Time.get_ticks_msec(), cam_abs)
 	return true
 
 func rebuild_count() -> int:
 	return _dbg_rebuild_count
+
+## FP_FT_SHELL_FLIP_CALM gate hooks (G-FT-FLIP-CALM): read the pending-flip latch + drive its failsafe clock so the
+## de-forced flip (paced + mesh-visible-until-commit) is provable without a live ring / a 2 s wall wait.
+func debug_flip_pending() -> bool:
+	return _flip_pending
+func debug_set_flip_pending_ms(ms: int) -> void:
+	_flip_pending_ms = ms
+func debug_set_flip_pending(v: bool) -> void:
+	_flip_pending = v
+func debug_set_last_step_ms(ms: int) -> void:                   # bypass the FT_SHELL_REBUILD_MS step cap in the real-step gate
+	_last_step_ms = ms
+## FP_WF_TIER_ATTR (F4): cumulative zone-flip defers — the "fired and helped" vs "never fired" live sensor.
+func flip_defers() -> int:
+	return _dbg_flip_defers
 
 ## FP_FT_STALE_REBUILD gate hooks (G-FTS-*): drive the staleness-override decision directly + manipulate/read its
 ## reference, so the ≤0.5 Hz floor logic is provable without a live FacetFarRing / a 2 s wall wait.
@@ -1662,6 +1878,15 @@ func debug_set_stale_ref(cam_abs: Vector3, wall_ms: int) -> void:
 	_last_rebuild_wall_ms = wall_ms
 func debug_stale_ref_cam() -> Vector3:
 	return _stale_ref_cam
+
+## FP_FT_STALE_PARKED gate hooks (G-LG-FLOOR / G-LG-PENDING): drive/read the parked-floor latches directly, so the S1
+## predicate (wall-clock floor + the _stale / _ft_cull_pending disjuncts) is provable without a live ring or a 2 s wait.
+func debug_set_stale(v: bool) -> void:
+	_stale = v
+func debug_set_ft_cull_pending(v: bool) -> void:
+	_ft_cull_pending = v
+func debug_ft_cull_pending() -> bool:
+	return _ft_cull_pending
 
 ## FP_FT_NEAR_GUARD gate read-backs (G-FTG-*): captured live-impostor metadata rows, rows the guard has zero-scaled this
 ## epoch, and the world-space X-axis length of a mesh instance's live transform (≈0 once the guard has collapsed it — the
@@ -1699,8 +1924,53 @@ func mesh_min_vertex_y(col: int) -> float:
 	return mn
 
 ## FP_FAR_TREES_COLORFIX gate hooks (§4): drive the visibility latch + read the mesh MultiMesh color-slot state.
-func debug_apply_visibility(offsurf: bool, h := -1.0) -> void:
-	_apply_visibility(offsurf, h)
+func debug_apply_visibility(offsurf: bool, h := -1.0, hide_alt := -1.0) -> void:
+	_apply_visibility(offsurf, h, hide_alt)
+
+## FP_SKIN_READY_GATE gate hook (G-SKIN-GATE): replicate step()'s hold decision + visibility + tier_fade for a scripted
+## altitude sweep (no live ring). Uses the wired _skin_ready_query (a gate stub) exactly as step() does. Returns the
+## computed {skin_hold, skin_ready_frac, hide_alt, ft_cards (card MMI visible), tier_fade, ft_stale}.
+## G-SKIN-GATE helper: seed the emitted-card handoff set directly so a scripted hold test can drive ready_frac through
+## the wired query WITHOUT a live card rebuild (the hold-law tests). The REAL construction is exercised by
+## debug_rebuild_cards below (G-SKIN-SET). Only a gate touches this.
+func debug_seed_skin_hold_fids(fids: Array) -> void:
+	_skin_hold_fids.clear()
+	for f in fids:
+		_skin_hold_fids[int(f)] = true
+
+## G-SKIN-SET helper: run the REAL card sink (populates _skin_hold_fids from the actual _write_card, published with the
+## buffer) so the gate can assert the handoff set == the emitted-card facets (not the over-broad wanted scan) + the
+## drawable instance count. Returns the committed instance count.
+func debug_rebuild_cards(cam_abs: Vector3, wanted: Array, shell_mode := true) -> int:
+	_rebuild_cards(cam_abs, wanted, shell_mode)
+	return _mm.visible_instance_count
+
+## G-SKIN-SET read-back: the emitted-card handoff set (the facets that actually rendered a card last rebuild).
+func skin_hold_fids() -> Array:
+	return _skin_hold_fids.keys()
+
+func debug_skin_gate(offsurf: bool, h: float) -> Dictionary:
+	var hold := false
+	if CubeSphere.FP_SKIN_READY_GATE and CubeSphere.FP_FT_SHELL_BAND and offsurf \
+			and h >= (CubeSphere.FT_SHELL_FADE_ALT - CubeSphere.SKIN_HANDOFF_MARGIN_ALT) \
+			and h < CubeSphere.FT_SHELL_HOLD_MAX_ALT:
+		_dbg_skin_ready_frac = _skin_ready_frac()
+		hold = _dbg_skin_ready_frac < CubeSphere.SKIN_READY_MIN
+	_dbg_skin_hold = hold
+	var hide_alt := CubeSphere.FT_SHELL_HOLD_MAX_ALT if hold else CubeSphere.FT_SHELL_HIDE_ALT
+	var shell_mode := CubeSphere.FP_FT_SHELL_BAND and offsurf and h < hide_alt
+	_apply_visibility(offsurf, h, hide_alt)
+	var tf := (1.0 - smoothstep(CubeSphere.FT_SHELL_FADE_ALT, CubeSphere.FT_SHELL_HIDE_ALT, h)) if shell_mode else 1.0
+	if hold:
+		tf = maxf(tf, CubeSphere.SKIN_HOLD_FADE)
+	return {
+		"skin_hold": hold,
+		"skin_ready_frac": _dbg_skin_ready_frac,
+		"hide_alt": hide_alt,
+		"ft_cards": (_mmi != null and _mmi.visible),
+		"tier_fade": tf,
+		"ft_stale": _stale,
+	}
 func mmi_visible() -> bool:
 	return _mmi != null and _mmi.visible
 ## FP_FT_SHELL_BAND gate read-back (G-FTSB-VIS): the mesh rung MMI visibility (hidden in zone B). True iff ANY mesh MMI shows.
@@ -1716,13 +1986,25 @@ func mesh_mmi_visible() -> bool:
 func shell_band_state() -> Dictionary:
 	if not CubeSphere.FP_FT_SHELL_BAND:
 		return {}
-	return {
+	var d := {
 		"ft_zone": _dbg_shell_zone,
 		"ft_cards": (_mmi != null and _mmi.visible),
+		"ft_ci": (_mm.visible_instance_count if _mm != null else 0),   # DRAWABLE card count (0 with node visible ⇒ hidden gap)
 		"ft_mesh": mesh_mmi_visible(),
 		"ft_off": _dbg_shell_offsurf,
 		"ft_h": snappedf(_dbg_shell_h, 0.1),
 	}
+	# FP_SKIN_READY_GATE / FP_WORST_FRAME_ATTR §6: the skin-handoff readiness + drawable-gap telemetry (absent off both
+	# flags ⇒ byte-identical snapshot). ft_gap_worst_ms is the A/B discriminator (A: 2-30 s spikes; B: ≤ ~2 s).
+	if CubeSphere.FP_SKIN_READY_GATE:
+		d["ft_skin_hold"] = _dbg_skin_hold
+		d["ft_skin_frac"] = snappedf(_dbg_skin_ready_frac, 0.01)
+		d["ft_skin_held"] = _skin_hold_fids.size()
+	if CubeSphere.FP_WORST_FRAME_ATTR:
+		d["ft_gap_ms"] = _dbg_gap_ms
+		d["ft_gap_worst_ms"] = _dbg_gap_worst_ms
+		d["ft_hold_ms"] = _dbg_hold_ms
+	return d
 func is_stale() -> bool:
 	return _stale
 func mesh_uses_colors() -> bool:

@@ -30,6 +30,7 @@ extends SceneTree
 
 const FT := preload("res://src/world/facet_far_trees.gd")
 const FA := preload("res://src/cosmos/facet_atlas.gd")
+const FFR := preload("res://src/world/facet_far_ring.gd")   # real ring for the G-FT-FLIP-CALM-REAL credit-path gate
 
 # The LIVE deploy flag fingerprint this gate models for its baseline pins — NOT CubeSphere.FP_* (repo-default
 # false would silently void a pin). The ON assertions read CubeSphere.FP_FAR_TREES directly (sed-toggled).
@@ -59,6 +60,11 @@ class FakeWorld extends RefCounted:
 	var band := Vector2(-64.0, 130.0)
 	func skin_near_meshed(_fid: int, _box: AABB) -> bool: return meshed
 	func meshed_band_y(_ly: float) -> Vector2: return band
+## G-SKIN-GATE skin-readiness stub: the tier's _skin_ready_query calls this with _last_wanted; it returns a controllable
+## baked fraction (a method, not a captured local — the closure-trap guard). Mirrors FacetTexBaker.ready_frac.
+var _fake_skin_frac := 1.0
+func _fake_skin_ready(_fids) -> float:
+	return _fake_skin_frac
 func _ok(c: bool, m: String) -> void:
 	if c: _pass += 1
 	else:
@@ -129,9 +135,21 @@ func _initialize() -> void:
 		_gate_texmean()
 		# G-FTS (FP_FT_STALE_REBUILD, #132 P1): the ≤0.5Hz staleness floor — credit-0 rebuild-while-moving. Two-state.
 		_gate_stale()
+		# G-LG-FLOOR / G-LG-PENDING (FP_FT_STALE_PARKED, LOD-DROPOUT S1): the PARKED-camera wall-clock floor +
+		# pending-restore latch. Two-state, self-describing (off => the shipped move-AND-time override verbatim).
+		_gate_parked_floor()
 		# G-FTSB (FP_FT_SHELL_BAND, far-tree orbit dropout): the three-zone altitude visibility law + zone-B card-only
 		# rebuild + cadence + de-orbit latch. Two-state, self-describing (off ⇒ shipped binary offsurf⇒hide).
 		_gate_shell_band()
+		# G-FT-FLIP-CALM (FP_FT_SHELL_FLIP_CALM, surface-entry spike S2): the de-forced zone flip — paced, credit-gated,
+		# mesh-visible-until-commit. Two-state, self-describing (off ⇒ the shipped force-arm on the flip step).
+		_gate_flip_calm()
+		# G-FT-FLIP-CALM-REAL (Codex P0-1 / Fable F3): the BOUNDED-DEFERRAL fix through the REAL step() credit/settle path
+		# (a live FacetFarRing, not debug_step) — an expired flip must force its rebuild even parked at credit 0.
+		_gate_flip_calm_real()
+		# G-SKIN-GATE (FP_SKIN_READY_GATE, LOD-DROPOUT S3): the card→skin hide holds until the handoff set's skin is
+		# baked (ready_frac ≥ SKIN_READY_MIN), up to FT_SHELL_HOLD_MAX_ALT. Two-state (off ⇒ the shipped zone-O hide).
+		_gate_skin_gate()
 	else:
 		print("  (ON gates skipped — need FACETED + FP_FAR_TREES sed-toggled true)")
 
@@ -140,6 +158,87 @@ func _initialize() -> void:
 
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
+
+# ---- G-SKIN-GATE (FP_SKIN_READY_GATE, LOD-DROPOUT S3) ---------------------------------------------------------------
+## The card→skin hide is gated on baked-skin readiness: cards HOLD (visible, tier_fade ≥ SKIN_HOLD_FADE, no _stale
+## latch) above FT_SHELL_HIDE_ALT until ready_frac ≥ SKIN_READY_MIN, OR the camera passes FT_SHELL_HOLD_MAX_ALT (the
+## hard ceiling) past which the hold releases regardless. Off ⇒ the shipped zone-O hide verbatim. A stub skin-ready
+## query (`_fake_skin_ready`) drives a controllable fraction so the whole hold law is proven without a live baker.
+func _gate_skin_gate() -> void:
+	if not CubeSphere.FP_FAR_TREES_CARDS:
+		print("  (G-SKIN-GATE skipped — needs FP_FAR_TREES_CARDS sed-toggled true)")
+		return
+	var on := CubeSphere.FP_SKIN_READY_GATE and CubeSphere.FP_FT_SHELL_BAND
+	var fid: int = _sample_facets()[0]
+	if on:
+		# un-ready skin at h=650 (∈ (HIDE 600, HOLD_MAX 900)) ⇒ cards HELD visible, faded ≥ floor, NOT stale.
+		# The handoff set MUST be non-empty for the readiness query to be consulted (Codex P0: readiness is over the
+		# EMITTED set, so an empty set degrades to frac 1.0 = no hold). Seed one facet, then drive the hold law.
+		var t1 = FT.new(); t1.setup_instance(_fake_ring(), fid); t1.set_skin_ready_query(Callable(self, "_fake_skin_ready"))
+		t1.debug_seed_skin_hold_fids([fid])
+		_fake_skin_frac = 0.0
+		var rh := t1.debug_skin_gate(true, 650.0)
+		_ok(rh["skin_hold"] and rh["ft_cards"] and not rh["ft_stale"] and rh["tier_fade"] >= CubeSphere.SKIN_HOLD_FADE,
+			"G-SKIN-GATE(on): skin un-ready at h=650 ⇒ cards HELD (visible, tier_fade %.2f ≥ %.2f, no stale)" % [rh["tier_fade"], CubeSphere.SKIN_HOLD_FADE])
+		# ready ⇒ the hand-off completes (zone-O hide + stale latch) — the shipped behaviour, within one step.
+		var t2 = FT.new(); t2.setup_instance(_fake_ring(), fid); t2.set_skin_ready_query(Callable(self, "_fake_skin_ready"))
+		t2.debug_seed_skin_hold_fids([fid])
+		_fake_skin_frac = 1.0
+		var rr := t2.debug_skin_gate(true, 650.0)
+		# The hand-off = cards HIDDEN at zone O (the _stale latch is FP_FAR_TREES_COLORFIX's own concern — G-FTSB).
+		_ok(not rr["skin_hold"] and not rr["ft_cards"],
+			"G-SKIN-GATE(on): skin ready at h=650 ⇒ cards hidden, zone-O hand-off (releases)")
+		# threshold: frac == SKIN_READY_MIN releases (hold is strictly frac < MIN).
+		var t3 = FT.new(); t3.setup_instance(_fake_ring(), fid); t3.set_skin_ready_query(Callable(self, "_fake_skin_ready"))
+		t3.debug_seed_skin_hold_fids([fid])
+		_fake_skin_frac = CubeSphere.SKIN_READY_MIN
+		_ok(not t3.debug_skin_gate(true, 650.0)["skin_hold"], "G-SKIN-GATE(on): ready_frac == SKIN_READY_MIN ⇒ no hold (releases)")
+		# ceiling: un-ready but above FT_SHELL_HOLD_MAX_ALT ⇒ the hold RELEASES (never held to true orbit).
+		var t4 = FT.new(); t4.setup_instance(_fake_ring(), fid); t4.set_skin_ready_query(Callable(self, "_fake_skin_ready"))
+		t4.debug_seed_skin_hold_fids([fid])
+		_fake_skin_frac = 0.0
+		var rc := t4.debug_skin_gate(true, 950.0)
+		_ok(not rc["skin_hold"] and not rc["ft_cards"],
+			"G-SKIN-GATE(on): above FT_SHELL_HOLD_MAX_ALT the hold releases regardless of readiness (ceiling bounds duty)")
+		# empty EMITTED set ⇒ frac degrades to 1.0 ⇒ NO hold (Codex P0: nothing on screen to hold — degrade-safe).
+		var t5 = FT.new(); t5.setup_instance(_fake_ring(), fid); t5.set_skin_ready_query(Callable(self, "_fake_skin_ready"))
+		_fake_skin_frac = 0.0   # the query WOULD say un-ready, but the empty set never reaches it
+		_ok(not t5.debug_skin_gate(true, 650.0)["skin_hold"],
+			"G-SKIN-GATE(on): empty emitted set ⇒ no hold (readiness is over the emitted cards, not the wanted scan)")
+		_gate_skin_set()
+	else:
+		var t0 = FT.new(); t0.setup_instance(_fake_ring(), fid); t0.set_skin_ready_query(Callable(self, "_fake_skin_ready"))
+		t0.debug_seed_skin_hold_fids([fid])
+		_fake_skin_frac = 0.0
+		_ok(not t0.debug_skin_gate(true, 650.0)["skin_hold"],
+			"G-SKIN-GATE(off): FP_SKIN_READY_GATE off ⇒ never holds (byte-identical zone-O hide)")
+
+## G-SKIN-SET (Codex P0): the handoff set is built from the ACTUAL card sink, NOT the over-broad wanted scan. Drive a
+## REAL _rebuild_cards over a cache holding ONE enumerated facet but a wanted list of TWO — assert the emitted-card set
+## equals the facet that truly rendered cards (drawable instance count > 0) and EXCLUDES the wanted-but-non-emitting one
+## (the old code, keyed on _last_wanted, would have wrongly included it → an unrelated fid pinning the tier). FACETED-gated
+## (enumeration needs GenCtx). No-op on the off arm.
+func _gate_skin_set() -> void:
+	if not CubeSphere.FACETED or not CubeSphere.FP_FAR_TREES_CARDS:
+		print("  (G-SKIN-SET skipped — needs FACETED + FP_FAR_TREES_CARDS for a real card rebuild)")
+		return
+	var facets := _sample_facets()
+	var fid: int = facets[0]
+	var other: int = facets[1]
+	var t = FT.new(); t.setup_instance(_fake_ring(), fid)
+	var recs: PackedFloat32Array = t.enumerate_facet_sync(fid)   # cache ONLY `fid` (the other stays empty)
+	if recs.size() < 3:
+		print("  (G-SKIN-SET skipped — facet %d enumerated no trees)" % fid)
+		return
+	# Place the camera ~300 blocks radially above the first tree so its cards fall in [r0, CARD_MAX] (shell_mode emits).
+	var tp := Vector3(recs[0], recs[1], recs[2])
+	var cam := tp + tp.normalized() * 300.0
+	var n: int = t.debug_rebuild_cards(cam, [fid, other], true)   # wanted = BOTH facets; only `fid` is cached
+	_ok(n > 0, "G-SKIN-SET: the real card rebuild emitted ≥1 DRAWABLE card (visible_instance_count %d > 0)" % n)
+	var held := t.skin_hold_fids()
+	_ok(held.has(fid), "G-SKIN-SET: the emitting facet %d is in the handoff set (built from the real sink)" % fid)
+	_ok(not held.has(other),
+		"G-SKIN-SET: the wanted-but-NON-emitting facet %d is EXCLUDED (set == emitted cards, not the wanted scan — the P0 fix)" % other)
 
 # ---- helpers -------------------------------------------------------------------------------------------------------
 
@@ -1500,6 +1599,117 @@ func _gate_stale() -> void:
 		"G-FTS-4: a real rebuild resets the staleness reference camera (floor re-arms from the new pos)")
 	ring.queue_free()
 
+# ---- G-LG-FLOOR / G-LG-PENDING (FP_FT_STALE_PARKED — the LOD-dropout Stage S1 parked-camera floor) ------------------
+
+## docs/COSMOS-LOD-DROPOUT-DESIGN.md §3. Two-state, self-describing. S1 drops the FT_STALE_MOVE conjunct from the credit-0
+## override so the wall-clock floor fires for a PARKED camera too — but ONLY when the tier is _stale OR a cull restore is
+## pending (else a fully-settled parked camera re-admits NO rebuilds: the cost bound). Drives the decision directly
+## (debug_stale_override) with the latches set via debug hooks, so the full predicate is provable without a live ring or a
+## 2 s wall wait — the G-FTS pattern. G-LG-PENDING then proves the _ft_cull_pending latch is SET on a near-presence
+## disagreement and cleared on agreement (the M3 drain path), and opens the parked override off it.
+func _gate_parked_floor() -> void:
+	var parked := CubeSphere.FP_FT_STALE_PARKED
+	if not CubeSphere.FP_FT_STALE_REBUILD:
+		print("  (G-LG-FLOOR skipped — FP_FT_STALE_PARKED requires FP_FT_STALE_REBUILD sed-toggled true)")
+		return
+	var ring := _fake_ring()
+	var fid: int = _sample_facets()[0]
+	var tier = FT.new()
+	tier.setup_instance(ring, fid)
+	var cam0 := Vector3(1000.0, 2000.0, 3000.0)
+	var now := Time.get_ticks_msec()
+	var moved := cam0 + Vector3(FT.FT_STALE_MOVE + 8.0, 0.0, 0.0)
+	# time-stale reference (last rebuild FT_STALE_MS+1s ago); the camera stays PARKED at cam0 (moved 0 < FT_STALE_MOVE)
+	tier.debug_set_stale_ref(cam0, now - FT.FT_STALE_MS - 1000)
+
+	# --- case A: parked + _stale latched (the primary M1 fix) ---
+	tier.debug_set_stale(true); tier.debug_set_ft_cull_pending(false)
+	if parked:
+		_ok(tier.debug_stale_override(true, false, cam0),
+			"G-LG-FLOOR-ON: parked (no-move) STALE tier => wall-clock override fires (the parked-descent fix)")
+	else:
+		_ok(not tier.debug_stale_override(true, false, cam0),
+			"G-LG-FLOOR-OFF: parked STALE tier => NO override off-flag (shipped: needs move > FT_STALE_MOVE)")
+
+	# --- case B: parked + pending cull-restore (the M3 drain) ---
+	tier.debug_set_stale(false); tier.debug_set_ft_cull_pending(true)
+	if parked:
+		_ok(tier.debug_stale_override(true, false, cam0),
+			"G-LG-FLOOR-ON: parked tier with a pending cull-restore => override fires (M3 drains at the floor)")
+	else:
+		_ok(not tier.debug_stale_override(true, false, cam0),
+			"G-LG-FLOOR-OFF: parked pending tier => NO override off-flag (byte-identical credit gate)")
+
+	# --- case C (the cost bound, holds in BOTH states): parked + nothing latched/pending => NO override ---
+	tier.debug_set_stale(false); tier.debug_set_ft_cull_pending(false)
+	_ok(not tier.debug_stale_override(true, false, cam0),
+		"G-LG-FLOOR: parked SETTLED tier (not stale, nothing pending) => NO override in EITHER state (zero-cost bound)")
+
+	# --- case D: the wall-clock floor still holds — a fresh rebuild ref blocks the parked override even when stale ---
+	tier.debug_set_stale(true)
+	tier.debug_set_stale_ref(cam0, now)
+	_ok(not tier.debug_stale_override(true, false, cam0),
+		"G-LG-FLOOR: < FT_STALE_MS since the last rebuild => NO override even when stale (the <=0.5 Hz floor holds)")
+
+	# --- case E (BOTH states): a MOVED camera still overrides (the shipped move disjunct is preserved) ---
+	tier.debug_set_stale(false); tier.debug_set_ft_cull_pending(false)
+	tier.debug_set_stale_ref(cam0, now - FT.FT_STALE_MS - 1000)
+	_ok(tier.debug_stale_override(true, false, moved),
+		"G-LG-FLOOR: moved > FT_STALE_MOVE => override in BOTH states (shipped move disjunct survives)")
+	_ok(not tier.debug_stale_override(true, true, moved),
+		"G-LG-FLOOR: credit OK => no override (the normal path already rebuilds)")
+	_ok(not tier.debug_stale_override(false, false, moved),
+		"G-LG-FLOOR: not settled => never overrides (fresh-load pile-up stays protected)")
+	ring.queue_free()
+
+	# --- G-LG-PENDING: the _ft_cull_pending latch — SET on a near-presence disagreement, cleared on agreement, and then it
+	# opens the parked override. Needs the NEARCULL+DELTA+MESH fp path that maintains it (self-describes/skips otherwise). ---
+	if not (CubeSphere.FP_FAR_TREES_NEARCULL and CubeSphere.FP_FAR_TREES_DELTA and CubeSphere.FP_FAR_TREES_MESH):
+		print("  (G-LG-PENDING skipped — needs FP_FAR_TREES_NEARCULL + _DELTA + _MESH, the fp path that maintains the latch)")
+		return
+	var ring2 := _fake_ring()
+	var tp = FT.new()
+	tp.setup_instance(ring2, fid)
+	var d := FA.cell_dir(fid, (FA.dom_min(fid).x + FA.dom_max(fid).x) / 2, (FA.dom_min(fid).y + FA.dom_max(fid).y) / 2)
+	var centre := Vector3(d.x, d.y, d.z) * FA.R_BLOCKS
+	var radial := centre.normalized()
+	var up := Vector3(0, 1, 0)
+	if absf(radial.dot(up)) > 0.99: up = Vector3(1, 0, 0)
+	var tangent := radial.cross(up).normalized()
+	var one := PackedFloat32Array()
+	var pd := centre + tangent * 140.0          # inside the probe annulus [FT_CULL_MIN=64, near_render_radius()+40=168]
+	var pr := pd.normalized()
+	one.push_back(pd.x); one.push_back(pd.y); one.push_back(pd.z)
+	one.push_back(pr.x); one.push_back(pr.y); one.push_back(pr.z)
+	one.push_back(0.0); one.push_back(5.0); one.push_back(140.0); one.push_back(10.0); one.push_back(0.0)
+	tp.debug_set_cache(fid, one)
+	# step 1: COVERED probe on a still-SHOWN tree => a hide wants to start => pending SET
+	tp.set_near_query(func(_f, _b): return NearPresence.COVERED)
+	tp.debug_step([fid], centre)
+	if parked:
+		_ok(tp.debug_ft_cull_pending(),
+			"G-LG-PENDING-ON: COVERED on a shown far tree SETS _ft_cull_pending (a hide wants to advance)")
+	else:
+		_ok(not tp.debug_ft_cull_pending(),
+			"G-LG-PENDING-OFF: _ft_cull_pending never set off-flag (the latch is inert)")
+	# step 2: still COVERED, now the tree is committed-HIDDEN => probe AGREES => pending CLEARS (no churn while settled)
+	tp.debug_step([fid], centre)
+	if parked:
+		_ok(not tp.debug_ft_cull_pending(),
+			"G-LG-PENDING-ON: steady COVERED on a hidden tree CLEARS _ft_cull_pending (quiet while settled)")
+	# step 3: near unloads (NOT_COVERED) on the still-hidden tree => a restore wants to advance => pending SET again, and
+	# the parked credit-0 override now fires off it (the M3 drain, end-to-end)
+	tp.set_near_query(func(_f, _b): return NearPresence.NOT_COVERED)
+	tp.debug_step([fid], centre)
+	if parked:
+		_ok(tp.debug_ft_cull_pending(),
+			"G-LG-PENDING-ON: NOT_COVERED on a hidden tree re-SETS _ft_cull_pending (a restore wants to advance)")
+		tp.debug_set_stale(false)
+		tp.debug_set_stale_ref(centre, now - FT.FT_STALE_MS - 1000)
+		_ok(tp.debug_stale_override(true, false, centre),
+			"G-LG-PENDING-ON: a pending restore opens the parked credit-0 override (the streak drains at the floor)")
+	ring2.queue_free()
+
 # ---- G-NP (NearPresence tri-state predicate) -----------------------------------------------------------------------
 
 func _gate_np() -> void:
@@ -1592,7 +1802,12 @@ func _gate_shell_band() -> void:
 		var did_big := tier.debug_step(wanted, far, true, h_b)
 		_ok(did_big, "G-FTSB-CADENCE: 90-blk move > thr(75) ⇒ rebuild")
 		var did_flip := tier.debug_step(wanted, far, false, 40.0)   # same cam, zone B→S ⇒ flip re-arm
-		_ok(did_flip, "G-FTSB-CADENCE: a zone flip (B→S) re-arms exactly one rebuild (still camera)")
+		# FP_FT_SHELL_FLIP_CALM §S2.1 inverts this: the flip no longer force-arms (it latches _flip_pending, served paced +
+		# by the FT_FLIP_MAX_MS failsafe). So under FLIP_CALM the still-camera flip does NOT rebuild — asserted in G-FT-FLIP-CALM.
+		if CubeSphere.FP_FT_SHELL_FLIP_CALM:
+			_ok(not did_flip, "G-FTSB-CADENCE: under FP_FT_SHELL_FLIP_CALM a still-camera zone flip DEFERS (no forced rebuild)")
+		else:
+			_ok(did_flip, "G-FTSB-CADENCE: a zone flip (B→S) re-arms exactly one rebuild (still camera)")
 
 	# ---- G-FTSB-LATCH: climb + de-orbit, correct-or-nothing (fresh tier) ----
 	if on:
@@ -1614,4 +1829,107 @@ func _gate_shell_band() -> void:
 		_ok(deorbit_hidden, "G-FTSB-LATCH: de-orbit O→B stays hidden until a fresh rebuild (correct-or-nothing, #115 safe)")
 		_ok(t2.mmi_visible() and not t2.is_stale(), "G-FTSB-LATCH: visible after the first zone-B rebuild clears the latch")
 
+	ring.queue_free()
+
+# ---- G-FT-FLIP-CALM (FP_FT_SHELL_FLIP_CALM — the surface-entry spike S2) --------------------------------------------
+
+## Drive a synthetic S→B flip and assert the de-forced handoff. FLIP_CALM ON: the flip step does NOT rebuild (it latches
+## _flip_pending), the rung-1 mesh stays VISIBLE while pending (no [R0,448) gap), the FT_FLIP_MAX_MS failsafe forces the
+## deferred rebuild through, and the commit clears the pending flip + hides the rung. OFF: the flip force-arms a rebuild
+## on the flip step (shipped). Needs FP_FT_SHELL_BAND (the zones) + FP_FAR_TREES_CARDS (the rebuild proxy). Hermetic —
+## debug hooks only, no live ring / no 2 s wall wait.
+func _gate_flip_calm() -> void:
+	if not CubeSphere.FP_FAR_TREES_CARDS:
+		print("  (G-FT-FLIP-CALM skipped — needs FP_FAR_TREES_CARDS sed-toggled true, the rebuild proxy)")
+		return
+	if not CubeSphere.FP_FT_SHELL_BAND:
+		print("  (G-FT-FLIP-CALM skipped — needs FP_FT_SHELL_BAND sed-toggled true for the zones)")
+		return
+	var calm := CubeSphere.FP_FT_SHELL_FLIP_CALM
+	var ring := _fake_ring()
+	var tier = FT.new()
+	var fid: int = _sample_facets()[0]
+	tier.setup_instance(ring, fid)
+	tier.set_edits_rev_query(Callable(self, "_fake_edit_count"))
+	_fake_edits_rev = 0
+	tier.enumerate_facet_sync(fid)
+	var d := FA.cell_dir(fid, (FA.dom_min(fid).x + FA.dom_max(fid).x) / 2, (FA.dom_min(fid).y + FA.dom_max(fid).y) / 2)
+	var cam := Vector3(d.x, d.y, d.z) * (FA.R_BLOCKS + 300.0)   # one camera reused for the baseline + the flip (still camera)
+	var wanted := [fid]
+	# Baseline: a zone-S rebuild latches _last_rebuild_shell = false (the pre-flip zone).
+	tier.debug_step(wanted, cam, false, 41.0)
+	var c0 := tier.rebuild_count()
+	# The S→B flip step (still camera, so ONLY the zone changed).
+	var did_flip := tier.debug_step(wanted, cam, true, 300.0)
+	if calm:
+		_ok(not did_flip and tier.rebuild_count() == c0,
+			"G-FT-FLIP-CALM: the S→B flip step DEFERS (no forced rebuild; count %d→%d)" % [c0, tier.rebuild_count()])
+		_ok(tier.debug_flip_pending(), "G-FT-FLIP-CALM: the flip is latched _flip_pending")
+		tier.debug_apply_visibility(true, 300.0)
+		_ok(tier.mesh_mmi_visible(), "G-FT-FLIP-CALM: rung-1 mesh stays VISIBLE while the flip is pending (no [R0,448) gap)")
+		# The FT_FLIP_MAX_MS failsafe: age the pending flip past the ceiling ⇒ the next step forces the deferred rebuild.
+		tier.debug_set_flip_pending_ms(Time.get_ticks_msec() - CubeSphere.FT_FLIP_MAX_MS - 1)
+		var did_fs := tier.debug_step(wanted, cam, true, 300.0)
+		_ok(did_fs and tier.rebuild_count() == c0 + 1,
+			"G-FT-FLIP-CALM: the FT_FLIP_MAX_MS failsafe forces the deferred zone-B rebuild through (count %d)" % tier.rebuild_count())
+		_ok(not tier.debug_flip_pending(), "G-FT-FLIP-CALM: the committed rebuild clears the pending flip")
+		tier.debug_apply_visibility(true, 300.0)
+		_ok(not tier.mesh_mmi_visible(), "G-FT-FLIP-CALM: rung-1 mesh hides once the zone-B card buffer is resident")
+
+		# ---- G-FT-FLIP-CALM-DESCENT (Fable F2): the B→S mirror must NOT double-render. After the zone-B rebuild above,
+		# _last_rebuild_shell = true; flip B→S (still camera) ⇒ deferred, _flip_pending latched. In zone S the stale zone-B
+		# card MMI ([R0,2400]) is HIDDEN while pending (else it draws over the resident mesh rung [R0,448)); meshes stay up.
+		var did_bs := tier.debug_step(wanted, cam, false, 41.0)
+		_ok(not did_bs and tier.debug_flip_pending(),
+			"G-FT-FLIP-CALM-DESCENT: the B→S flip step DEFERS + latches _flip_pending (still camera)")
+		tier.debug_apply_visibility(false, 41.0)
+		_ok(not tier.mmi_visible() and tier.mesh_mmi_visible(),
+			"G-FT-FLIP-CALM-DESCENT: zone S while flip-pending HIDES the stale zone-B cards + keeps meshes (no double-render)")
+		# The zone-S rebuild lands (failsafe) ⇒ repartition + clear ⇒ cards visible again.
+		tier.debug_set_flip_pending_ms(Time.get_ticks_msec() - CubeSphere.FT_FLIP_MAX_MS - 1)
+		var did_s := tier.debug_step(wanted, cam, false, 41.0)
+		tier.debug_apply_visibility(false, 41.0)
+		_ok(did_s and not tier.debug_flip_pending() and tier.mmi_visible(),
+			"G-FT-FLIP-CALM-DESCENT: the zone-S rebuild lands, clears the flip, and restores the cards")
+	else:
+		_ok(did_flip and tier.rebuild_count() == c0 + 1,
+			"G-FT-FLIP-CALM(off): the flip force-arms a rebuild on the flip step (shipped, count %d→%d)" % [c0, tier.rebuild_count()])
+	ring.queue_free()
+
+## G-FT-FLIP-CALM-REAL: the bounded-deferral fix (Codex P0-1 / Fable F3) exercised through the REAL FacetFarTrees.step()
+## credit/settle path (not debug_step) with a LIVE FacetFarRing. A parked camera at stream-credit 0 must NOT leave the
+## flip latched forever: step() returns at the credit gate until the FT_FLIP_MAX_MS failsafe, then _stale_override forces
+## the rebuild through even parked. FLIP_CALM ON only (self-describes off with a skip line).
+func _gate_flip_calm_real() -> void:
+	if not (CubeSphere.FP_FT_SHELL_FLIP_CALM and CubeSphere.FP_FT_SHELL_BAND and CubeSphere.FP_FAR_TREES_CARDS and CubeSphere.FP_FAR_TREES_DELTA):
+		print("  (G-FT-FLIP-CALM-REAL skipped — needs FP_FT_SHELL_FLIP_CALM + FP_FT_SHELL_BAND + FP_FAR_TREES_CARDS + FP_FAR_TREES_DELTA)")
+		return
+	var ring: Node3D = FFR.new()
+	ring.call("setup", _sample_facets()[0])
+	get_root().add_child(ring)
+	var tier = FT.new()
+	var fid: int = _sample_facets()[0]
+	tier.setup_instance(ring, fid)
+	tier.set_edits_rev_query(Callable(self, "_fake_edit_count"))
+	_fake_edits_rev = 0
+	tier.enumerate_facet_sync(fid)
+	var d := FA.cell_dir(fid, (FA.dom_min(fid).x + FA.dom_max(fid).x) / 2, (FA.dom_min(fid).y + FA.dom_max(fid).y) / 2)
+	var cam := Vector3(d.x, d.y, d.z) * (FA.R_BLOCKS + 300.0)
+	# Baseline zone-S rebuild through REAL step() (settled, credit OK) => _last_rebuild_shell = false.
+	ring.call("debug_set_shell_state", false, 41.0)
+	tier.debug_set_last_step_ms(Time.get_ticks_msec() - 100000)
+	tier.step(true, true, cam)
+	var c0 := tier.rebuild_count()
+	# Flip S->B, then a PARKED + credit-0 step: the credit gate must return (deferred), the flip latched.
+	ring.call("debug_set_shell_state", true, 300.0)
+	tier.debug_set_last_step_ms(Time.get_ticks_msec() - 100000)
+	tier.step(true, false, cam)
+	_ok(tier.rebuild_count() == c0 and tier.debug_flip_pending(),
+		"G-FT-FLIP-CALM-REAL: parked + credit 0 => step() DEFERS the flip (no rebuild), latch held (count %d)" % tier.rebuild_count())
+	# Age the flip past FT_FLIP_MAX_MS: the NEXT parked credit-0 step must force the rebuild through the credit gate.
+	tier.debug_set_flip_pending_ms(Time.get_ticks_msec() - CubeSphere.FT_FLIP_MAX_MS - 1)
+	tier.debug_set_last_step_ms(Time.get_ticks_msec() - 100000)
+	tier.step(true, false, cam)
+	_ok(tier.rebuild_count() == c0 + 1 and not tier.debug_flip_pending(),
+		"G-FT-FLIP-CALM-REAL: an EXPIRED flip forces the rebuild through the REAL credit gate even parked at credit 0, latch clears (count %d)" % tier.rebuild_count())
 	ring.queue_free()

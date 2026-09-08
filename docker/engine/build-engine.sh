@@ -33,6 +33,12 @@ WEB_PTHREAD_POOL="${WEB_PTHREAD_POOL:-8}"
 # (docs/COSMOS-WALK-PERF-DESIGN.md). Requires emsdk >= 3.1.50 (we pin 3.1.64). Revert: set dlmalloc.
 WEB_MALLOC="${WEB_MALLOC:-dlmalloc}"
 
+# COSMOS GEN-CONVOY §6: compile the allocator-lock stall probe into the web template (engine patch 0003
+# adds the scons `alloc_probe` option; default "no" == byte-identical stock). versions.env sets this to
+# "yes" for the instrumented Stage-1 A/B build so remote_bridge's FP_WORST_FRAME_ATTR snapshot carries
+# wf_alloc_main_ms / wf_alloc_workers_ms (docs/COSMOS-GEN-CONVOY-DESIGN.md §6). Revert: set "no".
+WEB_ALLOC_PROBE="${WEB_ALLOC_PROBE:-no}"
+
 WORK=/work
 SRC="${WORK}/godot"
 VOXEL_DIR="${SRC}/modules/voxel"
@@ -196,7 +202,9 @@ build_web_templates() {
   # PTHREAD_POOL_SIZE from versions.env WEB_PTHREAD_POOL (COSMOS-FP-M1-DESIGN §9.3).
   # malloc is the scons option added by engine patch 0002; wires -sMALLOC from versions.env
   # WEB_MALLOC (COSMOS-WALK-PERF-DESIGN §4 L2). dlmalloc == stock (flag omitted entirely).
-  scons platform=web target="$2" pthread_pool_size="${WEB_PTHREAD_POOL}" malloc="${WEB_MALLOC}" "${extra[@]}" -j"${JOBS}"
+  # alloc_probe is the scons option added by engine patch 0003; wires -DZN_VOX_ALLOC_PROBE from versions.env
+  # WEB_ALLOC_PROBE (COSMOS GEN-CONVOY §6). "no" == stock (macro expands to raw libc malloc/free/realloc).
+  scons platform=web target="$2" pthread_pool_size="${WEB_PTHREAD_POOL}" malloc="${WEB_MALLOC}" alloc_probe="${WEB_ALLOC_PROBE}" "${extra[@]}" -j"${JOBS}"
 }
 
 web_build_all() {
@@ -257,6 +265,7 @@ fi
   echo "engine_patches  :${ENGINE_PATCHES_APPLIED}"
   echo "web_pthread_pool: ${WEB_PTHREAD_POOL}"
   echo "web_malloc      : ${WEB_MALLOC}"
+  echo "web_alloc_probe : ${WEB_ALLOC_PROBE}"
   echo "emcc            : $(emcc --version | head -n1)"
   echo "module_in_web   : ${MODULE_IN_WEB}"
   echo "templates       : $(ls -1 "${OUT}/templates"/*.zip 2>/dev/null | xargs -n1 basename 2>/dev/null | tr '\n' ' ')"

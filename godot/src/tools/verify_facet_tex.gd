@@ -56,8 +56,85 @@ func _initialize() -> void:
 	else:
 		print("  (texture path OFF — G-FT-BAKE/UV/PALETTE/COVER need FP_FACET_TEX && FP_SHELL_ABSOLUTE ON; OFF-identity by G-FT-OFF)")
 
+	_gate_skin_ready(fid)                     # S3/S4 (LOD-DROPOUT §4): handoff_ready/ready_frac + the handoff select order
+
 	print("==== VERIFY: %d passed, %d failed ====" % [_pass, _fail])
 	quit(1 if _fail > 0 else 0)
+
+# --- G-SKIN-READY / G-SKIN-PRI (docs/COSMOS-LOD-DROPOUT-DESIGN.md §4, S3/S4) ------------------------------------------
+## The card→skin handoff readiness predicate + the baker's handoff bake priority class. Runs in every invocation (the
+## baker API is flag-independent; the SELECT order self-describes OFF vs ON on FP_SKIN_HANDOFF_PREWARM).
+func _gate_skin_ready(fid: int) -> void:
+	var baker := FacetTexBaker.new()
+	baker.setup(fid)
+	var total := 6 * FA.K * FA.K
+	# G-SKIN-READY: handoff_ready + ready_frac (g0 _baked surface — FP_PAGES_SHOT off in this bare gate).
+	_ok(not baker.handoff_ready(fid), "G-SKIN-READY: a fresh (un-baked) facet is NOT handoff_ready")
+	_ok(baker.ready_frac([]) == 1.0, "G-SKIN-READY: empty handoff set ⇒ frac 1.0 (nothing to hold)")
+	baker.bake_facet(fid)
+	_ok(baker.handoff_ready(fid), "G-SKIN-READY: a baked facet IS handoff_ready")
+	var f1 := (fid + 1) % total
+	while f1 == fid:
+		f1 = (f1 + 1) % total
+	_ok(baker.ready_frac([fid]) == 1.0 and baker.ready_frac([fid, f1]) == 0.5,
+		"G-SKIN-READY: ready_frac = |ready|/|set| ({fid} baked, {f1} not ⇒ 0.5)".format({"fid": fid, "f1": f1}))
+
+	# G-SKIN-READY (Codex P1 — false-ready): the shipped predicate checked ONLY the base page (_shot_baked/_baked), which
+	# is terrain colour WITHOUT the tree/roof replacement — so it reported "ready" while the real skin was still blank and
+	# the tier released into a dropout. When the fine map is the live skin (_fm_on), readiness MUST require the FINE tile
+	# committed (_fine_commit → _fine_baked) AND the base page. Force _fm_on to prove the corrected predicate directly.
+	var bf := FacetTexBaker.new(); bf.setup(fid)
+	bf._fm_on = true
+	bf._fm_quad = CubeSphere.PLANET_MAP_QUAD               # _fine_uploaded's layer math needs the quad edge (setup() skips the fine map)
+	bf.bake_facet(fid)                                     # base page covered — the OLD predicate would (wrongly) say ready
+	_ok(not bf.handoff_ready(fid),
+		"G-SKIN-READY(fine): base baked but fine tile NOT ⇒ NOT handoff_ready (false-ready falsified — the P1 fix)")
+	# GAP-B (GPU-upload false-ready): mark the fine tile CPU-committed but its sub-page LAYER still dirty (un-uploaded).
+	var dd := bf._decode(fid)
+	var layer := int(dd[0]) * 4 + (int(dd[2]) / bf._fm_quad) * 2 + (int(dd[1]) / bf._fm_quad)
+	bf._fine_baked[fid] = true
+	bf._fm_dirty[layer] = true                             # committed to CPU page but NOT yet uploaded to the GPU array
+	_ok(not bf.handoff_ready(fid),
+		"G-SKIN-READY(fine): fine baked but LAYER still dirty (un-uploaded) ⇒ NOT ready (GAP-B GPU-throttle false-ready falsified)")
+	bf._fm_dirty.erase(layer)                              # the throttled update_layer lands ⇒ on the GPU
+	_ok(bf.handoff_ready(fid), "G-SKIN-READY(fine): fine tile uploaded (layer clean) + base ⇒ handoff_ready (the real skin is on-screen)")
+	var bf2 := FacetTexBaker.new(); bf2.setup(fid); bf2._fm_on = true; bf2._fm_quad = CubeSphere.PLANET_MAP_QUAD
+	bf2._fine_baked[fid] = true                            # fine uploaded (no dirty layer) but base page absent
+	_ok(not bf2.handoff_ready(fid),
+		"G-SKIN-READY(fine): fine uploaded but base page NOT ⇒ NOT ready (the coverage sentinel still needs the base page)")
+
+	# The emit axis toward the (ready) spawn facet's centre — _next_handoff_fid must return an UN-READY facet, never fid.
+	var c = FA.cell_dir(fid, (FA.dom_min(fid).x + FA.dom_max(fid).x) / 2, (FA.dom_min(fid).y + FA.dom_max(fid).y) / 2)
+	var axis: Array = [c.x, c.y, c.z]
+	var hf := baker._next_handoff_fid(axis)
+	_ok(hf != fid, "G-SKIN-PRI: _next_handoff_fid never returns the already-ready facet")
+	_ok(hf < 0 or not baker.handoff_ready(hf), "G-SKIN-PRI: _next_handoff_fid returns an UN-READY facet (or -1 when the disc is all ready)")
+	# priority == the wanted set: the selected handoff fid is inside the near-axis cap (the visible disc the player is
+	# descending into), never a far-side facet — so the budget serves what will be handed off, not a random backside bake.
+	if hf >= 0:
+		var chf: Vector3 = baker._centre_pack[hf]
+		_ok(chf.x * axis[0] + chf.y * axis[1] + chf.z * axis[2] >= FacetTexBaker.HANDOFF_DOT_MIN,
+			"G-SKIN-PRI: the selected handoff fid is inside the near-axis cap (priority serves the wanted/visible disc)")
+	# Bake the whole nearest-axis disc ready ⇒ _next_handoff_fid returns -1 (the hold would release; convergence proof).
+	for f in range(total):
+		var cf: Vector3 = baker._centre_pack[f]
+		if cf.x * axis[0] + cf.y * axis[1] + cf.z * axis[2] >= FacetTexBaker.HANDOFF_DOT_MIN:
+			baker.bake_facet(f)
+	_ok(baker._next_handoff_fid(axis) < 0, "G-SKIN-PRI: once the whole in-cap disc is ready, _next_handoff_fid == -1 (converges)")
+
+	# G-SKIN-PRI: the select ORDER. Fresh baker, one un-ready near-axis facet exists. With the flag ON + off-surface the
+	# handoff class claims a "base" unit (marked handoff); OFF it does not (plain coverage). Close-up/band are OFF here,
+	# so this isolates the handoff slot (its pre-emption by cu/band is guaranteed by construction — the branches above it).
+	var b2 := FacetTexBaker.new()
+	b2.setup(fid)
+	var got := b2._select_worker_unit(true, axis, -1)   # offsurface=true, active_fid=-1 (band skipped)
+	_ok(got, "G-SKIN-PRI: _select_worker_unit finds work off-surface (coverage/handoff)")
+	if CubeSphere.FP_SKIN_HANDOFF_PREWARM:
+		_ok(b2._job_kind == "base" and b2._job_base_handoff,
+			"G-SKIN-PRI(on): off-surface with un-ready disc ⇒ a HANDOFF-class base unit is selected before plain coverage")
+	else:
+		_ok(b2._job_kind == "base" and not b2._job_base_handoff,
+			"G-SKIN-PRI(off): no handoff class ⇒ the shipped coverage unit is selected (byte-identical select order)")
 
 # --- G-FT-OFF: OFF ⇒ no UV channels (byte-identical); ON ⇒ UV channels present + geometry-aligned -----------
 func _gate_off(spawn_fid: int) -> void:

@@ -223,6 +223,29 @@ const FP_STAMP := false
 ## weakened to make the port pass.
 const FP_CPPGEN := false
 
+## COSMOS GEN-CONVOY (docs/COSMOS-GEN-CONVOY-DESIGN.md §4.B) — Stage-1 per-gen-task alloc-diet, forwarded
+## into the compiled VoxelGeneratorCosmos config in module_world._make_cpp_generator (C++-side only; no
+## effect on the GDScript generator or the FLAT fallback). All default off/0 ⇒ byte-identical worldgen.
+## FP_GEN_PROFS_TLS reuses a thread_local scratch vector for the generator's per-column profile pass
+## (census b1: 1 malloc+free/block off the global dlmalloc lock). FP_GEN_POOL_PREWARM pre-reserves that
+## many 8 KiB VoxelMemoryPool TYPE-channel blocks at setup so the first ground crossing doesn't spill
+## channel allocs to dlmalloc mid-spike (census a3; ~2500 ≈ 20 MB, heap-budgeted). Flip per A/B arm.
+const FP_GEN_PROFS_TLS := false
+const FP_GEN_POOL_PREWARM := 0
+## FP_GEN_ALLOC_PROBE enables the §6 core allocator-lock stall probe accumulation (per-thread alloc
+## wall-time + dequeue timer) so remote_bridge's FP_WORST_FRAME_ATTR snapshot carries wf_alloc_main_ms /
+## wf_alloc_workers_ms / wf_dequeue_ms — turning the "~430 ms unmetered" spike into a measured lock-stall
+## number. NOTE: only has effect when the engine was built with the probe compiled in (versions.env
+## WEB_ALLOC_PROBE=yes, the Stage-1 build); otherwise inert. Default false ⇒ byte-identical. Flip per A/B arm.
+## (Lever 2 — the VoxelBuffer object recycler, FP_GEN_SMALLOBJ_POOL — is HELD for Build #2 pending the
+## probe's verdict; see docs/COSMOS-GEN-CONVOY-DESIGN.md §5.)
+const FP_GEN_ALLOC_PROBE := false
+## FP_GEN_LOCK_PROBE (COSMOS GEN-CONVOY §6 lock-wait extension) enables the main-thread engine-lock
+## acquire-WAIT probe: times how long the main thread busy-spins acquiring the VoxelData map RWLock and the
+## task-runner mutexes while the workers flood generation. Surfaces wf_lock_rwlock_ms / wf_lock_mutex_ms.
+## Same compile requirement as FP_GEN_ALLOC_PROBE (WEB_ALLOC_PROBE=yes); otherwise inert. Default false.
+const FP_GEN_LOCK_PROBE := false
+
 ## COSMOS CLIMATE-BIOMES B1 (docs/COSMOS-CLIMATE-BIOMES-DESIGN.md §6/§7) — the Whittaker temperature×moisture
 ## biome classifier. When true, TerrainConfig._biome swaps its shipped first-match chain for a
 ## temperature-band × humidity-band table that appends B_SAVANNA / B_JUNGLE, TreeGen grows acacia (savanna),
@@ -267,6 +290,18 @@ const FP_NO_NEAR_LOD := false
 ## near_render_radius() scaffold — the ridge-band, pool-ceiling raise (224 MB) and real-bytes ceiling are a later pass
 ## (design §3-§4, Steps 3-5). Default OFF → near_render_radius() stays the shipped faceted 128 → byte-identical.
 const FP_FULLRES_256 := false
+
+## COSMOS NEAR-RADIUS DIET (village/ground jerkiness — live-confirmed 2026-08-31). The DEV_HIDE_NEAR bisection proved
+## the near voxel field (godot_voxel gen+mesh+main-thread apply across the CURVED_RENDER_RADIUS_BLOCKS=128 disc) is a
+## MAJOR jerkiness source (collapsing it → "much less jerky"). This shrinks the near render radius to
+## NEAR_RADIUS_DIET_BLOCKS so the streamed/meshed near area drops ~(diet/128)² (96→0.56×, 80→0.39×, 64→0.25×); the far
+## tier (blocky far-ring + skin, already resident past the near edge) covers the freed ring. Consulted ONLY via
+## near_render_radius() (the single lever every ramp/anchor/pool cap reads), and analytic physics/collider read
+## TerrainConfig directly (never the mesh), so movement/collision are UNCHANGED — this is a render-cost trade only.
+## Default OFF ⇒ near_render_radius() returns the shipped faceted 128 verbatim; FLAT (not FACETED) hits the 256 branch
+## first, untouched ⇒ byte-identical (FLAT 6042/0). Tunable live: sweep NEAR_RADIUS_DIET_BLOCKS for the smooth/detail knee.
+const FP_NEAR_RADIUS_DIET := false           # shrink the near voxel-field render radius (128 → NEAR_RADIUS_DIET_BLOCKS)
+const NEAR_RADIUS_DIET_BLOCKS := 96          # dieted near radius (blocks); area ∝ r² ⇒ 96 = 0.56× the 128 near work
 
 ## COSMOS-ATLAS (docs/COSMOS-ATLAS-DESIGN.md, Perf L3) — collapse the OPAQUE terrain onto ONE shared atlas material.
 ## Every block id today carries its OWN StandardMaterial3D (block_materials.gd), and VoxelMesherBlocky emits ONE
@@ -401,6 +436,35 @@ const SHELL_PWD_SAMPLE_MS := 250    # descent-latch sampling cadence (Δh/Δt pe
 const SHELL_PWD_SNAP_MS := 500      # min wall-ms between pre-warm-forced cap snapshots (the pacing bound)
 const SHELL_PWD_DRIFT_DEG := 2.0    # force a snapshot only when the axis swept ≥ this since the last one…
 const SHELL_PWD_DTH_DEG := 1.0      # …or θ_h moved ≥ this (else the pacer stays silent — no-op ticks are free)
+
+## FP_SHELL_ASCENT_LAZY (docs/COSMOS-SURFACE-ENTRY-SPIKE-DESIGN.md S3) — the SECONDARY surface-entry fix (mirror of the
+## descent pre-warm, ascent-shaped). The UPWARD floor release (was floored, now off-surface) today arms a SAFETY re-emit
+## (shell_fall_should_reemit returns true first thing on floor_changed), dirtying the whole cap in one dispatch + the main-
+## thread prelude. But the resident FLOORED cap is a strict SUPERSET of the narrower un-floored cap (new_cos >= _emit_cos)
+## whenever the axis has not swept (drift ≤ SHELL_SLACK_DEG) — below the CLIMB_NO_CHURN ~9900-block bound the floored 90°
+## hemisphere contains every pixel of the new cap — so the re-emit is a pure QUALITY upgrade, deferrable by construction.
+## When true (and the release is that superset case) the snapshot's axis/cap/regime still commit (so shell_offsurface()/
+## _shell_orbit() advance), but the re-emit arms on the LUXURY rail (FP_APPLIED_PROBE_CALM promotes it when the stream is
+## healthy+settled) with a SHELL_ASCENT_LAZY_MAX_MS forced-promote failsafe; and _orbit_emitted_once is set so
+## _orbit_warm_async does not force the first off-surface emit. The DESCENT floor edge (genuine growth, 90° ⊅ resident) is
+## untouched — SAFETY, as shipped. Requires FP_APPLIED_PROBE_CALM (with it off, _arm_pending ignores the luxury param and
+## the arm is SAFETY, byte-identical). Off ⇒ the shipped SAFETY arm verbatim (byte-identical, FLAT 6042/0). Composes
+## disjointly with FP_SHELL_PREWARM_DESCENT (descending+un-floored+[650,1300]) / STAGE_REEMIT / SECTOR_FINE / CLIMB_NO_CHURN.
+## NEVER-OOM: temporarily keeps the LARGER already-resident mesh (zero growth); the promote shrinks it. Gate: verify_shell.gd G-SHELL-ASCENT-LAZY.
+## DEFERRED (Fable F1): INERT under the currently-served flags — FP_SHELL_SURF_CAP diet-caps the floored cap to θ_h+29°
+## and FP_SHELL_FALL_HOLD adds the release margin, so the containment test acos(new_cos)+drift ≤ acos(_emit_cos) can never
+## be satisfied on a climb ⇒ always SAFETY-immediate ⇒ the shipped spike. This flag is a FUTURE arm: it can only fire with
+## FP_SHELL_SURF_CAP OFF (or the floored cap widened back toward the 90° hemisphere). Deploy it OFF for now; the F4
+## shell_ascent_lazy_arms counter (surfaced under FP_WF_TIER_ATTR) measures whether it ever fires when later enabled.
+const FP_SHELL_ASCENT_LAZY := false
+const SHELL_ASCENT_LAZY_MAX_MS := 4000   # failsafe: past this wall-ms a parked ascent-release luxury arm is force-promoted (the conversion always lands)
+
+## FP_OFFSURF_MAT_PREWARM (docs/COSMOS-SURFACE-ENTRY-SPIKE-DESIGN.md S4) — prepay the once-per-session GL/ANGLE program
+## link of the off-surface-only materials (FacetOrbitRelief's ShaderMaterial foremost) at the boot-splash prewarm stage,
+## so the first ascent past 256 does not pay a first-draw compile. PENDING the §3.1 repeat-crossing discriminator (a live
+## test that says whether the spike has a one-time first-exposure component); the flag const exists so the wiring lands in
+## one place, but the splash-prewarm logic is NOT yet implemented. Off ⇒ inert.
+const FP_OFFSURF_MAT_PREWARM := false
 
 ## COSMOS DE-ORBIT SLICE SMOOTHING (docs/COSMOS-DEORBIT-SLICE-SMOOTHING-DESIGN.md) — bound the staged shell slice.
 ## FP_FARRING_SECTORS' 2×2 face-quadrant sector (≤ (K/2)²=144 fids) is the ATOMIC swap unit, so every staged slice
@@ -1019,7 +1083,69 @@ const ORBIT_RELIEF_MAX_TILES := 384          # hard cap; ≈26.55 MB at 72,492 B
 const ORBIT_RELIEF_AXIS_MS := 1000           # min ms between axis-drift want-set recomputes (crossings always force one)
 const ORBIT_RELIEF_COMMIT_MS := 500          # min ms between commits (array-concat + one GPU upload, no CPU normal pass)
 const ORBIT_RELIEF_COMMIT_TILES := 24        # max NEW tiles folded into the live mesh per commit (bounds the upload too)
+# FP_OR_COMMIT_PARTIAL granularity (docs/COSMOS-ORBIT-RELIEF-COMMIT-DESIGN.md §6 follow-up): once commits are cheap
+# per-slot region uploads (not a whole-arena re-pack), SMALLER/more-frequent batches spread the cold fill over ~3×
+# more commits at the SAME net fill rate (8 tiles/150 ms ≈ 24/450 ms) — ~⅓ the densest per-commit burst, smoother
+# ascent. Selected by FacetOrbitRelief.commit_tiles_cap()/commit_interval_ms() ONLY when the partial path is armed
+# (`_or_partial_ok`); the OFF whole-rebuild path keeps 24/500 (it wants FEWER, larger commits) — so byte-off is exact.
+const ORBIT_RELIEF_COMMIT_TILES_PARTIAL := 8    # partial-path NEW-tiles/commit cap (region uploads are cheap)
+const ORBIT_RELIEF_COMMIT_MS_PARTIAL := 150     # partial-path min ms between commits
 const ORBIT_RELIEF_FALLBACK_REACH_RAD := 0.7853981633974483   # deg_to_rad(45.0): on-surface/no-horizon-yet angular reach
+
+## FP_OR_FLIP_STAGE (docs/COSMOS-SURFACE-ENTRY-SPIKE-DESIGN.md — the surface-entry SECONDARY, orbit-relief tier).
+## The surface-entry up-crossing (alt OFFSURFACE_Y, offsurf false→true) unfreezes `FacetOrbitRelief.step()` after a
+## long on-surface freeze that left the axis-drift throttle stale, so the throttled `_recompute_want` always runs a
+## FULL want-set scan in ONE frame — a scan-dominated ~15-35ms WASM burst (measured 1.15ms native scan / 0.14ms
+## sort over all 3456 facets, ×WASM). This flag AMORTISES that scan across frames (`_recompute_want_staged`): the
+## scan runs under a per-step `OR_FLIP_STAGE_US` time box (polled once per `OR_FLIP_STAGE_CHUNK` facets), the OLD
+## want-set keeps serving until the scan completes (frozen resident mesh stays drawn — no hole, no coverage change),
+## and the finish-frame sort/truncate/publish is byte-identical to the synchronous `_recompute_want`. It ALSO caps
+## per-step dispatch at `OR_FLIP_DISPATCH_MAX` so a post-publish burst of newly-wanted facets can't fire all `_sn`
+## height_grid-cache-miss snapshots on one frame. CONVERGENCE: the scan advances ≥ one CHUNK per step ⇒ finishes in
+## ≤ ceil(3456/CHUNK) steps, then the existing `_sn`/dispatch-cap loop fills every wanted tile — no livelock, no
+## permanent hole. Only the THROTTLED (force=false) step path is staged — init and facet-crossing force-recomputes
+## stay synchronous (verbatim). Off ⇒ `step()` calls the verbatim synchronous `_recompute_want`, the dispatch cap is
+## never checked, and none of the `_or_stage_*` state is written — byte-identical. Gate: verify_orbit_relief.gd
+## (G-OR-SUSPEND unchanged: staging lives entirely on the off-surface path, after the on-surface early-return).
+const FP_OR_FLIP_STAGE := false
+const OR_FLIP_STAGE_US := 3000       # per-step µs time box for the staged want-set scan (native scans all in 1 frame; WASM spreads over ~7)
+const OR_FLIP_STAGE_CHUNK := 128     # facets scanned between time-box polls (amortises the clock read; also the min advance/step ⇒ termination bound)
+const OR_FLIP_DISPATCH_MAX := 3      # max tiles dispatched per step under the flag (spreads the post-publish snapshot burst; still `_sn`-bounded)
+
+## FP_OR_WORKER_DECODE (docs/COSMOS-ORBIT-RELIEF-HEIGHT-DECODE-DESIGN.md — the surface-entry PRIMARY, orbit-relief tier).
+## The dispatch loop's real up-crossing burst is `_relief_data.height_grid(f)` — 1089 main-thread `decode_s16` reads
+## (~33ms/facet WASM, cache-cold), up to `OR_FLIP_DISPATCH_MAX` cache-miss snapshots on the flip frame ⇒ ~100ms. This
+## flag moves the 1089-node s16 DECODE off the main thread: the caller hands the worker a cheap ~2178-byte raw-byte
+## SLICE (`GlobalReliefData.height_bytes(f)`, a main-thread memcpy) and `_build_worker_raw` decodes it worker-side via
+## the pure static `GlobalReliefData.decode_height_bytes`. The main thread keeps only the ~µs memcpy. SAFE because
+## `bake_facet` (the only writer of `_heights`) runs main-thread-only (design §2), so the slice is strictly serialized
+## with any bake — torn-free. COMPOSES with FP_OR_FLIP_STAGE (disjoint terms: this removes the decode, FLIP_STAGE the
+## want-scan). Off ⇒ the dispatch else-branch is the VERBATIM shipped `height_grid` + `_build_worker` path, `height_bytes`/
+## `decode_height_bytes`/`_build_worker_raw` are dead code — byte-identical (FLAT verify_feature.gd 6042/0). Gate:
+## verify_orbit_relief.gd (G-OR-WDEC: round-trip + degrade + tile byte-equality + structural no-off-thread-read scans).
+const FP_OR_WORKER_DECODE := false
+
+## FP_OR_COMMIT_PARTIAL (docs/COSMOS-ORBIT-RELIEF-COMMIT-DESIGN.md — the surface-entry PRIMARY, THE real orbit-relief
+## fix). `FacetOrbitRelief._commit()` rebuilds the WHOLE fixed 384-tile arena into a fresh ArrayMesh via
+## add_surface_from_arrays + full GPU re-upload EVERY commit — O(MAX_TILES) regardless of how few slots changed
+## (measured wf_or_commit_us=111,220µs = the entire surface-entry residual; ~22.8 MB of fresh WASM dlmalloc buffers
+## packed + a full re-upload + AABB scan + a 2× transient). This flag replaces it with a PERSISTENT surface built
+## ONCE at boot (behind the splash) + per-changed-slot `RenderingServer.mesh_surface_update_vertex_region` /
+## `..._attribute_region` uploads (glBufferSubData-backed, core WebGL2): per-commit cost becomes O(changed slots)
+## — a few ms typical, the 111 ms burst gone from the flip. The index buffer is STATIC (no index-region API; the
+## per-slot grid pattern is fid-independent, filled once — eviction collapses VERTICES to origin, not indices); a
+## conservative custom_aabb is set ONCE (region updates never recompute it — without it the all-zero initial
+## surface culls to a point = silent blank); two packed CPU byte-mirrors (`_arena_vbytes` pos 12B/vert +
+## `_arena_abytes` RGBA8+uv+uv2 20B/vert) are written in the same per-slot loop as `_write_arena_slot` and uploaded
+## as a memcpy slice. A boot self-check byte-compares one hand-packed slot against Godot's OWN
+## add_surface_from_arrays packing (guards the u8 color-quant match + layout on any exotic driver) → on ANY mismatch
+## `_or_partial_ok=false` and every commit takes the verbatim whole-arena rebuild (degrade, never corrupt). The
+## RENDERED result is byte-identical to the full rebuild (same committed tiles/verts/colors/uvs/sink masks). All
+## RenderingServer calls stay MAIN-thread (workers still only produce tile dicts). Off ⇒ `_commit()` is the verbatim
+## whole-arena add_surface_from_arrays, no persistent surface / mirrors / RS-region work, setup unchanged —
+## byte-identical (FLAT verify_feature.gd 6042/0). Gate: verify_orbit_relief.gd (G-OR-PART-PACK/EQ/DEGEN +
+## G-OR-COMMIT-COST extension).
+const FP_OR_COMMIT_PARTIAL := false
 
 ## FP_ORBIT_RELIEF_SURFACE_HIDE (docs/COSMOS-FAR-NEAR-COVERAGE-DESIGN.md §3.1 — kills the far-over-near mountain
 ## protrusion) — G3's on-surface SUSPEND (`FacetOrbitRelief.step()` WS1a) freezes recompute/commit below
@@ -1099,6 +1225,30 @@ const FT_DELTA_MIN_MOVE := 2.0               # blocks of camera motion that re-a
 const FP_FT_MOVE_HYST := false               # F2a §4: widen the far-tree rebuild move threshold while credit flows (the F1 interlock)
 const FT_DELTA_MOVE_HYST := 12.0             # blocks of camera motion re-arming a far-trees rebuild under FP_FT_MOVE_HYST (6× the shipped 2.0)
 const FT_DELTA_WANTED_MOVE := 64.0           # blocks of camera motion that re-compute the wanted-facet scan
+
+## FP_FT_WALK_CALM (docs/COSMOS-FARTIER-WALK-DESIGN.md §2.2, Lever 1) — the move-churn diet for the far-TREE tier.
+## FP_FT_MOVE_HYST merely widens the camera re-arm threshold to 12 blk (still a camera term); a walk STILL re-arms the
+## full ~50-60 ms rebuild. Under WALK_CALM the rebuild move threshold is raised to FT_CALM_MARGIN·0.5 (16 blk re-arm),
+## superseded-by-max over FP_FT_MOVE_HYST/shell (maxf); it degrades to the shipped threshold when an instance/tri cap was
+## hit last rebuild (nearest-first ORDERING is then genuinely camera-dependent). This alone drops the walking far-tree
+## rebuild rate ~8× vs the shipped 2-blk re-arm (and ~1.3× vs MOVE_HYST@12).
+## DESIGN DEVIATION (reported, safe subset): the design's Step A (migrating the dist-driven fade alpha into a per-frame
+## shader `cam_pos` uniform) and the paired band-edge MEMBERSHIP MARGIN are NOT implemented — the margin is correct ONLY
+## with Step A's per-frame fade (else widened-in trees render at a stale baked alpha / far-over-near). Without Step A,
+## widening the band is unsafe, so ONLY the re-arm threshold is raised: WALK_CALM then behaves like FP_FT_MOVE_HYST with
+## a wider (16 vs 12 blk) window — the SAME ≤16-blk band/alpha staleness class as the live MOVE_HYST, never worse. The
+## pixel-identity-by-construction claim needs Step A; see the design-vs-reality note. Off ⇒ the shipped move threshold
+## verbatim (byte-identical). FT_CALM_MARGIN is retained for a future Step A (the margin width); today only ·0.5 is read.
+const FP_FT_WALK_CALM := false               # Lever 1: 16-blk re-arm (walk = ~8× fewer far-tree rebuilds; membership-margin subset deferred)
+const FT_CALM_MARGIN := 32.0                 # membership margin (blocks); re-arm threshold = margin·0.5 (band-edge slack deferred with Step A)
+
+## FP_FT_NEARCULL_XFADE (docs/COSMOS-FARTIER-WALK-DESIGN.md §3.2, Lever 2a) — DECLARED, not yet implemented (the
+## bidirectional per-frame alpha animator at the near frontier). The const exists so the flag family + gate compile;
+## its body (generalising FP_FT_NEAR_GUARD from destructive hide-only into an alpha animator) is deferred with the
+## shader-migration subset (see the design-vs-reality note). Off ⇒ inert (byte-identical). Needs FP_FT_NEAR_GUARD.
+const FP_FT_NEARCULL_XFADE := false          # Lever 2a: bidirectional per-frame alpha animator (trees) — DECLARED, deferred
+const FT_HYST_W := 8.0                        # Schmitt dead-band width (blocks) on the FT_CULL_MIN / probe_hi branch edges
+const FT_XFADE_STEP := 0.17                   # per-frame alpha step (≈6 frames 0→1)
 
 ## FP_SLOPE_ALL_MATERIALS (docs/COSMOS-SLOPE-MATERIAL-DESIGN.md, task #122) — widen the 45° smooth-slope carve band
 ## from B_MOUNTAINS-only to ALL Earth land biomes except B_BADLANDS. Default false ⇒ the shipped predicate verbatim
@@ -1181,6 +1331,19 @@ const FP_FT_TEXMEAN_COLOR := false           # §3: far-tree leaf/trunk colour =
 ## overloaded client — hence a live perf A/B before default-on; ship byte-off (credit gate exactly as shipped when off).
 const FP_FT_STALE_REBUILD := false           # §4.1: ≤0.5Hz staleness floor — rebuild-while-moving despite credit 0 (converse of the guard)
 
+## FP_FT_STALE_PARKED (docs/COSMOS-LOD-DROPOUT-DESIGN.md §3, Stage S1) — the PARKED-camera blind spot in FP_FT_STALE_REBUILD.
+## The shipped floor (above) needs the camera to have MOVED > FT_STALE_MOVE (32 blk) AND ≥ FT_STALE_MS since the last
+## rebuild before a credit-0 rebuild is admitted; a de-orbit where the player STOPS to look with the tier stale + stream
+## credit starved never satisfies the move conjunct ⇒ trees stay VANISHED until credit returns (unbounded, up to ~30 s).
+## Under this flag the credit-0 override drops the FT_STALE_MOVE conjunct and fires on the WALL-CLOCK floor ALONE, but
+## gated on (moved > FT_STALE_MOVE ∨ _stale ∨ _ft_cull_pending) so a fully-SETTLED parked camera (not stale, no pending
+## cull-restore) re-admits NO rebuilds — the cost bound. `_ft_cull_pending` is the trees' pending-restore latch (the
+## converse of the cull-only FP_FT_NEAR_GUARD): set when a near-presence probe disagrees with the committed visibility,
+## so a frozen cull streak (#130-class M3) drains at the ≤0.5 Hz floor even while parked. The 250 ms rate cap + the DELTA
+## gate still apply (at most one REAL rebuild per FT_STALE_MS, only when an input actually drifted). Requires
+## FP_FT_STALE_REBUILD. Off ⇒ the shipped move-AND-time override verbatim (byte-identical credit gate).
+const FP_FT_STALE_PARKED := false            # §3 (S1): wall-clock-only credit-0 floor + pending-restore latch (needs FP_FT_STALE_REBUILD)
+
 ## FP_FT_SHELL_BAND (docs/COSMOS-FARTREE-ORBIT-DESIGN.md, far-tree orbit dropout) — the far trees hard-suspend the whole
 ## tier above OFFSURFACE_Y (256) though the cards are built to FAR_TREES_CARD_MAX (2400): 3D trees vanish flying up ~350
 ## blocks BELOW where a tree becomes sub-pixel (~600). Fix = a three-zone altitude law (h = camera radial altitude):
@@ -1197,6 +1360,22 @@ const FT_SHELL_FADE_ALT := 520.0             # tier_fade dissolve start (80-blk 
 const FT_SHELL_MOVE_FRAC := 0.25             # zone-B DELTA move threshold = max(FT_DELTA_MOVE_HYST, frac·h)
 const FT_SHELL_REBUILD_MS := 500             # zone-B rebuild rate cap (≤2 Hz hard ceiling)
 const FT_SHELL_SWAP_DWELL := 2               # steps of zone dwell before the mesh↔card rung swap (256-boundary flap absorber)
+
+## FP_FT_SHELL_FLIP_CALM (docs/COSMOS-SURFACE-ENTRY-SPIKE-DESIGN.md S2) — the PRIMARY surface-entry fix. The zone S→B
+## flip today FORCE-ARMS an immediate full _rebuild_cards (_rebuild_inputs_changed returns true on shell_mode !=
+## _last_rebuild_shell, bypassing every calm lever) AND immediately hides the rung-1 mesh set, opening a [R0,448) card
+## gap the forced rebuild scrambles to close — a ~350-600 ms main-thread GDScript loop landing on the crossing frame on
+## ASCENT (near field resident+idle ⇒ credit flows there). This flag makes the flip a correct-or-nothing HANDOFF: the raw
+## flip no longer force-arms (it latches _flip_pending, served by the SAME paced/credit-gated path as every zone-B rebuild,
+## with an FT_FLIP_MAX_MS failsafe), and the rung-1 mesh set stays VISIBLE (real geometry, one frame ago) until the first
+## zone-B card buffer commits — so the deferral never opens a gap (FT_SHELL_SWAP_DWELL promoted from "2 blind steps" to
+## "until the replacement is resident"). Off ⇒ the shipped force-arm + immediate hide verbatim (byte-identical, FLAT
+## 6042/0). Composes with FP_FT_STALE_PARKED (disjoint latch). Gate: verify_far_trees.gd G-FT-FLIP-CALM.
+## REQUIRES FP_FAR_TREES_DELTA on (deployed on): the flip is served through _rebuild_inputs_changed, which only runs under
+## DELTA. F7 caveat — with DELTA OFF the flip would perpetually re-latch (the DELTA gate that consumes it never runs); that
+## combination is unreachable in the served config, but do not ship FLIP_CALM with DELTA off.
+const FP_FT_SHELL_FLIP_CALM := false
+const FT_FLIP_MAX_MS := 2000                 # failsafe: past this wall-ms a still-pending flip rebuild is forced through (no stale band persists)
 
 ## FP_STRUCT_DETECT + FP_STRUCT_FAR (docs/COSMOS-STRUCTURES-DESIGN.md, task #121) — player-built (and, in P1,
 ## generated) STRUCTURES rendered NEAR to orbit as decimated low-res VOXEL MODELS, culled where the near voxel
@@ -1218,7 +1397,10 @@ const FT_SHELL_SWAP_DWELL := 2               # steps of zone dwell before the me
 ##    (§7.3) — the SAME "near meshed here ⇒ hide the far impostor" law the far-trees cull uses. Ledger: ≤ +2 draws,
 ##    STRUCT_FAR_TRIS_MAX tris, STRUCT_BYTES_MAX hard byte cap (never-OOM).
 ##  - FP_STRUCT_GEN (§5, P1 — declared, unused in P0): the procedural village GENERATOR (worldgen, not edits).
-##  - FP_STRUCT_LOD (§7.4/§10, P2 — declared, unused in P0): LOD-B band + orbit exception + fine-map roof texels.
+##  - FP_STRUCT_LOD (§7.4a — LIVE, fully implemented): far-skin roof texels — StructureGen.top_decoration composites a
+##    house roof-pixel into the band/fine map (GDScript bakers) + the C++ bake_far_tile path (patch 0013) + the far_
+##    palette dark_oak→BROWN re-home, so villages read as brown rooftop specks above the card band (the zone-O handoff
+##    the card altitude-band relies on). Default false (byte-off); shipped TRUE in the combined deploy arm. Gate: G-ST-LODSKIN.
 ## All default false, byte-identical off: the choke-point hook is one flag test, `FacetFarRing.setup` never
 ## constructs the tier (the FP_ORBIT_RELIEF pattern), `resolve_cell` never calls the generator. Gate:
 ## verify_structures.gd (G-ST-OFF/CLUSTER/DECIM/HANDOFF/BYTES/DRAWS/DELTA + the shared G-NP-*), full suite byte-off.
@@ -1247,6 +1429,42 @@ const STRUCT_FAR_MAX := 2400.0              # §7.1 far-structure outer band edg
 const STRUCT_STEP_MS := 250                  # §7.1 min ms between FacetFarStructures rebuilds (rate cap)
 const STRUCT_FAR_TRIS_MAX := 80000          # §8 NEVER-OOM: merged-band triangle cap
 const STRUCT_BYTES_MAX := 8 << 20           # §8 NEVER-OOM: hard 8 MB ceiling (tracker + registry + bakes + meshes)
+
+## FP_STRUCT_COARSE_FAR (far-village render diet — live-confirmed 2026-09-01). The far-village tier adds ~240k prims
+## PINNED at STRUCT_FAR_TRIS_MAX (80k tris), the dominant far-village cost (orbit "villages=jerky, no-villages=fast").
+## STRUCT_TARGET_RES=16 renders houses ≤16 blk at FULL 1:1 voxel res (no decimation). This flag decimates far houses
+## coarser (STRUCT_COARSE_RES) AND lowers the merged-mesh cap (STRUCT_COARSE_TRIS_MAX) proportionally — SAME villages
+## shown (they're smaller, more fit the cap), ~70% fewer village prims. Consulted only via struct_far_target_res() /
+## struct_far_tris_max() (below); analytic physics never touches the far model ⇒ movement unchanged, render-only trade.
+## Off ⇒ 16 / 80000 verbatim ⇒ byte-identical (FLAT 6042/0; villages OFF in FLAT anyway). Needs FP_STRUCT_FAR. Visual:
+## far houses blockier from a distance (tiny on screen at orbit). Gate: verify_structures decim parity holds both res.
+const FP_STRUCT_COARSE_FAR := false          # coarser far-village decimation + lower tri cap (kills the +240k village-prim load)
+const STRUCT_COARSE_RES := 8                 # decimator target res under the flag (16→8 ⇒ ~4× fewer tris/house)
+const STRUCT_COARSE_TRIS_MAX := 24000        # merged-band tri cap under the flag (matches the tri reduction — same villages)
+
+## Effective far-village decimator target res + tri cap (the single read sites; byte-identical off).
+static func struct_far_target_res() -> int:
+	return STRUCT_COARSE_RES if FP_STRUCT_COARSE_FAR else STRUCT_TARGET_RES
+static func struct_far_tris_max() -> int:
+	return STRUCT_COARSE_TRIS_MAX if FP_STRUCT_COARSE_FAR else STRUCT_FAR_TRIS_MAX
+
+## FP_STRUCT_SHADER_LITE / FP_STRUCT_CULL_BACK / FP_STRUCT_VIS_ABTEST (far-building GPU raster diet — Codex cross-review,
+## 2026-09-01, docs/COSMOS-BUILDING-RENDER-PERF-STRUGGLE.md). The far-village jerk at ~alt 500 tracks the FAR-STRUCTURE
+## RENDER, not the bake (stationary st_rb Δ0, merge ~2ms). Two per-fragment/raster wastes found in facet_far_structures.gd:
+##  (a) the zone-B `_SHELL_SHADER` runs a `sin(dot(floor(FRAGCOORD)…))` dither EVERY covered fragment even when
+##      tier_fade==1.0 (h<FT_SHELL_FADE_ALT=520 ⇒ discard can never fire) — pure ALU waste over the whole house footprint,
+##      which is exactly why FP_STRUCT_COARSE_FAR (−70% tris) did NOT cure it (same covered pixels). FP_STRUCT_SHADER_LITE
+##      guards the dither behind `tier_fade < 1.0` ⇒ byte-identical PIXELS (the discard was a no-op at fade 1), just no sin.
+##  (b) BOTH materials `render_mode cull_disabled` ⇒ hardware backface rejection off ⇒ ~2× raster. FP_STRUCT_CULL_BACK
+##      flips them to `cull_back` (closed, outward-wound house cubes). VISUAL-RISK if any face is mis-wound (holes) —
+##      isolated on its own flag to A/B; revert if it holes.
+## FP_STRUCT_VIS_ABTEST is the cheap definitive diagnostic (Codex): blink `_mi.visible` every STRUCT_VIS_ABTEST_PERIOD_MS
+## with the mesh baked + resident — jerk-follows-visibility ⇒ render/GPU-bound (registry/probe/bake all keep running).
+## All three OFF ⇒ shader strings + visibility verbatim ⇒ byte-identical (FLAT 6042/0). Need FP_STRUCT_FAR (+SHELL_BAND for a).
+const FP_STRUCT_SHADER_LITE := false         # skip the shell-shader per-fragment sin() dither when tier_fade>=1 (no-op discard)
+const FP_STRUCT_CULL_BACK := false           # cull_back (not cull_disabled) on both far-structure materials — ~2x less raster
+const FP_STRUCT_VIS_ABTEST := false          # DIAGNOSTIC: blink the far-structure mesh visibility to isolate render vs the rest
+const STRUCT_VIS_ABTEST_PERIOD_MS := 4000    # half-period of the visibility blink (ms) — 4s visible / 4s hidden
 const STRUCT_ORBIT_MIN := 48                 # §7.4 P2: min max-extent (blocks) for the orbit-resident exception
 const STRUCT_HIDE_STREAK := 2                # §7.3 consecutive COVERED probes before hiding the far model
 const STRUCT_SHOW_STREAK := 2                # §7.3 consecutive NOT_COVERED probes before restoring it
@@ -1279,6 +1497,147 @@ const FP_STRUCT_BAKE_STAGE := false          # staged wake-bake drain (no single
 const STRUCT_BAKE_STAGE_MS := 8.0            # per-pass bake time box (ms) ≈ half a 60 Hz frame
 const STRUCT_BAKE_STAGE_MIN := 2             # min fresh bakes per pass — guaranteed forward progress
 const STRUCT_HOLD_PROBE_CAP := 96            # max inside-r0 probes per pass (past ⇒ UNKNOWABLE ⇒ hold; safe degrade)
+
+## FP_STRUCT_GATE_MEMO (village-descent bake diet) — the far-structure bake (StructDecimator.decimate) samples
+## WorldManager.structure_cell_at → StructureGen.claim_at ONCE PER FINE CELL across the whole structure bbox (O(volume)).
+## claim_at's cost is dominated by has_village (a 4×4 column_top cliff stencil + biome + hashes) and house_info (which
+## re-calls has_village + 4 column_top + slope), yet both depend ONLY on (vx,vz)/(hx,hz) — near-CONSTANT within one
+## village's bbox — so they recompute the identical result thousands of times per bake (measured st_bms ≈ 150 ms /pass on
+## descent = ~75 ms per village decimate). This memoizes has_village per (vx,vz) and house_info per (hx,hz) in the GenCtx
+## (the same per-fid ctx already carrying the column_top memo), collapsing the per-cell gate cost to a dict lookup. The
+## memoized values are byte-IDENTICAL to the recomputed ones (both are pure functions of the frozen epoch), so the far
+## model is unchanged — this is pure work elision, not a fidelity trade. Only engages when pcache is a GenCtx AND the flag
+## is on; every other caller (plain-dict / null pcache, FLAT) is untouched ⇒ byte-identical (FLAT 6042/0). Gate: G-ST-MEMO.
+const FP_STRUCT_GATE_MEMO := false           # memoize has_village/house_info per cell-grid in the GenCtx (kills the O(volume) village-bake spike)
+
+## FP_STRUCT_WALK_CALM (docs/COSMOS-FARTIER-WALK-DESIGN.md §2.1, Lever 1) — the move-churn diet for the far-STRUCTURE
+## tier. The per-structure bakes are world-space (camera-INDEPENDENT geometry); the shipped 2-blk camera re-arm re-
+## concatenates + re-uploads UNCHANGED merged data every ~0.36 s of walk. Under WALK_CALM the camera re-arm is replaced
+## by a band FINGERPRINT (XOR of _root_hash × band-code, folded FREE inside the existing _probe_pass distance loop): a
+## re-commit fires only when at least one structure crossed a band/branch edge (a genuine membership delta). Degrades to
+## the shipped camera re-arm when the tri cap was hit last rebuild (nearest-first ORDERING is then camera-dependent).
+## Off ⇒ the shipped camera-delta disjunct verbatim (byte-identical). Composes with FP_STRUCT_HANDOFF_HYST (dead-band on
+## the band edges so a razor-edge camera can't oscillate the fingerprint). Gate: verify_fartier_walk.gd (G-WC-STRUCT).
+const FP_STRUCT_WALK_CALM := false           # Lever 1: camera-delta re-arm → membership band-fingerprint (walk = zero re-commit)
+
+## FP_STRUCT_HANDOFF_HYST (docs/COSMOS-FARTIER-WALK-DESIGN.md §3.4/§2.1, Lever 2c) — a state-keyed Schmitt dead-band
+## (width STRUCT_HYST_W) on the far-structure distance band edges (r0 / r0+CULL_ANNULUS / STRUCT_FAR_MAX): a structure
+## keeps its latched band-code until the camera crosses the edge by ±STRUCT_HYST_W, so a player wobbling on a boundary
+## can't flap the band classification (and thus can't oscillate the WALK_CALM fingerprint). Independently flippable;
+## consulted only inside the WALK_CALM band-code classifier (no shipped-path read). Off ⇒ raw edge compares (byte-off).
+const FP_STRUCT_HANDOFF_HYST := false        # Lever 2c: Schmitt dead-band on the far-structure r0/annulus/2400 band edges
+const STRUCT_HYST_W := 8.0                    # Schmitt dead-band half-width (blocks) on the far-structure band edges
+
+## FP_STRUCT_REG_EPOCH (docs/COSMOS-FARTIER-WALK-DESIGN.md — the far-structure stationary-over-village spike) — the
+## far-STRUCTURE prelude ran O(N-houses) main-thread work EVERY ~250 ms step BEFORE its delta gate could conclude
+## "nothing changed": WorldManager.structure_registry() deep-DUPLICATES every GEN record per call, then _probe_pass
+## re-walks all records computing _structure_centre → FacetAtlas.lattice_to_world64 (a fresh 3-Variant Array each) —
+## a ~2 Hz frame spike over a village even when parked. This VERSIONS the registry (WorldManager.structure_registry_
+## version = StructGenIndex.version ⊕ StructureTracker.version): the prelude MATERIALIZES the snapshot (the one
+## registry duplicate + the per-record world centres) ONLY when the version drifts, camera moves ≥ STRUCT_EPOCH_STILL,
+## or a cull is mid-transition; a parked, same-version step whose last probe found an EMPTY handoff annulus early-
+## returns in O(1) (no duplicate, no probe loop). The far-TREE tier already checks cheap gate inputs before any O(N)
+## work (facet_far_trees.gd:802) — this brings the structure tier to parity. NEVER-DROP: the version bumps on EVERY
+## registry mutation (a cluster change, a GEN damage rev, a crossing re-selecting the wanted band), so a real change
+## is caught the same step it lands; the O(1) skip only fires when the version, camera AND annulus are all quiescent.
+## Off ⇒ the shipped prelude verbatim (lines guarded if/else ⇒ byte-identical). Gate: verify_structures.gd (G-ST-
+## EPOCH) + verify_fartier_walk.gd (G-WC-EPOCH). Composes with FP_STRUCT_WALK_CALM (the band-fp is recomputed on every
+## non-short-circuit probe; a sub-STRUCT_EPOCH_STILL camera drift is bounded to < STRUCT_EPOCH_STILL from the last
+## full scan before a resync, so a razor-edge band flip is at most one step / < 0.5 blk stale — self-correcting).
+const FP_STRUCT_REG_EPOCH := false           # version-gate the far-structure prelude (parked-over-village ⇒ O(1) step)
+
+## FP_STRUCT_XFADE (docs/COSMOS-FARTIER-WALK-DESIGN.md §3.3, Lever 2b) — DECLARED, not yet implemented (the structure
+## dither-alpha channel + credit-independent streak pass + bounded fade commits). The const exists so the flag family +
+## gate compile; its body is deferred with the shader-migration subset (see the design-vs-reality note). Off ⇒ inert
+## (byte-identical). Needs FP_STRUCT_FAR.
+const FP_STRUCT_XFADE := false               # Lever 2b: structures dither-alpha cross-fade handoff — DECLARED, deferred
+const STRUCT_XFADE_STEPS := 4                 # alpha quantisation steps per transition (≤ this many commits per event)
+const STRUCT_XFADE_STEP_MS := 80             # commit cadence while a fade is in flight
+
+## FP_STRUCT_CARDS (docs/COSMOS-STRUCT-IMPOSTOR-DESIGN.md) — the far-village impostor-card tier (Stage 2 of the
+## far-village perf fix). GEN houses (SOURCE_GEN, negative tracker root) beyond STRUCT_CARD_MIN render as DIRECTIONAL
+## impostor cards: ONE shared 4-triangle mesh (a camera-facing vertical quad + a planet-tangent roof cap) in ONE
+## MultiMeshInstance3D, textured from a CPU-rasterized archetype atlas, with the view sector chosen IN THE VERTEX
+## SHADER so camera rotation never rewrites the instance buffer. The merged-cube path retains the inner band
+## [r0, STRUCT_CARD_MIN) + ALL player-built (tracker root ≥ 0 / non-GEN source) structures at every distance. Off ⇒
+## the shipped merged-cube tier VERBATIM (byte-identical; FLAT 6042/0 — villages absent in FLAT regardless, and every
+## new line is behind the flag). Needs FP_STRUCT_FAR (+_GEN for any GEN record to exist) and is designed to run WITH
+## FP_STRUCT_REG_EPOCH (the card param precompute lives in _resnapshot). Composes with WALK_CALM/HANDOFF_HYST (§7) and
+## SHELL_BAND (§8.4). Gates: verify_structures.gd (G-ST-CARD-*) + verify_fartier_walk.gd (split-edge fingerprint).
+const FP_STRUCT_CARDS := false               # far-village impostor-card tier (data-plane swap)
+const STRUCT_CARD_MIN := 320.0               # cube→card split radius (blocks); the A/B "cards-all-the-way" arm sets 0.0
+const STRUCT_CARD_INST_MAX := 2048           # card MultiMesh instance cap (nearest-first fill)
+const STRUCT_CARD_TILE := 32                 # atlas texels per tile (32² RGBA8)
+const STRUCT_CARD_AZIMUTHS := 8              # side views per archetype (45° sectors, snap-select in-shader)
+const STRUCT_CARD_ARCHES := 10               # §3: 2 flat + 8 gabled canonical archetypes
+const STRUCT_CARD_FADE_W := 16.0             # P2 (optional) cube↔card dither cross-fade half-width (blocks)
+
+## FP_STRUCT_CARD_ALT_BAND (docs/COSMOS-CARD-BAND-HANDOFF-DESIGN.md §4, Stage 3 S3) — the card altitude-band extension.
+## The shipped card zone law hides cards at FT_SHELL_HIDE_ALT=600 (with the cube tier), so villages VANISH above 600
+## and pop back on descent — but cards are ~4 tris/house, so they can afford the WHOLE 3D distance envelope. Under this
+## flag the CARD tier's zone law in _apply_shell_visibility uses STRUCT_CARD_HIDE_ALT (= STRUCT_FAR_MAX = 2400, where
+## the emitted set is empty by construction — _rebuild drops dist>2400) and re-anchors the card tier_fade dissolve to
+## [STRUCT_CARD_FADE_ALT, STRUCT_CARD_HIDE_ALT]; the freeze line (step early-return) and the extended-band rate cap move
+## with it. The CUBE tier keeps its 600 law unchanged. Off ⇒ the FT_SHELL_HIDE_ALT=600 law verbatim (byte-identical).
+## Requires FP_STRUCT_CARDS ∧ FP_STRUCT_SHELL_BAND ∧ FP_STRUCT_REG_EPOCH (warns at setup otherwise). Gates: G-ST-CALT/RES.
+const FP_STRUCT_CARD_ALT_BAND := false       # cards render to STRUCT_FAR_MAX (not 600); roof-skin owns the view above
+const STRUCT_CARD_HIDE_ALT := 2400.0         # card zone-O boundary (blocks) — kept == STRUCT_FAR_MAX by law (§3.1; gate-asserted)
+const STRUCT_CARD_FADE_ALT := 2000.0         # card tier_fade dissolve start (the top cross-fade band [2000, 2400])
+const STRUCT_SHELL_STEP_MS := 500            # extended-band (h ≥ FT_SHELL_HIDE_ALT) prelude cadence — the view changes slowly up there
+
+# --- FP_SKIN_READY_GATE / FP_SKIN_HANDOFF_PREWARM (LOD skin-readiness handoff, docs/COSMOS-LOD-DROPOUT-DESIGN.md) ---
+# Hold the card/mesh tier past its normal hide-alt until the replacement fine-map skin is baked (ready), so trees/houses
+# never vanish into an un-baked gap across an LOD step; a hard ceiling releases regardless of readiness (no infinite hold).
+const FP_SKIN_READY_GATE := false            # gate the card→skin handoff on baker readiness (extends hide-alt to *_HOLD_MAX_ALT)
+const FP_SKIN_HANDOFF_PREWARM := false       # baker "handoff" priority class + early un-freeze so the descent disc pre-bakes
+const FT_SHELL_HOLD_MAX_ALT := 900.0         # far-tree hold ceiling (blocks): release the mesh/card even if skin not ready (> FT_SHELL_HIDE_ALT 600)
+const STRUCT_CARD_HOLD_MAX_ALT := 2800.0     # far-structure card hold ceiling (blocks): release even if skin not ready (> STRUCT_CARD_HIDE_ALT 2400)
+const SKIN_HANDOFF_MARGIN_ALT := 40.0        # blocks below *_FADE_ALT at which the readiness-hold logic starts watching
+const SKIN_READY_MIN := 0.9                  # min baked fraction (0..1) of the EMITTED-card skin fids to release the hold
+                                             # (< ⇒ hold). 0.9 (not 1.0) so a single slow-baking straggler in the actual
+                                             # committed set can't pin the whole tier to the ceiling (Codex P0 amplifier).
+const SKIN_HOLD_FADE := 1.0                  # tier_fade floor (0..1) while holding — keep the tier fully visible, no dissolve
+## FP_SKIN_HANDOFF_PREWARM §4.3: the descent-prewarm un-freeze ceiling (blocks, radial altitude). The page baker is only
+## un-frozen off-surface when the skin is retired AND the camera has fallen BELOW this — a bounded window that gives the
+## descent lead time to prebake the 600/2400 handoff disc, WITHOUT baking invisibly through all of parked orbit above it
+## (Codex P1). Above the struct card-hold ceiling (2800) + margin so the roof skin prebakes before the 2400 handoff.
+const SKIN_PREWARM_MAX_ALT := 3600.0
+
+## FP_STRUCT_CARD_STAGE (docs/COSMOS-CARD-BAND-HANDOFF-DESIGN.md §6-§7, Stage 3 S2+S4) — kills the ~1136 ms crossing
+## spike, two composing fixes. (S2/§7) THE SORT BOMB: _rebuild's nearest-first sort_custom recomputes _structure_dist
+## → _structure_centre → lattice_to_world64 (a fresh 3-Variant Array) PER COMPARISON (~N·log N allocating calls); under
+## the flag the ordering is a precomputed-distance argsort off the REG_EPOCH _centres (O(N) float ops, no per-comparison
+## lattice), and _cull_emit/_drain_bakes reuse the same precomputed distances. (S4/§6) THE WAKE DEBT: _resnapshot's
+## per-record precompute is drained over frames into a DOUBLE-BUFFERED snapshot (the old snapshot keeps rendering) at
+## ≤STRUCT_SNAP_STAGE_MS/≥STRUCT_SNAP_STAGE_MIN per pass, swapped on convergence; plus a ~STRUCT_WAKE_FADE_S fade-in on
+## a large set entry. Preserves the REG_EPOCH O(1)-stationary skip (staging engages only when the version drifts). Off ⇒
+## the one-shot _resnapshot body + the shipped sort_custom lambda run verbatim (byte-identical). Requires FP_STRUCT_REG_
+## EPOCH (staging lives inside the epoch prelude; warns at setup otherwise). Gates: G-ST-SORT / G-ST-SNAPSTAGE.
+const FP_STRUCT_CARD_STAGE := false          # staged double-buffered snapshot + precomputed-distance argsort + wake fade-in
+const STRUCT_SNAP_STAGE_MS := 2.0            # staged-snapshot per-pass time box (ms)
+const STRUCT_SNAP_STAGE_MIN := 32            # min records precomputed per pass — guaranteed forward progress ⇒ convergence
+const STRUCT_WAKE_FADE_S := 0.7              # §8 wake fade-in duration (s) when a swap lands a large card set
+const STRUCT_WAKE_JUMP := 64                 # §8 min _live_cards jump (from empty/frozen) that latches a wake fade
+
+## FP_STRUCT_EDIT_DEBOUNCE (docs/COSMOS-FAR-EDIT-DEBOUNCE-DESIGN.md) — defer the FAR-visible structure re-bake until the
+## player STOPS editing a building, DEPARTS ~16 blocks from its nearest block, and is IDLE-from-it a few seconds. Fixes
+## BOTH the freeze-on-break (P2 — every in-bbox edit synchronously re-materializes the whole far snapshot + re-bakes at
+## the 250 ms cadence) and the far-edit timing (P1 — the far hole should show on DEPARTURE, not ~1-2 s after the dig).
+## Mechanism: producers track damage instantly + losslessly (TRUTH rev), but the version token + the record `rev` fields
+## the far tier SEES are a PUBLISHED copy that advances only when a per-structure debounce gate opens (idle ≥ IDLE_MS AND
+## dist ≥ DEPART_BLK from the structure's world AABB). Publish is atomic + coalescing (all gated structures → ONE version
+## bump → one resnapshot → one rebuild), deferred but NEVER dropped. Off ⇒ the shipped immediate re-bake verbatim
+## (byte-identical; FLAT 6042/0). Composes with FP_STRUCT_REG_EPOCH / FP_STRUCT_CARD_STAGE / FP_STRUCT_GATE_MEMO.
+const FP_STRUCT_EDIT_DEBOUNCE := false       # defer far-visible structure revs until the player departs + idles
+const STRUCT_EDIT_DEPART_BLK := 16.0         # publish gate: min distance (blocks) from the structure's world AABB (nearest block)
+const STRUCT_EDIT_IDLE_MS := 3000            # publish gate: min ms since the last edit to that structure
+const STRUCT_EDIT_PENDING_MAX := 64          # NEVER-OOM: pending-entry cap (overflow force-publishes the oldest)
+## v2 (docs/COSMOS-FAR-EDIT-DEBOUNCE-REDESIGN.md) — the deferred, budgeted, O(1)-per-entry classifier. The edit input
+## frame only ENQUEUES (STRICTLY O(1), worldgen-free); classification runs off-frame in _sed_classify_step, bounded by
+## a per-frame time box AND a forward-progress floor (so a queue of N drains in ≤ ⌈N/MIN⌉ ticks — never dropped).
+const STRUCT_EDIT_CLASSIFY_US := 500         # per-frame classifier time box (µs) — bounds the DEFERRED drain, never the input frame
+const STRUCT_EDIT_CLASSIFY_MIN := 8          # min entries drained per tick regardless of the time box (guaranteed forward progress)
+const STRUCT_EDIT_UNCLS_MAX := 4096          # NEVER-OOM cap on the un-classified queue (32 KB int64); overflow ⇒ whole-facet superset marker
 
 ## FP_DEM_DEFER (docs/COSMOS-STREAM-PARALLEL-DESIGN.md Phase A — the fresh-reload fix) — the whole-planet coarse
 ## DEM (`FP_GLOBAL_RELIEF_DATA` / `GlobalReliefData.step`) is frame-budget GATED but the admitted unit is UNBOUNDED
@@ -2716,6 +3075,31 @@ const INFLIGHT_MAX := 192        # close the gate above this F (≈0.6 s of pipe
 const INFLIGHT_MIN := 64         # re-open below this F (≈0.2 s) — the hysteresis band prevents admission thrash
 const INFLIGHT_MAIN_K := 2       # an apply is main-thread-priced: weight tasks.main_thread K× in F
 const APPLY_CHOKE := 24          # feed-forward: full ramp pace at main_q 0, linearly to 0 at main_q ≥ APPLY_CHOKE
+
+## COSMOS-GEN-BURST-THROTTLE (docs/COSMOS-GEN-BURST-THROTTLE-DESIGN.md) — FP_WALK_STEP_GATE: a stepped, drain-gated
+## streaming viewer. Ground-walk jerkiness on web is per-crossing GENERATION BURSTS: every ~3 s the player crosses a
+## 16-voxel data-block boundary and godot_voxel's C++ box-diff enqueues the whole leading strip across all live
+## FP_M1_POOL slots in ONE process pass — wf_vox_gen spikes 1000–2186, and 65–83 % of the resulting worst-frame time
+## is unmetered WASM/browser burst cost (heap-growth copies + 6-thread bandwidth churn). The shipped controller +
+## FP_INFLIGHT_GATE have NO actuator over the box-step (they pace the view RAMP, idle at steady-state walking), so the
+## only lever is to reduce the burst: the viewer node's continuous motion is the one C++-admission input GDScript owns.
+## When true, WorldManager holds the viewer on a committed ANCHOR and advances it toward the player ONE data-block
+## quantum along ONE axis per admitted STEP; a step is admitted only when tasks.generation < WALK_STEP_OPEN and ≥
+## WALK_STEP_MIN_INTERVAL_S has elapsed (feed-forward, same signal family as backlog_gated()), with a forced step once
+## the per-axis lag exceeds WALK_GATE_MAX_LAG (frontier deficit bounded to LAG+QUANTUM ever). Snaps on any
+## discontinuity (> WALK_GATE_SNAP_DIST — crossing/flip re-place, teleport) or non-walking motion (speed >
+## WALK_GATE_MAX_SPEED — fly/fall keep the shipped free-follow viewer, ungated). Physics is analytic (block_id_at /
+## floor_under never read the mesh) so a late strip has zero fall-through risk; the un-meshed rim stays covered by the
+## far-tier backstop (FP_FARRING_CULL_COVERED culls confirmed-meshed only). Default OFF ⇒ walk_gate_update is never
+## called, the viewer is never written and stays the plain player child from attach_viewer (byte-identical admission;
+## FLAT stays 6042/0). Flipped ON at export after the live 3-min ground-walk A/B (§7 sed-at-export pattern).
+const FP_WALK_STEP_GATE := false
+const WALK_STEP_QUANTUM := 16.0        # one godot_voxel data block — the admission unit the C++ box-diff quantizes at
+const WALK_STEP_OPEN := 128            # admit the next step only when tasks.generation is below this (~0.4 s of pipe @300/s)
+const WALK_STEP_MIN_INTERVAL_S := 0.2  # ≥1 render frame of drain between admitted steps even at zero backlog
+const WALK_GATE_MAX_LAG := 24.0        # per-axis force-step bound (voxels): the streamed frontier never trails farther
+const WALK_GATE_SNAP_DIST := 48.0      # beyond this the delta is a crossing/flip/teleport re-place — snap, don't step
+const WALK_GATE_MAX_SPEED := 12.0      # engage only at ground speeds (walk 5.5 / run 9.5); fly/fall keep the shipped viewer
 
 ## INITIAL-LOAD VIEW RAMP (perf/voxiverse-load-profile) — FP_LOAD_RAMP. Symptom: the FIRST cold load slams the near
 ## VoxelTerrain's max_view_distance to the full near radius (near_render_radius(): 256 flat / 128 faceted) in ONE
@@ -4241,6 +4625,33 @@ const FALL_FREEZE_BAND := 48.0
 ## telemetry keys added (byte-identical). NEVER-OOM: a fixed handful of int-keyed maxima, cleared every telemetry
 ## window. Gate G-FALL-TIMING (verify_fall_timing.gd): byte-off default + the plumbing populates/clears the keys.
 const FP_FALL_TIMING := false
+
+## FP_WORST_FRAME_ATTR (docs/COSMOS-GROUND-WALK-PERF-ATTRIBUTION.md §3) — worst-frame-keyed attribution snapshot.
+## Every attribution field today is either an independently-maxed segment or a telemetry-tick-boundary snapshot; NONE
+## is captured at the instant the window's worst frame is recognised, so the 285 ms unattributed remainder cannot be
+## pinned to (a) a vox_gen/mesh/main burst that just missed the 250 ms sample, (b) the pool_active≈pool_threads
+## dlmalloc-convoy signature, or (c) an all-queues-zero structure/far-tier stall. This flag piggybacks on the exact
+## `_win_worst` comparison RemoteBridge._process already performs (remote_bridge.gd): the frame that sets a NEW window
+## maximum snapshots the attribution-relevant stats RIGHT THEN (get_stats tasks + general pool activity + draws/prims/
+## objects/phys + the live st_bms/smooth_v2_commit_ms/main_commit_ms markers, and — if FP_FALL_TIMING is also on — the
+## in-progress _ft segment maxima), emitted once per window as `wf_*`-prefixed fields. Cost: one dict build per NEW
+## window maximum (rare — typically once/window), reading already-computed leaf values only (no heavy new query on the
+## hot path). Off ⇒ the snapshot is never built and NO wf_* key is stamped (byte-identical telemetry). NEVER-OOM: zero
+## growing state (one fixed dict, overwritten each new worst, cleared every emit). Zero engine rebuild.
+const FP_WORST_FRAME_ATTR := false
+
+## FP_WF_TIER_ATTR (docs/COSMOS-SURFACE-ENTRY-SPIKE-DESIGN.md S1) — per-tier worst-frame self-time markers so the
+## surface→off-surface (256) regime-flip spike is ATTRIBUTABLE (today `worst_frame_markers` has structure-tier
+## st_step_us but no far-tree / orbit-relief / ring-prelude / ring-swap self-time, so the 1111 ms is unpinnable).
+## Adds four leaf µs timers surfaced only under this flag: wf_ftr_us (last FacetFarTrees.step wall µs), wf_or_us
+## (last FacetOrbitRelief.step µs), wf_ring_disp_us (the _dispatch_async_rebuild main-thread prelude µs), wf_ring_swap_us
+## (last _swap_in_sectors/_swap_in_arrays µs). The timing itself is unconditional + cheap (a couple of get_ticks_usec
+## reads, the _dbg_drive_ms precedent), but the KEYS are merged into the marker dict ONLY under this flag ⇒ OFF telemetry
+## is byte-identical (no wf_*_us key stamped). Zero engine rebuild. Also surfaces the F4 "fired" counters ft_flip_defers
+## (zone-flip defers) + shell_ascent_lazy_arms (ascent-release luxury arms) so an A/B can tell "fired and helped" from
+## "never fired". F8 caveat — wf_ring_disp_us / wf_ring_swap_us are last-EVENT values (a dispatch/swap only happens on a
+## re-emit), reset to 0 each ring frame; read them ALONGSIDE the sh_reemit/sh_emit deltas, not as per-frame costs.
+const FP_WF_TIER_ATTR := false
 
 ## COSMOS-PERF FALL — THE fall-fps fix. _attitude_ground_contact() (player.gd) calls world.floor_under() EVERY
 ## free-fall frame; at high altitude the near field is ALT_REGIME-frozen so the floor query hits a slow regenerate

@@ -7,6 +7,12 @@ extends Node3D
 # boundary at 256 blocks dissolves into the horizon (DESIGN §1).
 const SKY_COLOR := Color(0.62, 0.74, 0.86)
 
+# COSMOS SPAWN TIME-OF-DAY: the celestial clock's raw t=0 phase is local MIDNIGHT at the spawn point
+# (docs/COSMOS-ORBITAL-DESIGN.md epoch), which drops the player into darkness. Land the spawn instead
+# at early morning — Sun low but already above the horizon. 12.0 = local noon; see the clock-offset
+# block below (only reached when the celestial clock exists at all).
+const SPAWN_LOCAL_HOURS := 7.0
+
 var _player: Player
 
 # COSMOS ORBITAL O0 (CubeSphere.ORBITAL_SKY): the celestial clock (advanced each frame) and the sky
@@ -135,6 +141,19 @@ func _ready() -> void:
 	if CubeSphere.ORBITAL_SKY or CubeSphere.FP_SEASONS or CubeSphere.FP_CLIMATE_GRID:
 		_cosmos_clock = CosmosEphemeris.CosmosClock.new()
 		world.set_cosmos_clock(_cosmos_clock)
+		# COSMOS SPAWN TIME-OF-DAY (SPAWN_LOCAL_HOURS above): fold a one-time offset into the fresh
+		# clock so the SPAWN point (player.global_position, already finalized above) reads local
+		# early-morning instead of the raw t=0 midnight phase. Mirrors the remote `set_time` dev cheat's
+		# own offset-solve exactly (player.gd remote_set_time / docs/COSMOS-REMOTE-CONTROL-DESIGN.md):
+		# up_bf is the spawn point's body-fixed up vector relative to the planet's render centre (still
+		# Vector3.ZERO here — nothing has floating-origin re-anchored yet, so this equals global_position),
+		# and add_offset folds the delta into the ONE clock every celestial read goes through, so the
+		# Sun/Moon/sky/day-night all start in the same early-morning phase together. Done BEFORE
+		# CosmosSky.setup() below so the sky's very first frame already reflects it (no midnight flash).
+		var spawn_up_bf := player.global_position - world.planet_render_centre()
+		if spawn_up_bf.length() > 1.0e-6:
+			_cosmos_clock.add_offset(CosmosEphemeris.offset_for_local_hours(
+				CosmosSky.OBSERVER, spawn_up_bf, _cosmos_clock.now(), SPAWN_LOCAL_HOURS))
 	if CubeSphere.ORBITAL_SKY:
 		var we := get_node_or_null("WorldEnvironment") as WorldEnvironment
 		var env: Environment = we.environment if we != null else null

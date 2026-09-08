@@ -15,12 +15,30 @@ const _FACET_CAP := 96              # LRU cap on cached facets (never-OOM; ≫ t
 
 var _cache: Dictionary = {}         # fid -> Array of GEN records (pure enumeration, rev overlaid from _rev)
 var _lru: Array = []                # fids in recency order (front = most recent) for the eviction bound
-var _rev: Dictionary = {}           # root -> damage rev (persists across enumeration eviction; 0-default is pristine)
+var _rev: Dictionary = {}           # root -> damage rev (TRUTH: bumped instantly on every in-bbox edit; 0-default pristine)
+# FP_STRUCT_EDIT_DEBOUNCE: root -> PUBLISHED damage rev — what enumerate_facet/records() serve the far tier. Advances
+# ONLY at publish_roots (player departed + idle). Same persistence class as _rev (survives LRU eviction). Off ⇒ never
+# written; the overlay reads _rev verbatim (byte-identical).
+var _rev_pub: Dictionary = {}
 var _wanted: PackedInt32Array = PackedInt32Array()
+
+# FP_STRUCT_EDIT_DEBOUNCE v2 (docs/COSMOS-FAR-EDIT-DEBOUNCE-REDESIGN.md §3.1) — the captured-but-unclassified edit
+# queue. Under the flag, note_edit is STRICTLY O(1): it packs (fid,cell) into the edit-key bijection and appends here,
+# then returns. WorldManager's budgeted _sed_classify_step drains it OFF the input frame (position-pure classification).
+# NEVER-DROP: capture is unconditional; at STRUCT_EDIT_UNCLS_MAX the facet is marked wholesale-dirty in _uncls_overflow
+# (the classifier later resolves it by enumerating the facet off-frame + bumping every record — over-invalidate, never
+# drop). Both are empty + never touched off-flag (the OFF note_edit path bumps the truth rev inline) ⇒ byte-identical.
+var _uncls: PackedInt64Array = PackedInt64Array()   # packed edit keys awaiting off-frame classification (LIFO drain)
+var _uncls_overflow: Dictionary = {}                # fid -> true: NEVER-OOM superset marker (facet wholesale-dirty)
 
 var _epoch := 0                     # bumped on crossing (re-selects the wanted band; records themselves are pure)
 var _active_fid := -1
 var _wanted_dirty := true
+
+# FP_STRUCT_REG_EPOCH: a monotone change token bumped on every mutation that could alter what records() returns (a
+# cache (re)fill, a damage-rev bump, a crossing that re-selects the wanted band). The far tier reads version() O(1)
+# and re-materializes its snapshot only when it drifts. Inert off-flag (the counter is written but never read).
+var _version := 0
 
 # telemetry / gate read-back
 var _dbg_enum_count := 0
@@ -35,6 +53,7 @@ func refresh(active_fid: int) -> void:
 	_active_fid = active_fid
 	_wanted_dirty = false
 	_wanted = _wanted_facets(active_fid)
+	_version += 1                                  # FP_STRUCT_REG_EPOCH: the wanted band was rebuilt ⇒ records() may differ
 	for fid in _wanted:
 		enumerate_facet(int(fid))
 	_evict_unwanted()
@@ -42,8 +61,13 @@ func refresh(active_fid: int) -> void:
 ## Bump the crossing epoch (WorldManager calls this on a facet crossing). Re-selects the wanted band next refresh.
 func set_active(new_fid: int) -> void:
 	_epoch += 1
+	_version += 1                                  # FP_STRUCT_REG_EPOCH: a crossing re-selects the wanted band next refresh
 	_active_fid = new_fid
 	_wanted_dirty = true
+
+## FP_STRUCT_REG_EPOCH: O(1) change token for the far-tier prelude (bumps on refresh/set_active/note_edit/_store).
+func version() -> int:
+	return _version
 
 ## THE registry query half (§12.5): fresh record dicts for every CACHED wanted facet's houses. The far tier walks
 ## this concatenated with the tracker's records; it never scans the world.
@@ -95,30 +119,114 @@ func enumerate_facet(fid: int, pcache = null) -> Array:
 						continue
 					var rec := StructureGen.make_record(fid, hi)
 					var root := int(rec["root"])
-					if _rev.has(root):
-						rec["rev"] = int(_rev[root])   # overlay the damage counter onto the pristine record
+					# FP_STRUCT_EDIT_DEBOUNCE: a fresh (crossing-refill) enumeration serves the PUBLISHED rev, not the
+					# truth rev — else a crossing mid-edit would materialize the damaged model before the player departs.
+					# Off ⇒ `_rev` verbatim (byte-identical).
+					var rsrc: Dictionary = _rev_pub if CubeSphere.FP_STRUCT_EDIT_DEBOUNCE else _rev
+					if rsrc.has(root):
+						rec["rev"] = int(rsrc[root])   # overlay the (published/truth) damage counter onto the pristine record
 					recs.append(rec)
 	_store(fid, recs)
 	return recs
 
 
-## §12.5 damage rev: a player edit at (fid, cell) bumps the rev of every cached GEN record on that fid whose bbox
-## contains the cell (O(records-on-fid) ≈ a handful). The rev-sum drift re-arms the far tier's delta gate → re-bake →
-## the far model shows the hole within ~1-2 s (exactly the player-build path).
-func note_edit(fid: int, cell: Vector3i) -> void:
+## §12.5 damage rev — the edit-frame producer half.
+## FP_STRUCT_EDIT_DEBOUNCE v2 (docs/COSMOS-FAR-EDIT-DEBOUNCE-REDESIGN.md §3.1): UNDER the flag this is STRICTLY O(1) —
+## it packs (fid,cell) into the edit-key bijection and appends to `_uncls`, then returns []; it NEVER classifies,
+## NEVER enumerates, warm OR cold (the v1 cache-cold `enumerate_facet` fallback that caused the 3.4 s freeze is DELETED).
+## Classification (the truth-rev bump + pending upsert) is deferred to WorldManager._sed_classify_step, off the input
+## frame. NEVER-DROP: capture is unconditional; at STRUCT_EDIT_UNCLS_MAX the facet is marked wholesale-dirty instead.
+## OFF ⇒ the shipped immediate bump (`_rev` + cached `rec["rev"]` + `_version += 1`) verbatim (miss ⇒ []; byte-identical);
+## the returned [] is ignored by the off-flag callers.
+func note_edit(fid: int, cell: Vector3i) -> Array:
+	if CubeSphere.FP_STRUCT_EDIT_DEBOUNCE:
+		# O(1): pack + append. NEVER classify, NEVER enumerate here (warm or cold) — the edit frame can never freeze.
+		if _uncls.size() >= CubeSphere.STRUCT_EDIT_UNCLS_MAX:
+			_uncls_overflow[fid] = true                # NEVER-OOM degrade: whole-facet superset marker (resolved off-frame)
+		else:
+			_uncls.append(FacetAtlas.edit_key(fid, cell))
+		return []                                      # pending upsert happens at classification (§3.2)
+	# OFF: the shipped immediate re-bake — miss ⇒ [] (a cache-cold edit is not recorded), hit ⇒ instant rev + version bump.
 	var recs: Variant = _cache.get(fid)
 	if recs == null:
-		return
+		return []
 	for r in (recs as Array):
 		var rec: Dictionary = r
 		if _bbox_has(rec["bmin"], rec["bmax"], cell):
 			var root := int(rec["root"])
 			var nrev := int(_rev.get(root, 0)) + 1
-			_rev[root] = nrev
+			_rev[root] = nrev                          # TRUTH: bumped instantly (lossless)
 			rec["rev"] = nrev
+			_version += 1                              # FP_STRUCT_REG_EPOCH: a damage rev bumped ⇒ records() changed
+	return []
+
+
+## FP_STRUCT_EDIT_DEBOUNCE v2 (§3.2): the DEFERRED classifier's TRUTH-rev bump for a damaged house `root`. Bumps ONLY
+## the persistence-class `_rev` (survives LRU eviction) — NO `_version`, NO cache write; the far tier keeps seeing the
+## PUBLISHED rev (via the _rev_pub overlay in enumerate_facet) until publish_roots. Called ONLY under the flag, from
+## WorldManager._classify_edit (the position-pure caller guarantees never-drop). Idempotent-safe (rev is a counter).
+func note_damage(root: int) -> void:
+	_rev[root] = int(_rev.get(root, 0)) + 1
+
+# --- FP_STRUCT_EDIT_DEBOUNCE v2 deferred-classification queue accessors (§3.1/§3.2) ---------------------------------
+func uncls_size() -> int: return _uncls.size()
+func uncls_queue_empty() -> bool: return _uncls.is_empty()
+func has_overflow() -> bool: return not _uncls_overflow.is_empty()
+
+## Pop one captured edit key. LIFO (resize-down, O(1) amortized) — order is IMMATERIAL: classification is position-pure
+## and the queue always drains to empty (the forward-progress floor guarantees it). Caller guards with uncls_queue_empty().
+func uncls_pop() -> int:
+	var n := _uncls.size()
+	var k := _uncls[n - 1]
+	_uncls.resize(n - 1)
+	return k
+
+## Take one overflow facet id (erasing it) for off-frame resolution, or -1 when none. Caller guards with has_overflow().
+func overflow_take() -> int:
+	var keys := _uncls_overflow.keys()
+	if keys.is_empty():
+		return -1
+	var fid := int(keys[0])
+	_uncls_overflow.erase(fid)
+	return fid
+
+## FP_STRUCT_EDIT_DEBOUNCE v2 (§5.4 NEVER-OOM degrade): resolve an overflow-marked facet OFF the input frame — enumerate
+## it (via the persistent ctx the caller threads), bump the TRUTH rev of EVERY record on it, and return
+## `[{root, fid, bmin, bmax}, …]` so WorldManager upserts each into the pending map. Over-invalidation (a bounded extra
+## re-bake per house on the facet), never a drop. Only called under the flag.
+func overflow_resolve(fid: int, pcache = null) -> Array:
+	var recs: Array = enumerate_facet(fid, pcache)
+	var out: Array = []
+	for r in recs:
+		var rec: Dictionary = r
+		var root := int(rec["root"])
+		_rev[root] = int(_rev.get(root, 0)) + 1
+		out.append({"root": root, "fid": int(rec["fid"]), "bmin": rec["bmin"], "bmax": rec["bmax"]})
+	return out
 
 static func _bbox_has(bmin: Vector3i, bmax: Vector3i, c: Vector3i) -> bool:
 	return c.x >= bmin.x and c.x <= bmax.x and c.y >= bmin.y and c.y <= bmax.y and c.z >= bmin.z and c.z <= bmax.z
+
+
+## FP_STRUCT_EDIT_DEBOUNCE (§3.2): publish the accumulated TRUTH revs of `roots` to the far-visible PUBLISHED revs —
+## copy _rev → _rev_pub, patch any cached record's `rev`, and bump `_version` ONCE for the whole batch (coalescing: all
+## structures whose gates open the same tick land in one version drift ⇒ one resnapshot ⇒ one rebuild). Deferred but
+## never dropped: after this, records() serve the damaged rev and the far tier re-bakes the hole. Only called under the
+## flag (from WorldManager._sed_publish). A root with no truth entry (never damaged) is a no-op.
+func publish_roots(roots: Array) -> void:
+	if roots.is_empty():
+		return
+	for root in roots:
+		var r := int(root)
+		if _rev.has(r):
+			_rev_pub[r] = int(_rev[r])
+	# patch any CACHED records so records() reflects the published rev without waiting for a re-enumeration.
+	for fid in _cache:
+		for rec in (_cache[fid] as Array):
+			var root2 := int((rec as Dictionary)["root"])
+			if _rev_pub.has(root2):
+				(rec as Dictionary)["rev"] = int(_rev_pub[root2])
+	_version += 1                                  # FP_STRUCT_REG_EPOCH: ONE drift for the whole published batch
 
 
 # --- wanted-facet band (§12.5) --------------------------------------------------------------------------------------
@@ -158,6 +266,7 @@ func _facet_centre(fid: int) -> Vector3:
 # --- LRU cache bookkeeping (never-OOM) ------------------------------------------------------------------------------
 func _store(fid: int, recs: Array) -> void:
 	_cache[fid] = recs
+	_version += 1                                  # FP_STRUCT_REG_EPOCH: cache (re)fill — conservative bump (settles once warm)
 	_touch(fid)
 	while _lru.size() > _FACET_CAP:
 		var victim: int = _lru.pop_back()
@@ -202,4 +311,6 @@ func total_bytes() -> int:
 	var recs := 0
 	for fid in _cache:
 		recs += (_cache[fid] as Array).size()
-	return recs * 256 + _rev.size() * 48
+	# FP_STRUCT_EDIT_DEBOUNCE: _rev_pub mirrors _rev (0 off-flag); the v2 un-classified queue is capped at
+	# STRUCT_EDIT_UNCLS_MAX int64 (8 B) + the tiny overflow-facet marker set (both 0 off-flag).
+	return recs * 256 + _rev.size() * 48 + _rev_pub.size() * 48 + _uncls.size() * 8 + _uncls_overflow.size() * 16

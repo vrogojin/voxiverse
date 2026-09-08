@@ -21,9 +21,10 @@ extends RefCounted
 
 ## Coarse pitch for a structure of the given max extent (blocks). Power-of-two so nested levels (P2 LOD-B = c×2) align.
 static func coarse_pitch(max_extent: int) -> int:
-	if max_extent <= CubeSphere.STRUCT_TARGET_RES:
+	var target_res := CubeSphere.struct_far_target_res()   # FP_STRUCT_COARSE_FAR: 8 under the flag, else 16 (byte-identical off)
+	if max_extent <= target_res:
 		return 1
-	var ratio := float(max_extent) / float(CubeSphere.STRUCT_TARGET_RES)
+	var ratio := float(max_extent) / float(target_res)
 	var e := int(ceil(log(ratio) / log(2.0)))
 	return maxi(1, 1 << e)
 

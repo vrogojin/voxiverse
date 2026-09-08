@@ -129,7 +129,9 @@ func height_at(fid: int, i: int, j: int) -> int:
 ## PERF FIX WS1d (live A/B follow-up): cache the snapshot PER FID once the facet is truly baked (`bake_facet`
 ## never re-bakes an already-baked facet — idempotent no-op — so a baked facet's heights can never change again,
 ## making this cache permanently valid; a call BEFORE baking is deliberately left uncached, so a LATER real bake
-## is still correctly picked up next call). Main-thread only (matches every other caller of this function).
+## is still correctly picked up next call). Main-thread only (matches every other caller of this function) — still true
+## for height_grid itself, but under FP_OR_WORKER_DECODE the caller hands over a raw `height_bytes()` slice instead and
+## the decode runs worker-side (`decode_height_bytes`), so this is no longer the ONLY safe hand-off.
 var _height_grid_cache: Dictionary = {}   # fid -> PackedInt32Array, lazily cached once baked
 func height_grid(fid: int) -> PackedInt32Array:
 	if _height_grid_cache.has(fid):
@@ -141,6 +143,32 @@ func height_grid(fid: int) -> PackedInt32Array:
 			out[j * NODES_PER_EDGE + i] = height_at(fid, i, j)
 	if is_baked(fid):
 		_height_grid_cache[fid] = out
+	return out
+
+## FP_OR_WORKER_DECODE (docs/COSMOS-ORBIT-RELIEF-HEIGHT-DECODE-DESIGN.md §1): the raw i16 byte snapshot of one facet's
+## height region — the CHEAP (one ~2178-byte memcpy) main-thread twin of `height_grid()`. The worker decodes it via
+## the pure static `decode_height_bytes()` instead of the caller running 1089 `decode_s16` reads before dispatch.
+## MUST be called on the MAIN THREAD (same contract as `height_grid`: `_heights` is live-written by `bake_facet` — also
+## main-thread-only — so a main-thread `slice()` is a strictly serialized, torn-free value copy; `slice()` allocates a
+## fresh buffer, so the worker's copy never aliases `_heights`). Empty ⇒ not ready / out of range — the decoder degrades
+## that to the SAME all-zero grid `height_grid()` returns (see `decode_height_bytes`).
+func height_bytes(fid: int) -> PackedByteArray:
+	if _heights.is_empty() or fid < 0 or fid >= _baked.size():
+		return PackedByteArray()
+	return _heights.slice(fid * NODES_PER_FACET * 2, (fid + 1) * NODES_PER_FACET * 2)
+
+## PURE + STATIC (worker-safe: reads only its argument, no instance state, seeds no cache). Decodes a `height_bytes()`
+## snapshot into the byte-identical grid `height_grid()` produces (row-major j*NODES_PER_EDGE+i, little-endian s16 — the
+## SAME codec `bake_facet` writes with). ANY wrong size (in particular the empty not-set-up/out-of-range degrade above)
+## ⇒ 1089 zeros — exactly `height_at()`'s empty/out-of-range guard default, so `build_tile` still builds the same flat
+## tile the status quo builds instead of refusing ({}). A naive empty-passthrough would make build_tile refuse — a real
+## behavioural divergence — so the wrong-size degrade is load-bearing (design §3.2).
+static func decode_height_bytes(raw: PackedByteArray) -> PackedInt32Array:
+	var out := PackedInt32Array()
+	out.resize(NODES_PER_FACET)          # zero-filled
+	if raw.size() == NODES_PER_FACET * 2:
+		for k in range(NODES_PER_FACET):
+			out[k] = raw.decode_s16(k * 2)
 	return out
 
 ## G1a shade [0,1] at the same node grid. 1.0 (no darkening) if not ready/baked/flag-off — a safe neutral default,

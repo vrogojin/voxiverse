@@ -1,0 +1,174 @@
+COSMOS GEN-CONVOY §6 — allocator-lock stall probe (core), compile-gated + runtime-gated, byte-off.
+
+Adds a per-thread allocation wall-time probe to core/os/memory.cpp (alloc_static/free_static/realloc_static)
+that splits the "~430 ms unmetered" worst frame (docs/COSMOS-GEN-CONVOY-DESIGN.md §1) into main-thread vs
+worker allocation stall time. Compile-gated by a new web scons option `alloc_probe` (default False =>
+byte-identical: the ZN_PROBE_* macros expand to raw libc malloc/free/realloc). Runtime-gated by
+zn_vox_alloc_probe_set_enabled (flipped from FP_GEN_ALLOC_PROBE via cosmos setup) so both A/B arms can carry
+the probe; totals are read by the godot_voxel module via the weak extern "C" zn_vox_alloc_probe_read.
+Applies on top of godot engine patches 0001 + 0002.
+diff --git a/core/os/memory.cpp b/core/os/memory.cpp
+--- a/core/os/memory.cpp
++++ b/core/os/memory.cpp
+@@ -35,6 +35,92 @@
+ #include <stdlib.h>
+ #include <string.h>
+ 
++// VOXIVERSE COSMOS GEN-CONVOY (docs/COSMOS-GEN-CONVOY-DESIGN.md §6) — allocator-lock stall probe.
++// Compile-gated by the web scons option `alloc_probe` (-DZN_VOX_ALLOC_PROBE); ABSENT by default, so the
++// three macros below expand to the raw libc calls => byte-identical to stock Godot. When present, every
++// malloc/free/realloc is wall-timed (only while zn_alloc_probe_enabled, flipped by FP_GEN_ALLOC_PROBE via
++// the weak zn_vox_alloc_probe_set_enabled) and its duration accumulated into main-thread vs worker buckets
++// (classified by Thread::is_main_thread(), a thread_local int compare). remote_bridge reads the totals via
++// the weak zn_vox_alloc_probe_read and differences them over its window, turning the "~430 ms unmetered"
++// spike into a measured main-thread lock-stall number — the ONE thing a GDScript timer cannot see.
++#ifdef ZN_VOX_ALLOC_PROBE
++#include "core/os/os.h"
++#include "core/os/thread.h"
++#include <atomic>
++namespace {
++struct ZnAllocProbe {
++	SafeNumeric<uint64_t> main_usec;
++	SafeNumeric<uint64_t> main_count;
++	SafeNumeric<uint64_t> work_usec;
++	SafeNumeric<uint64_t> work_count;
++};
++ZnAllocProbe zn_alloc_probe;
++std::atomic<bool> zn_alloc_probe_enabled{ false };
++// Disabled => one relaxed atomic load per alloc and nothing else. Enabled => two get_ticks_usec reads.
++// OS may be null during earliest static-init allocs; those are skipped. No allocation happens inside the
++// probe (SafeNumeric is lock-free; is_main_thread() is a thread_local compare) so it cannot recurse.
++_ALWAYS_INLINE_ uint64_t zn_probe_t0() {
++	if (!zn_alloc_probe_enabled.load(std::memory_order_relaxed)) {
++		return 0;
++	}
++	const OS *os = OS::get_singleton();
++	return os != nullptr ? os->get_ticks_usec() : 0;
++}
++_ALWAYS_INLINE_ void zn_probe_acc(uint64_t p_t0) {
++	if (p_t0 == 0) {
++		return;
++	}
++	const OS *os = OS::get_singleton();
++	if (os == nullptr) {
++		return;
++	}
++	const uint64_t dt = os->get_ticks_usec() - p_t0;
++	if (Thread::is_main_thread()) {
++		zn_alloc_probe.main_usec.add(dt);
++		zn_alloc_probe.main_count.increment();
++	} else {
++		zn_alloc_probe.work_usec.add(dt);
++		zn_alloc_probe.work_count.increment();
++	}
++}
++_ALWAYS_INLINE_ void *zn_probe_malloc(size_t p_size) {
++	const uint64_t t0 = zn_probe_t0();
++	void *p = malloc(p_size);
++	zn_probe_acc(t0);
++	return p;
++}
++_ALWAYS_INLINE_ void *zn_probe_realloc(void *p_mem, size_t p_size) {
++	const uint64_t t0 = zn_probe_t0();
++	void *p = realloc(p_mem, p_size);
++	zn_probe_acc(t0);
++	return p;
++}
++_ALWAYS_INLINE_ void zn_probe_free(void *p_mem) {
++	const uint64_t t0 = zn_probe_t0();
++	free(p_mem);
++	zn_probe_acc(t0);
++}
++} // namespace
++// Non-mangled so the godot_voxel module can weak-link these and no-op when the probe is not compiled in.
++extern "C" bool zn_vox_alloc_probe_read(double *r_main_ms, double *r_work_ms, uint64_t *r_main_n, uint64_t *r_work_n) {
++	*r_main_ms = double(zn_alloc_probe.main_usec.get()) / 1000.0;
++	*r_work_ms = double(zn_alloc_probe.work_usec.get()) / 1000.0;
++	*r_main_n = zn_alloc_probe.main_count.get();
++	*r_work_n = zn_alloc_probe.work_count.get();
++	return true;
++}
++extern "C" void zn_vox_alloc_probe_set_enabled(bool p_enabled) {
++	zn_alloc_probe_enabled.store(p_enabled, std::memory_order_relaxed);
++}
++#define ZN_PROBE_MALLOC(m_size) zn_probe_malloc(m_size)
++#define ZN_PROBE_REALLOC(m_mem, m_size) zn_probe_realloc((m_mem), (m_size))
++#define ZN_PROBE_FREE(m_mem) zn_probe_free(m_mem)
++#else
++#define ZN_PROBE_MALLOC(m_size) malloc(m_size)
++#define ZN_PROBE_REALLOC(m_mem, m_size) realloc((m_mem), (m_size))
++#define ZN_PROBE_FREE(m_mem) free(m_mem)
++#endif
++
+ void *operator new(size_t p_size, const char *p_description) {
+ 	return Memory::alloc_static(p_size, false);
+ }
+@@ -103,7 +189,7 @@
+ 	bool prepad = p_pad_align;
+ #endif
+ 
+-	void *mem = malloc(p_bytes + (prepad ? DATA_OFFSET : 0));
++	void *mem = ZN_PROBE_MALLOC(p_bytes + (prepad ? DATA_OFFSET : 0));
+ 
+ 	ERR_FAIL_NULL_V(mem, nullptr);
+ 
+@@ -152,12 +238,12 @@
+ #endif
+ 
+ 		if (p_bytes == 0) {
+-			free(mem);
++			ZN_PROBE_FREE(mem);
+ 			return nullptr;
+ 		} else {
+ 			*s = p_bytes;
+ 
+-			mem = (uint8_t *)realloc(mem, p_bytes + DATA_OFFSET);
++			mem = (uint8_t *)ZN_PROBE_REALLOC(mem, p_bytes + DATA_OFFSET);
+ 			ERR_FAIL_NULL_V(mem, nullptr);
+ 
+ 			s = (uint64_t *)(mem + SIZE_OFFSET);
+@@ -167,7 +253,7 @@
+ 			return mem + DATA_OFFSET;
+ 		}
+ 	} else {
+-		mem = (uint8_t *)realloc(mem, p_bytes);
++		mem = (uint8_t *)ZN_PROBE_REALLOC(mem, p_bytes);
+ 
+ 		ERR_FAIL_COND_V(mem == nullptr && p_bytes > 0, nullptr);
+ 
+@@ -196,9 +282,9 @@
+ 		mem_usage.sub(*s);
+ #endif
+ 
+-		free(mem);
++		ZN_PROBE_FREE(mem);
+ 	} else {
+-		free(mem);
++		ZN_PROBE_FREE(mem);
+ 	}
+ }
+ 
+diff --git a/platform/web/detect.py b/platform/web/detect.py
+--- a/platform/web/detect.py
++++ b/platform/web/detect.py
+@@ -43,6 +43,9 @@
+         ("default_pthread_stack_size", "WASM pthread default stack size (in KiB)", 2048),
+         ("pthread_pool_size", "WASM pthread pool size (preallocated Web Workers)", 8),
+         ("malloc", "WASM malloc implementation (dlmalloc|mimalloc|emmalloc)", "dlmalloc"),
++        # VOXIVERSE COSMOS GEN-CONVOY §6: compile the allocator-lock stall probe into core/os/memory.cpp.
++        # Default False == byte-identical to stock (the probe macros expand to the raw libc calls).
++        BoolVariable("alloc_probe", "VOXIVERSE: compile the allocator-lock stall probe (COSMOS GEN-CONVOY §6)", False),
+         BoolVariable("use_assertions", "Use Emscripten runtime assertions", False),
+         BoolVariable("use_ubsan", "Use Emscripten undefined behavior sanitizer (UBSAN)", False),
+         BoolVariable("use_asan", "Use Emscripten address sanitizer (ASAN)", False),
+@@ -237,6 +240,10 @@
+         # burning rAF). Default "dlmalloc" == stock Emscripten behaviour (flag omitted entirely).
+         if env["malloc"] != "dlmalloc":
+             env.Append(LINKFLAGS=["-sMALLOC=%s" % env["malloc"]])
++        # VOXIVERSE COSMOS GEN-CONVOY §6: define ZN_VOX_ALLOC_PROBE for the whole web compilation (incl.
++        # core/os/memory.cpp) so the allocator-lock stall probe is compiled in. Default off => byte-identical.
++        if env["alloc_probe"]:
++            env.Append(CPPDEFINES=["ZN_VOX_ALLOC_PROBE"])
+         env.Append(LINKFLAGS=["-sWASM_MEM_MAX=2048MB"])
+         if not env["dlink_enabled"]:
+             # Workaround https://github.com/emscripten-core/emscripten/issues/21844#issuecomment-2116936414.

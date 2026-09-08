@@ -112,7 +112,21 @@ static func _is_earth(pcache) -> bool:
 # =====================================================================================================================
 # has_village (§12.4) — body gate FIRST, then salt-201, then the site test (biome / flatness / above-sea). Pure.
 # =====================================================================================================================
+## FP_STRUCT_GATE_MEMO front door — memoize the (vx,vz) village-gate result in the GenCtx (the far-structure bake
+## calls this O(bbox-volume) times for a near-CONSTANT (vx,vz); the value is a pure function of the frozen epoch, so
+## the cache is byte-identical). Off / non-GenCtx pcache ⇒ straight through to _has_village_compute (byte-off).
 static func has_village(vx: int, vz: int, pcache = null) -> bool:
+	if CubeSphere.FP_STRUCT_GATE_MEMO and pcache is TerrainConfig.GenCtx:
+		var vk := Vector2i(vx, vz)
+		var c: Variant = pcache.svmemo.get(vk)
+		if c != null:
+			return c
+		var r := _has_village_compute(vx, vz, pcache)
+		pcache.svmemo[vk] = r
+		return r
+	return _has_village_compute(vx, vz, pcache)
+
+static func _has_village_compute(vx: int, vz: int, pcache = null) -> bool:
 	if not _is_earth(pcache):
 		return false                                   # body gate FIRST (the Moon biome-id alias trap)
 	if _hash01(vx, vz, _SALT_VILLAGE) >= VILLAGE_CHANCE:
@@ -154,7 +168,22 @@ static func _site_biome_ok(b: int) -> bool:
 # live → salt-202 → footprint-corner flatness ≤ STRUCT_FLAT_TOL AND no corner on a firing slope → params from salts
 # 203-209. Everything is a pure position hash, so near / far / physics reproduce the SAME house by construction.
 # =====================================================================================================================
+## FP_STRUCT_GATE_MEMO front door — memoize the (hx,hz) house descriptor in the GenCtx (same rationale as
+## has_village; {} = no-house is cached too). The returned Dictionary is READ-ONLY by every caller (claim_at /
+## _template_block / top_decoration only read it), so sharing the cached reference is safe. Byte-off when the flag
+## is off or pcache is not a GenCtx.
 static func house_info(hx: int, hz: int, pcache = null) -> Dictionary:
+	if CubeSphere.FP_STRUCT_GATE_MEMO and pcache is TerrainConfig.GenCtx:
+		var hk := Vector2i(hx, hz)
+		var c: Variant = pcache.shmemo.get(hk)
+		if c != null:
+			return c
+		var r := _house_info_compute(hx, hz, pcache)
+		pcache.shmemo[hk] = r
+		return r
+	return _house_info_compute(hx, hz, pcache)
+
+static func _house_info_compute(hx: int, hz: int, pcache = null) -> Dictionary:
 	var vx := floori(float(hx) / float(STRUCT_HPV))
 	var vz := floori(float(hz) / float(STRUCT_HPV))
 	if not has_village(vx, vz, pcache):
@@ -370,16 +399,26 @@ static func _roof_block(hi: Dictionary, lx: int, lz: int, ly: int, w: int, d: in
 ## The §3-shape GEN record for house `hi` on facet `fid` (fid-lattice bbox). `root` is a NEGATIVE packed site id,
 ## structurally disjoint from tracker roots (edit keys ≥ 0), so the far tier's _baked/_cull keying + _root_hash
 ## (negative-safe mask) need ZERO changes. `rev` is 0 (pristine) — StructGenIndex overlays the damage counter.
-static func make_record(fid: int, hi: Dictionary) -> Dictionary:
-	if not _mat_ready:
-		warm_up()
+## FP_STRUCT_EDIT_DEBOUNCE v2 (docs/COSMOS-FAR-EDIT-DEBOUNCE-REDESIGN.md §3.2) — the house solid-span bbox
+## [bmin, bmax] for descriptor `hi`, EXTRACTED from make_record so the debounce classifier and the GEN record share
+## ONE bbox law (they can never diverge; gate G-SED-CLASSIFY asserts equality). CARVE-TO-MIN: the span is
+## [base_y+1 (floor) .. base_y+1+rtop (roof)] — NO foundation below. Pure / flag-free; make_record calls this.
+static func record_bbox(hi: Dictionary) -> Array:
 	var base: Vector3i = hi["base"]
 	var w: int = hi["w"]
 	var d: int = hi["d"]
 	var rtop := _roof_top_ly(hi)
-	# CARVE-TO-MIN: the house solid span is [base_y+1 (floor) .. base_y+1+rtop (roof)] — NO foundation below.
 	var bmin := Vector3i(base.x, base.y + 1, base.z)
 	var bmax := Vector3i(base.x + w - 1, base.y + 1 + rtop, base.z + d - 1)
+	return [bmin, bmax]
+
+static func make_record(fid: int, hi: Dictionary) -> Dictionary:
+	if not _mat_ready:
+		warm_up()
+	# CARVE-TO-MIN: the house solid span is [base_y+1 (floor) .. base_y+1+rtop (roof)] — via the single-source law.
+	var bb := record_bbox(hi)
+	var bmin: Vector3i = bb[0]
+	var bmax: Vector3i = bb[1]
 	var ex := maxi(maxi(bmax.x - bmin.x + 1, bmax.y - bmin.y + 1), bmax.z - bmin.z + 1)
 	return {
 		"source": SOURCE_GEN,
@@ -401,3 +440,17 @@ static func pack_root(fid: int, hx: int, hz: int) -> int:
 	var b := (hz << 1) ^ (hz >> 63)
 	var p := ((fid & 0xFFF) << 40) | ((a & 0xFFFFF) << 20) | (b & 0xFFFFF)
 	return -(1 + p)
+
+## The exact inverse of pack_root (docs/COSMOS-STRUCT-IMPOSTOR-DESIGN.md §6): recover [fid, hx, hz] from a NEGATIVE
+## GEN root so the far-card tier can re-derive a house's descriptor (StructureGen.house_info) from the registry record
+## alone. p = −root − 1; fid = (p >> 40) & 0xFFF; the 20-bit zigzag fields decode via (a >> 1) ^ −(a & 1). Pure /
+## flag-free; round-trips pack_root over any (fid, hx, hz) whose zigzag(hx)/zigzag(hz) fit the 20-bit fields (the
+## house-lattice indices reachable from the ≤ K-facet worldgen domain). Gate: G-ST-CARD-ARCH (round-trip sweep).
+static func unpack_root(root: int) -> Array:
+	var p := -root - 1
+	var fid := (p >> 40) & 0xFFF
+	var a := (p >> 20) & 0xFFFFF
+	var b := p & 0xFFFFF
+	var hx := (a >> 1) ^ -(a & 1)                       # zigzag⁻¹
+	var hz := (b >> 1) ^ -(b & 1)
+	return [fid, hx, hz]

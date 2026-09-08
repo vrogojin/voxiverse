@@ -1,0 +1,308 @@
+COSMOS GEN-CONVOY §6 lock-wait extension (docs/COSMOS-GEN-CONVOY-DESIGN.md) — main-thread engine-lock
+acquire-WAIT probe, compile-gated + runtime-gated, byte-off.
+
+The Build-#1 alloc probe FALSIFIED alloc-stall as dominant (~14%); the remaining ~86% of the walk spike is
+main-thread stall on a NON-malloc engine lock while workers flood generation (wf_vox_gen 51x, pool 6). This
+times the MAIN-THREAD acquire wait on the two lock families the streaming/query path holds — RWLock
+(VoxelData::Lod::map_lock) and Mutex (ThreadedTaskRunner completed/staged) — surfacing wf_lock_rwlock_ms /
+wf_lock_mutex_ms.
+
+Reuses the ZN_VOX_ALLOC_PROBE compile gate (godot/0003 `alloc_probe`; no new build knob). Runtime flag
+FP_GEN_LOCK_PROBE (cosmos setup gen_lock_probe). ABSENT gate => rw_lock.h/mutex.h byte-identical, lock_probe
+empty. IMPORTANT: util/thread/ is NOT globbed by common.py (each .cpp is listed explicitly), so the new
+util/thread/lock_probe.cpp is registered in common.py:get_sources() (mirrors patch 0007's mechanism) — WITHOUT
+this the wrappers link-fail with undefined zn_lock_probe_begin/end. Applies on top of godot_voxel 0015 + 0016.
+diff --git a/util/thread/lock_probe.h b/util/thread/lock_probe.h
+new file mode 100644
+--- /dev/null
++++ b/util/thread/lock_probe.h
+@@ -0,0 +1,55 @@
++#ifndef ZN_LOCK_PROBE_H
++#define ZN_LOCK_PROBE_H
++
++// VOXIVERSE COSMOS GEN-CONVOY (docs/COSMOS-GEN-CONVOY-DESIGN.md §6 lock-wait extension) — main-thread
++// lock-acquire WAIT probe. Extends the godot/0003 alloc-probe technique to the engine locks the streaming/
++// query path acquires while the voxel workers are busy: the Build-#1 probe FALSIFIED alloc-stall as the
++// dominant cause (~14 %), so the remaining ~86 % of the walk spike is main-thread stall on something that is
++// NOT malloc / NOT apply / NOT render. Prime suspects (census): the VoxelData per-LOD RWLock (`map_lock`,
++// storage/voxel_data.h:364) held write by the main streaming/apply path while it inserts generated blocks
++// and read by the query/collision path, and the ThreadedTaskRunner mutexes drained on main while 6 workers
++// push completed generation tasks. On WASM the browser main thread cannot Atomics.wait, so a contended
++// acquire BUSY-SPINS on main — invisible to every existing bucket.
++//
++// This times the main-thread acquire WAIT per lock CLASS (RWLock vs Mutex) and accumulates it, surfaced via
++// VoxelEngine.get_stats() -> remote_bridge as wf_lock_rwlock_ms / wf_lock_mutex_ms (cumulative; the analysis
++// differences successive worst-frame snapshots). Compile-gated by ZN_VOX_ALLOC_PROBE (the same web scons
++// `alloc_probe` option godot/0003 adds — reused, no new build knob); ABSENT by default => this header is
++// empty and rw_lock.h/mutex.h are byte-identical. Runtime-gated by zn_set_lock_probe_enabled (flipped from
++// FP_GEN_LOCK_PROBE via cosmos setup) so it toggles independently of the alloc probe.
++//
++// The functions are OUT-OF-LINE (lock_probe.cpp) on purpose: rw_lock.h / mutex.h are hot low-level headers
++// included very early and widely, so they must NOT pull in core/os/thread.h or the OS ticks source (cycle
++// risk). They only see these declarations.
++
++#ifdef ZN_VOX_ALLOC_PROBE
++
++#include <cstdint>
++
++namespace zylann {
++
++enum ZnLockClass {
++	ZN_LOCK_RWLOCK = 0, // dominated by VoxelData::Lod::map_lock (the only hot main-acquired RWLock)
++	ZN_LOCK_MUTEX = 1, // dominated by the ThreadedTaskRunner completed/staged mutexes during a gen flood
++	ZN_LOCK_CLASS_COUNT = 2
++};
++
++// Returns a start tick if the probe is active (enabled AND caller is the main thread), else 0. When it
++// returns 0 the matching zn_lock_probe_end() is a no-op, so a worker-thread or disabled acquire pays only
++// one atomic load + a thread_local compare.
++uint64_t zn_lock_probe_begin();
++// Accumulates (now - t0) into the class bucket. No-op when t0 == 0.
++void zn_lock_probe_end(int lock_class, uint64_t t0);
++
++// Runtime master switch (default false). Flipped from FP_GEN_LOCK_PROBE via cosmos setup, main thread.
++void zn_set_lock_probe_enabled(bool enabled);
++// Cumulative main-thread acquire-wait for a class, in milliseconds (usec/1000). For the stats surface.
++double zn_lock_probe_wait_ms(int lock_class);
++// Cumulative main-thread acquire count for a class (sanity / rate).
++uint64_t zn_lock_probe_count(int lock_class);
++
++} // namespace zylann
++
++#endif // ZN_VOX_ALLOC_PROBE
++
++#endif // ZN_LOCK_PROBE_H
+diff --git a/util/thread/lock_probe.cpp b/util/thread/lock_probe.cpp
+new file mode 100644
+--- /dev/null
++++ b/util/thread/lock_probe.cpp
+@@ -0,0 +1,75 @@
++#include "lock_probe.h"
++
++// VOXIVERSE COSMOS GEN-CONVOY §6 lock-wait extension. Implementation lives here (out-of-line) so the hot
++// headers rw_lock.h / mutex.h stay free of core/os includes. Entirely compiled out when the probe scons
++// option is off (ZN_VOX_ALLOC_PROBE undefined) => byte-identical stock.
++#ifdef ZN_VOX_ALLOC_PROBE
++
++#include <core/os/os.h> // OS::get_singleton()->get_ticks_usec()
++#include <core/os/thread.h> // ::Thread::is_main_thread()
++
++#include <atomic>
++
++namespace zylann {
++
++namespace {
++std::atomic<bool> g_lock_probe_enabled{ false };
++std::atomic<uint64_t> g_lock_wait_usec[ZN_LOCK_CLASS_COUNT];
++std::atomic<uint64_t> g_lock_count[ZN_LOCK_CLASS_COUNT];
++} // namespace
++
++uint64_t zn_lock_probe_begin() {
++	if (!g_lock_probe_enabled.load(std::memory_order_relaxed)) {
++		return 0;
++	}
++	// Only main-thread acquire WAIT matters: on WASM the browser main thread busy-spins on a contended lock
++	// (no Atomics.wait), which is the stall we are hunting. Worker waits are off the felt-frame path.
++	if (!::Thread::is_main_thread()) {
++		return 0;
++	}
++	const OS *os = OS::get_singleton();
++	if (os == nullptr) {
++		return 0;
++	}
++	const uint64_t t = os->get_ticks_usec();
++	return t != 0 ? t : 1; // 0 is the "inactive" sentinel; clamp a genuine 0 tick to 1
++}
++
++void zn_lock_probe_end(int lock_class, uint64_t t0) {
++	if (t0 == 0) {
++		return;
++	}
++	if (lock_class < 0 || lock_class >= ZN_LOCK_CLASS_COUNT) {
++		return;
++	}
++	const OS *os = OS::get_singleton();
++	if (os == nullptr) {
++		return;
++	}
++	const uint64_t now = os->get_ticks_usec();
++	const uint64_t dt = now > t0 ? now - t0 : 0;
++	g_lock_wait_usec[lock_class].fetch_add(dt, std::memory_order_relaxed);
++	g_lock_count[lock_class].fetch_add(1, std::memory_order_relaxed);
++}
++
++void zn_set_lock_probe_enabled(bool enabled) {
++	g_lock_probe_enabled.store(enabled, std::memory_order_relaxed);
++}
++
++double zn_lock_probe_wait_ms(int lock_class) {
++	if (lock_class < 0 || lock_class >= ZN_LOCK_CLASS_COUNT) {
++		return 0.0;
++	}
++	return double(g_lock_wait_usec[lock_class].load(std::memory_order_relaxed)) / 1000.0;
++}
++
++uint64_t zn_lock_probe_count(int lock_class) {
++	if (lock_class < 0 || lock_class >= ZN_LOCK_CLASS_COUNT) {
++		return 0;
++	}
++	return g_lock_count[lock_class].load(std::memory_order_relaxed);
++}
++
++} // namespace zylann
++
++#endif // ZN_VOX_ALLOC_PROBE
+diff --git a/util/thread/rw_lock.h b/util/thread/rw_lock.h
+--- a/util/thread/rw_lock.h
++++ b/util/thread/rw_lock.h
+@@ -8,6 +8,11 @@
+ #include "../profiling.h"
+ #endif
+ 
++// VOXIVERSE COSMOS GEN-CONVOY §6 lock-wait probe (times main-thread acquire wait; compiled out by default).
++#ifdef ZN_VOX_ALLOC_PROBE
++#include "lock_probe.h"
++#endif
++
+ namespace zylann {
+ 
+ class RWLock {
+@@ -18,7 +23,13 @@
+ #ifdef ZN_PROFILE_RWLOCK
+ 		ZN_PROFILE_SCOPE();
+ #endif
++#ifdef ZN_VOX_ALLOC_PROBE
++		const uint64_t _zt = zn_lock_probe_begin();
++		_mutex.lock_shared();
++		zn_lock_probe_end(ZN_LOCK_RWLOCK, _zt);
++#else
+ 		_mutex.lock_shared();
++#endif
+ 	}
+ 
+ 	// Unlock the rwlock, let other threads continue
+@@ -36,7 +47,13 @@
+ #ifdef ZN_PROFILE_RWLOCK
+ 		ZN_PROFILE_SCOPE();
+ #endif
++#ifdef ZN_VOX_ALLOC_PROBE
++		const uint64_t _zt = zn_lock_probe_begin();
++		_mutex.lock();
++		zn_lock_probe_end(ZN_LOCK_RWLOCK, _zt);
++#else
+ 		_mutex.lock();
++#endif
+ 	}
+ 
+ 	// Unlock the rwlock, let other thwrites continue
+diff --git a/util/thread/mutex.h b/util/thread/mutex.h
+--- a/util/thread/mutex.h
++++ b/util/thread/mutex.h
+@@ -4,6 +4,11 @@
+ // #include "../profiling.h"
+ #include <mutex>
+ 
++// VOXIVERSE COSMOS GEN-CONVOY §6 lock-wait probe (times main-thread acquire wait; compiled out by default).
++#ifdef ZN_VOX_ALLOC_PROBE
++#include "lock_probe.h"
++#endif
++
+ namespace zylann {
+ 
+ template <class StdMutexT>
+@@ -13,7 +18,13 @@
+ public:
+ 	inline void lock() const {
+ 		// ZN_PROFILE_SCOPE();
++#ifdef ZN_VOX_ALLOC_PROBE
++		const uint64_t _zt = zn_lock_probe_begin();
++		mutex.lock();
++		zn_lock_probe_end(ZN_LOCK_MUTEX, _zt);
++#else
+ 		mutex.lock();
++#endif
+ 	}
+ 
+ 	inline void unlock() const {
+diff --git a/common.py b/common.py
+--- a/common.py
++++ b/common.py
+@@ -74,6 +74,7 @@
+         "util/noise/spot_noise_gd.cpp",
+         "util/string/*.cpp",
+         "util/thread/thread.cpp",
++        "util/thread/lock_probe.cpp", # COSMOS GEN-CONVOY §6 lock-wait probe (util/thread not globbed; list explicitly)
+         "util/thread/spatial_lock_2d.cpp",
+         "util/thread/spatial_lock_3d.cpp",
+         "util/tasks/*.cpp",
+diff --git a/generators/cosmos/voxel_generator_cosmos.cpp b/generators/cosmos/voxel_generator_cosmos.cpp
+--- a/generators/cosmos/voxel_generator_cosmos.cpp
++++ b/generators/cosmos/voxel_generator_cosmos.cpp
+@@ -10,6 +10,8 @@
+ // and links whether or not the core patch is present; skipped (nullptr) in a byte-off build.
+ extern "C" __attribute__((weak)) void zn_vox_alloc_probe_set_enabled(bool p_enabled);
+ 
++#include "../../util/thread/lock_probe.h" // COSMOS GEN-CONVOY §6 lock-wait: zn_set_lock_probe_enabled
++
+ #include <core/variant/dictionary.h>
+ #include <core/math/vector2.h>
+ 
+@@ -111,6 +113,7 @@
+ 	p.gen_profs_tls = bool(config.get("gen_profs_tls", false));
+ 	p.gen_pool_prewarm = int(config.get("gen_pool_prewarm", 0));
+ 	p.gen_alloc_probe = bool(config.get("gen_alloc_probe", false));
++	p.gen_lock_probe = bool(config.get("gen_lock_probe", false));
+ 
+ 	p.cube_arid = get_i32_param(config, "cube_arid");
+ 	p.gen_arid = get_i32_param(config, "gen_arid");
+@@ -304,6 +307,10 @@
+ 	if (zn_vox_alloc_probe_set_enabled != nullptr) {
+ 		zn_vox_alloc_probe_set_enabled(p.gen_alloc_probe);
+ 	}
++	// §6 lock-wait: enable the main-thread engine-lock acquire-wait probe (module; compiled out => no symbol).
++#ifdef ZN_VOX_ALLOC_PROBE
++	zn_set_lock_probe_enabled(p.gen_lock_probe);
++#endif
+ 
+ 	return true;
+ }
+diff --git a/generators/cosmos/voxel_generator_cosmos.h b/generators/cosmos/voxel_generator_cosmos.h
+--- a/generators/cosmos/voxel_generator_cosmos.h
++++ b/generators/cosmos/voxel_generator_cosmos.h
+@@ -465,6 +465,7 @@
+ 		bool gen_profs_tls = false;   // lever 1: thread_local reuse of the profs scratch vector (census b1)
+ 		int gen_pool_prewarm = 0;     // lever 3: VoxelMemoryPool 8 KiB TYPE-class pre-warm block count (0=off)
+ 		bool gen_alloc_probe = false; // §6: enable the core allocator-lock stall probe accumulation
++		bool gen_lock_probe = false;  // §6 lock-wait: enable the main-thread engine-lock acquire-wait probe
+ 
+ 		// World-shape flags, snapshotted from CubeSphere at setup. Consts in GDScript; frozen ints
+ 		// here, because a `const` there is a runtime value to us.
+diff --git a/engine/voxel_engine_gd.cpp b/engine/voxel_engine_gd.cpp
+--- a/engine/voxel_engine_gd.cpp
++++ b/engine/voxel_engine_gd.cpp
+@@ -9,6 +9,9 @@
+ #include "../util/profiling.h"
+ #include "../util/tasks/godot/threaded_task_gd.h"
+ #include "voxel_engine.h"
++#ifdef ZN_VOX_ALLOC_PROBE
++#include "../util/thread/lock_probe.h" // COSMOS GEN-CONVOY §6 lock-wait: zn_lock_probe_wait_ms
++#endif
+ 
+ #ifdef VOXEL_TESTS
+ #include "../tests/tests.h"
+@@ -195,6 +198,15 @@
+ 		probe["compiled"] = false;
+ 	}
+ 	probe["dequeue_ms"] = double(zylann::voxel::get_dequeue_probe_usec()) / 1000.0;
++	// COSMOS GEN-CONVOY §6 lock-wait: main-thread engine-lock acquire-wait (cumulative ms + counts). Dominant
++	// RWLock main-acquire = VoxelData::Lod::map_lock; dominant Mutex during a gen flood = the task-runner
++	// completed/staged mutexes. remote_bridge emits wf_lock_rwlock_ms / wf_lock_mutex_ms.
++#ifdef ZN_VOX_ALLOC_PROBE
++	probe["lock_rwlock_ms"] = zylann::zn_lock_probe_wait_ms(zylann::ZN_LOCK_RWLOCK);
++	probe["lock_mutex_ms"] = zylann::zn_lock_probe_wait_ms(zylann::ZN_LOCK_MUTEX);
++	probe["lock_rwlock_n"] = int64_t(zylann::zn_lock_probe_count(zylann::ZN_LOCK_RWLOCK));
++	probe["lock_mutex_n"] = int64_t(zylann::zn_lock_probe_count(zylann::ZN_LOCK_MUTEX));
++#endif
+ 	d["alloc_probe"] = probe;
+ 	return d;
+ }

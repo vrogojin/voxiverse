@@ -278,13 +278,11 @@ const FP_FARRING_ASYNC_REBUILD := false
 ## back-hemisphere cull (BACK_CULL) is UNCHANGED. Default OFF → `_front_visible` excludes active+`_excluded` exactly as
 ## today, no backstop cache is ever populated, FLAT stays byte-identical (6035/0). Flipped ON at export after the live A/B.
 const FP_FARRING_FULL_COVER := false
-## Backstop tuning (§3). BACKSTOP_SINK: blocks the backstop facets are pushed radially inward, so they sit strictly
-## behind the near blocky surface (clears facet chord sagitta + relief quantization + the residual flank dip). BACKSTOP_CELLS:
-## the backstop-facet heightmap resolution (vs the shipped CELLS=4 for non-backstop facets) — denser cells shrink the
-## between-sample chord error so a coarse triangle cannot stab up through fine mountain terrain. G-FRC-NOPOKE is the tuning
-## oracle: if a mountain-foothill spawn pokes, raise BACKSTOP_CELLS to 32 (cell ≈ 6 blocks) before raising the sink, so the
-## boundary step at the near edge stays small (< 0.05° at ≥128 blocks). Consulted ONLY under FP_FARRING_FULL_COVER.
-const BACKSTOP_SINK := 6.0
+## Backstop tuning (§3). The backstop facets are pushed radially inward so they sit strictly behind the near blocky
+## surface (clears facet chord sagitta + relief quantization + the residual flank dip). BACKSTOP_CELLS: the backstop-facet
+## heightmap resolution (vs the shipped CELLS=4 for non-backstop facets) — denser cells shrink the between-sample chord
+## error so a coarse triangle cannot stab up through fine mountain terrain. G-FRC-NOPOKE is the tuning oracle: if a
+## mountain-foothill spawn pokes, raise BACKSTOP_CELLS to 32 before raising the sink. Consulted ONLY under FP_FARRING_FULL_COVER.
 const BACKSTOP_CELLS := 16
 ## Rescale-safe backstop sink: TierPlace.backstop_sink() derives the radial sink as BACKSTOP_SINK_FRAC × the facet
 ## cell size (cell = facet_edge/BACKSTOP_CELLS, facet_edge = (π/2·R)/K), so it scales with R and clears the coarse-grid

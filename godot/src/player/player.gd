@@ -821,14 +821,15 @@ func _orbit_coast_move(delta: float) -> void:
 	var out := _coast_step_kepler(delta, _coast_p_bci, _coast_v_bci, _dominant_body())
 	_coast_p_bci = out[0]
 	_coast_v_bci = out[1]
-	# SN-ODECAY station-keeping (DEV assist): when the orbit nears the atmosphere, periodically add a small prograde
-	# Δv so it re-lifts instead of decaying in. Self-limiting (caps at circular speed) ⇒ never boosts to escape.
+	# SN-ODECAY station-keeping (DEV assist): when the orbit nears the atmosphere (altitude/periapsis in the guard
+	# band), periodically add a small prograde Δv so it re-lifts instead of decaying in. Self-limiting (stops once
+	# the orbit reaches the safe-altitude energy ⇒ semi-major axis bounded) ⇒ never boosts to escape.
 	_coast_boost_cd -= delta
 	if _coast_boost_cd <= 0.0:
 		var dv := _DevFlightCls.station_keep_dv(_dominant_body(), _coast_p_bci, _coast_v_bci)
 		if _DVCls.length(dv) > 0.0:
 			_coast_v_bci = _DVCls.add(_coast_v_bci, dv)
-			_coast_boost_cd = _DevFlightCls.STATION_KEEP_COOLDOWN
+			_coast_boost_cd = CubeSphere.STATION_KEEP_COOLDOWN
 	_dev_v_bci = PackedFloat64Array([_coast_v_bci[0], _coast_v_bci[1], _coast_v_bci[2]])
 	_dev_have_v = true                                       # SN-R1: the dev-flight seed mirrors the coast velocity
 	_horiz_vel = Vector3.ZERO

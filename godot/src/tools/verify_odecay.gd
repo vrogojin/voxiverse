@@ -449,7 +449,7 @@ func _station_keep_gate(dt: float) -> void:
 			var dv := DEVF.station_keep_dv(body, os1.pos, os1.vel)
 			if DV.length(dv) > 0.0:
 				os1.vel = DV.add(os1.vel, dv)
-				cd = DEVF.STATION_KEEP_COOLDOWN
+				cd = CubeSphere.STATION_KEEP_COOLDOWN
 		var rr := DV.length(os1.pos)
 		peri_min = minf(peri_min, rr)
 		apo_max = maxf(apo_max, rr)

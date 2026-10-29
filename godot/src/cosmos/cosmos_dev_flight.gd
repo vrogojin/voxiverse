@@ -49,41 +49,43 @@ const DEV_ACCEL := 40.0
 
 # ---------------------------------------------------------------------------------------
 # ORBIT_COAST station-keeping (SN-ODECAY) — a DEV assist that keeps the O free-coast from spiralling into the
-# atmosphere. When the orbit's ENERGY is below that of a circular orbit at the SAFE altitude (R_vox + ATMO_TOP +
-# STATION_KEEP_MARGIN) it periodically adds a small PROGRADE Δv (along v̂), firing only on the sub-circular arc
-# (|v| < v_circ, the apoapsis side — where a prograde burn raises PERIAPSIS). Because it adds ENERGY toward the
-# safe-orbit target (not merely re-circularising at the current, sinking radius), it genuinely LIFTS a decaying
-# orbit; because it STOPS the instant the energy reaches the safe target (semi-major axis == safe), it is
-# self-limiting and can never pump the orbit to escape. Physically APPROXIMATE (a dev verb) but robust + safe.
-# Gated by G-ODECAY (verify_odecay.gd). All DATA (feel is live-only; retune + re-gate cheaply).
+# atmosphere. TRIGGER (§7.4, per-body via _dominant_body()): the atmosphere in nearest proximity — the current
+# altitude h = |p|−R_body drops below ATMO_TOP + CubeSphere.STATION_KEEP_MARGIN, OR the predicted periapsis drops
+# into that same band (so an eccentric orbit is caught at apoapsis, before the dip). ACTION: a small PROGRADE Δv
+# along v̂ ("a bit of speed towards the orbiting direction"), applied only on the sub-circular arc (|v| < v_circ,
+# the apoapsis side — where a prograde burn raises PERIAPSIS, keeping the orbit near-circular) and only while the
+# orbit is below the safe energy, so it LIFTS the orbit back out of the band and STOPS once safe (self-limiting:
+# semi-major axis bounded at the safe radius ⇒ repeated nudges can never pump it to escape). A healthy high orbit
+# is never touched. Physically APPROXIMATE (a dev verb) but robust + safe. Gated by G-ODECAY (verify_odecay.gd).
+# Tunables live in cube_sphere.gd (STATION_KEEP_*).
 # ---------------------------------------------------------------------------------------
-const STATION_KEEP_MARGIN := 384.0     # blocks above ATMO_TOP the guard lifts the orbit to (safe periapsis headroom)
-const STATION_KEEP_DV := 4.0           # blocks/s per correction — a gentle nudge (a few % of v_circ)
-const STATION_KEEP_COOLDOWN := 0.35    # s between corrections — periodic, not every tick
 
 ## The station-keeping prograde Δv (BCI vector) to add THIS correction, or the zero vector when none is needed.
-## `body`/`p_bci`/`v_bci` are the current coast BCI state. Fires when the orbit's specific energy is below the
-## circular energy at the safe radius (R_vox + ATMO_TOP + MARGIN) AND the craft is sub-circular at its current
-## radius (|v| < v_circ = √(GM_dyn/r), the apoapsis side — where a prograde burn raises periapsis). Returns v̂ ·
-## min(STATION_KEEP_DV, energy-deficit/|v|) — prograde, sized to top the orbit's energy up to the safe target and
-## no further (self-limiting: once ε ≥ ε_safe, a == safe, so repeated nudges can never pump it past the safe orbit
-## to escape). The caller applies it on a cooldown so it reads as gentle, periodic station-keeping.
+## `body`/`p_bci`/`v_bci` are the current coast BCI state (R_body = GRAV.r_vox(body), per-body — not hardcoded).
+## Returns v̂ · min(STATION_KEEP_DV, energy-deficit/|v|) — prograde, sized to top the orbit's energy up to the safe
+## target and no further. The caller applies it on a cooldown so it reads as gentle, periodic station-keeping.
 static func station_keep_dv(body: String, p_bci: PackedFloat64Array, v_bci: PackedFloat64Array) -> PackedFloat64Array:
 	var r := DV.length(p_bci)
 	var speed := DV.length(v_bci)
 	if r <= 0.0 or speed <= 0.0:
 		return DV.v(0.0, 0.0, 0.0)
+	var rv := GRAV.r_vox(body)
 	var mu := GRAV.gm_dyn(body)
-	var safe := GRAV.r_vox(body) + CubeSphere.ATMO_TOP + STATION_KEEP_MARGIN
+	var band := CubeSphere.ATMO_TOP + CubeSphere.STATION_KEEP_MARGIN
+	# TRIGGER — the atmosphere in nearest proximity: current altitude OR the osculating periapsis inside the band.
+	var h := r - rv
+	var r_peri := ORB.periapsis_radius(mu, p_bci, v_bci)
+	if h >= band and r_peri >= rv + band:
+		return DV.v(0.0, 0.0, 0.0)
 	var eps := ORB.specific_energy(mu, p_bci, v_bci)
-	var eps_safe := -mu / (2.0 * safe)                      # specific energy of a circular orbit at the safe radius
-	if eps >= eps_safe:                                     # energetic enough (semi-major axis >= safe) — stop
+	var eps_safe := -mu / (2.0 * (rv + band))              # specific energy of a circular orbit at the safe radius
+	if eps >= eps_safe:                                     # energetic enough (semi-major axis >= safe) — stop (no escape)
 		return DV.v(0.0, 0.0, 0.0)
 	var v_circ := sqrt(mu / r)
 	if speed >= v_circ:                                     # only the sub-circular (apoapsis) arc — prograde there lifts periapsis
 		return DV.v(0.0, 0.0, 0.0)
 	# Δv to raise ε to ε_safe, first order (dε ≈ v·dv): (ε_safe − ε)/|v|, capped at the gentle per-correction limit.
-	var dv := minf(STATION_KEEP_DV, (eps_safe - eps) / speed)
+	var dv := minf(CubeSphere.STATION_KEEP_DV, (eps_safe - eps) / speed)
 	return DV.scale(v_bci, dv / speed)                      # prograde: along v̂, magnitude dv
 
 # ---------------------------------------------------------------------------------------

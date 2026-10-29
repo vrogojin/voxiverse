@@ -528,6 +528,12 @@ const FP_M3_ORBIT := false        # master flag; OFF ⇒ byte-identical (nothing
 const H_BLEND_LO := 128.0         # radial altitude (blocks): below = pure lattice feel gravity (shipped)
 const H_BLEND_HI := 512.0         # above = pure GM_dyn/r² inertial regime (> ATMO_TOP, > OFFSURFACE_Y)
 const ATMO_TOP := 384.0           # atmosphere ceiling (D10; near-field scale, user-locked)
+# COSMOS SPACE-NAV §7.4 (ORBIT_COAST) — SN-ODECAY station-keeping DEV assist tunables. When the O free-coast dips
+# into the guard band (altitude h = |p|−R_body below ATMO_TOP + STATION_KEEP_MARGIN, OR the predicted periapsis
+# there) it periodically adds a small PROGRADE Δv to lift the orbit back out of the band. DEAD off ORBIT_COAST.
+const STATION_KEEP_MARGIN := 384.0    # blocks above ATMO_TOP: the guard band the assist keeps the orbit above
+const STATION_KEEP_DV := 4.0          # blocks/s per correction — a small prograde nudge (a few % of v_circ)
+const STATION_KEEP_COOLDOWN := 0.35   # s between corrections — gentle + periodic (not every tick)
 const ORBIT_THRUST_G2 := 25.0     # gear-2 thrust authority, m/s²
 const ORBIT_ACTIVE_MAX := 8       # hard cap on actively-integrated orbital entities (NEVER-OOM)
 const DRAG_TERMINAL := 55.0       # sea-level terminal speed target, m/s (co-tuned with the controller commit band)

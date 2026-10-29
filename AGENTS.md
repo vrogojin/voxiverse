@@ -248,3 +248,18 @@ GDScript-only changes need no engine rebuild (minutes, not 24 minutes).
   `docs/COSMOS-CARD-BAND-HANDOFF-DESIGN.md`, `docs/COSMOS-FAR-EDIT-DEBOUNCE-REDESIGN.md`.
 - Remote bridge and control: `tools/remote-bridge/README.md`, `docs/COSMOS-REMOTE-CONTROL-DESIGN.md`,
   `docs/COSMOS-AGENT-CONTROL-DESIGN.md`, `docs/AUDIT-REMOTE-BRIDGE.md`.
+
+## Recreating the live game world
+
+The served build runs with 234 GDScript feature flags ON that the committed source keeps at `false`:
+233 in `godot/src/cosmos/cube_sphere.gd`, plus `CONTROL_ENABLED` in `godot/src/net/remote_bridge.gd`.
+They were recovered from the last archived live pack.
+
+- `docs/knowhow/live-flags/live-flags.json` is the flag record. It is the source of truth; do not inline
+  copies of it elsewhere.
+- `docs/knowhow/live-flags/LIVE-FLAGS.md` explains how the list was derived and groups the flags by theme.
+  It also lists the must-stay-OFF set and the limitations.
+- `docs/knowhow/live-flags/extract_pck_flags.py` is the parser for the PCK and GDScript binary tokens.
+- `scripts/deploy_cheats.sh --dry-run` checks the flips. Without `--dry-run` it flips, verifies,
+  exports and restores the files. `--deploy` also serves the build.
+- Commit any edits to those two files before a real run; the restore step wipes uncommitted changes.

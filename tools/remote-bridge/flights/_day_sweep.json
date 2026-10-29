@@ -1,0 +1,11 @@
+{ "name":"day-sweep","description":"sweep the day at the fixed junction view — border lighting behaviour after the fix","legs":[
+  {"name":"dawn","steps":[{"op":"set_time","local_hours":6}],"settle_s":2.5},
+  {"name":"s-dawn","steps":[{"op":"screenshot","label":"sweep-06-dawn"}],"settle_s":1.5},
+  {"name":"morn","steps":[{"op":"set_time","local_hours":8}],"settle_s":2.5},
+  {"name":"s-morn","steps":[{"op":"screenshot","label":"sweep-08-morning"}],"settle_s":1.5},
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":2.5},
+  {"name":"s-noon","steps":[{"op":"screenshot","label":"sweep-12-noon"}],"settle_s":1.5},
+  {"name":"dusk","steps":[{"op":"set_time","local_hours":18}],"settle_s":2.5},
+  {"name":"s-dusk","steps":[{"op":"screenshot","label":"sweep-18-dusk"}],"settle_s":1.5},
+  {"name":"night","steps":[{"op":"set_time","local_hours":22}],"settle_s":2.5},
+  {"name":"s-night","steps":[{"op":"screenshot","label":"sweep-22-night"}],"settle_s":1.5}]}

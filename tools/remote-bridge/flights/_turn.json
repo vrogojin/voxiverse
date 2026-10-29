@@ -1,0 +1,3 @@
+{ "name":"t","description":"turn","legs":[
+  {"name":"turn","steps":[{"op":"turn","dir":"left","seconds":1.4}],"settle_s":1.6},
+  {"name":"s","steps":[{"op":"screenshot"}],"settle_s":1.4}]}

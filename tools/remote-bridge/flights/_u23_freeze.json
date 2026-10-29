@@ -1,0 +1,8 @@
+{ "name":"u23_freeze","description":"#72 U2+U3 freeze-repro: climb to low alt then sustained forward motion (cull-mask churns every frame — the exact 1075ms/0.3fps trigger)","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":1.0},
+  {"name":"dev on","steps":[{"op":"dev_nav","on":true}],"settle_s":0.8},
+  {"name":"level","steps":[{"op":"look","pitch_deg":-8}],"settle_s":0.5},
+  {"name":"climb to ~40","steps":[{"op":"thrust","dy":1.0,"seconds":5,"gait":"run"}],"settle_s":1.5},
+  {"name":"MOVE fwd churn A","steps":[{"op":"thrust","dz":1.0,"seconds":12,"gait":"run"}],"settle_s":0.5},
+  {"name":"MOVE fwd churn B","steps":[{"op":"thrust","dz":1.0,"seconds":12,"gait":"run"}],"settle_s":0.5},
+  {"name":"MOVE fwd churn C","steps":[{"op":"thrust","dz":1.0,"seconds":12,"gait":"run"}],"settle_s":1.5}]}

@@ -1,0 +1,5 @@
+{ "name":"slope-land","description":"drop onto slope, verify on-ground not sunk, look at feet","legs":[
+  {"name":"devoff","steps":[{"op":"dev_nav","on":false}],"settle_s":1.0},
+  {"name":"fall","steps":[{"op":"wait","seconds":6}],"settle_s":1.0},
+  {"name":"feet","steps":[{"op":"look","pitch_deg":-55}],"settle_s":1.5},
+  {"name":"shot","steps":[{"op":"screenshot","label":"slope-feet"}],"settle_s":2.0}]}

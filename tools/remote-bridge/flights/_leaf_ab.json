@@ -1,0 +1,4 @@
+{ "name":"leaf-ab","description":"teleport to warm forest, capture see-through leaves + fps","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":13}],"settle_s":1.5},
+  {"name":"tp","steps":[{"op":"teleport","lat_deg":-42.695,"lon_deg":-140.939,"alt":3,"yaw_deg":0,"pitch_deg":-3}],"settle_s":10.0},
+  {"name":"s0","steps":[{"op":"screenshot","label":"leaf-a"}],"settle_s":2.0}]}

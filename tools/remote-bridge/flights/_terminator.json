@@ -1,0 +1,6 @@
+{ "name":"terminator","description":"advance to dusk so the day/night line crosses the disc","legs":[
+  {"name":"dusk","steps":[{"op":"set_time","local_hours":17.5}],"settle_s":2.5},
+  {"name":"nadir","steps":[{"op":"look","planet_lock":true}],"settle_s":1.5},
+  {"name":"s1","steps":[{"op":"screenshot","label":"term-1"}],"settle_s":1.5},
+  {"name":"later","steps":[{"op":"set_time","local_hours":18.5}],"settle_s":2.5},
+  {"name":"s2","steps":[{"op":"screenshot","label":"term-2"}],"settle_s":1.5}]}

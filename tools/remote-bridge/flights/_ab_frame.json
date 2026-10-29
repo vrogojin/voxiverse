@@ -1,0 +1,8 @@
+{ "name":"abframe","description":"raise up + pan to reframe the concave base (was grey)","legs":[
+  {"name":"up","steps":[{"op":"set_alt","alt":55}],"settle_s":4.0},
+  {"name":"lvl","steps":[{"op":"look","pitch_deg":-12}],"settle_s":1.5},
+  {"name":"s0","steps":[{"op":"screenshot","label":"abf-0"}],"settle_s":1.5},
+  {"name":"t1","steps":[{"op":"look","yaw_deg":45}],"settle_s":1.2},
+  {"name":"s1","steps":[{"op":"screenshot","label":"abf-1"}],"settle_s":1.5},
+  {"name":"t2","steps":[{"op":"look","yaw_deg":45}],"settle_s":1.2},
+  {"name":"s2","steps":[{"op":"screenshot","label":"abf-2"}],"settle_s":1.5}]}

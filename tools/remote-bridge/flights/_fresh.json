@@ -1,0 +1,6 @@
+{ "name":"fresh","description":"noon + teleport to a fresh never-visited region for prebake A/B","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":0.5},
+  {"name":"freeze","steps":[{"op":"freeze_time","on":true}],"settle_s":0.4},
+  {"name":"tp","steps":[{"op":"teleport","lat_deg":-32,"lon_deg":88,"alt":180}],"settle_s":3.0},
+  {"name":"look","steps":[{"op":"look","pitch_deg":-14}],"settle_s":3.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"fresh-prebake"}],"settle_s":2.0}]}

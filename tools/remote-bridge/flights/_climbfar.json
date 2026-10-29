@@ -1,0 +1,3 @@
+{ "name":"climbfar","description":"climb high to expose scaled-body/atmo/nav desync","legs":[
+  {"name":"climb","steps":[{"op":"thrust","dy":1.0,"seconds":60,"gait":"run"}],"settle_s":0.5},
+  {"name":"look","steps":[{"op":"look","pitch_deg":-30}],"settle_s":0.3}]}

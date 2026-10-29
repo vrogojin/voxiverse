@@ -1,0 +1,5 @@
+{ "name":"lodshot","description":"climb to orbit + screenshot the far-ring render (R6 smoke)","legs":[
+  {"name":"dev on","steps":[{"op":"dev_nav","on":true}],"settle_s":0.3},
+  {"name":"climb to orbit","steps":[{"op":"thrust","dy":1.0,"seconds":22,"gait":"run"}],"settle_s":0.5},
+  {"name":"look down at planet","steps":[{"op":"look","pitch_deg":-60}],"settle_s":0.5},
+  {"name":"shoot","steps":[{"op":"screenshot","label":"lod-orbit"}],"settle_s":1.0}]}

@@ -1,0 +1,8 @@
+{ "name":"finalreload","description":"reload + boot + enter orbit","legs":[
+  {"name":"reload","steps":[{"op":"reload"}],"settle_s":3.0},
+  {"name":"boot","steps":[{"op":"wait","seconds":35}],"settle_s":35.0},
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":1.0},
+  {"name":"nav","steps":[{"op":"dev_nav","on":true}],"settle_s":1.0},
+  {"name":"up","steps":[{"op":"set_alt","alt":1500}],"settle_s":3.0},
+  {"name":"w","steps":[{"op":"wait","seconds":20}],"settle_s":20.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"final-a"}],"settle_s":2.0}]}

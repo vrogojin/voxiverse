@@ -1,0 +1,6 @@
+{ "name":"bd","description":"noon + climb + oblique look at real block faces","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":1.2},
+  {"name":"dev on","steps":[{"op":"dev_nav","on":true}],"settle_s":1.0},
+  {"name":"climb","steps":[{"op":"thrust","dy":1.0,"seconds":5,"gait":"run"}],"settle_s":1.2},
+  {"name":"look","steps":[{"op":"look","pitch_deg":-22}],"settle_s":1.5},
+  {"name":"shoot","steps":[{"op":"screenshot","label":"blockdetail"}],"settle_s":2.5}]}

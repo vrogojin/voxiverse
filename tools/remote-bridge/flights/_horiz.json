@@ -1,0 +1,3 @@
+{ "name":"horiz","description":"look to the horizon to see the reconverged far skin from ground","legs":[
+  {"name":"level","steps":[{"op":"look","pitch_deg":0}],"settle_s":0.8},
+  {"name":"horizon","steps":[{"op":"look","pitch_deg":-5}],"settle_s":2.5}]}

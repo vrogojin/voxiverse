@@ -1,0 +1,3 @@
+{ "name":"climb2","description":"climb, atmo-off","legs":[
+  {"name":"dev on","steps":[{"op":"dev_nav","on":true}],"settle_s":0.2},
+  {"name":"up","steps":[{"op":"thrust","dy":1.0,"seconds":26,"gait":"run"}],"settle_s":0.2}]}

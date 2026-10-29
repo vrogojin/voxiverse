@@ -1,0 +1,3 @@
+{ "name":"bakewait","description":"one clean long wait for g2","legs":[
+  {"name":"w","steps":[{"op":"wait","seconds":75}],"settle_s":75.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"final-c"}],"settle_s":2.0}]}

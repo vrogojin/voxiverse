@@ -1,0 +1,5 @@
+{ "name":"walkm","description":"run around on the surface (skin tier fps A/B)","legs":[
+  {"name":"run fwd","steps":[{"op":"thrust","dz":1.0,"seconds":6,"gait":"run"}],"settle_s":0.2},
+  {"name":"turn","steps":[{"op":"turn","degrees":90,"dir":"right"}],"settle_s":0.2},
+  {"name":"run2","steps":[{"op":"thrust","dz":1.0,"seconds":6,"gait":"run"}],"settle_s":0.2},
+  {"name":"look","steps":[{"op":"look","pitch_deg":-4},{"op":"screenshot","label":"skin"}],"settle_s":0.3}]}

@@ -1,0 +1,6 @@
+{ "name":"daycap","description":"day + orbit + capture (one clean shot)","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":1.5},
+  {"name":"nav","steps":[{"op":"dev_nav","on":true}],"settle_s":1.0},
+  {"name":"up","steps":[{"op":"set_alt","alt":1400}],"settle_s":3.0},
+  {"name":"w","steps":[{"op":"wait","seconds":45}],"settle_s":45.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"final-day"}],"settle_s":2.0}]}

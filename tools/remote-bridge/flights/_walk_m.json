@@ -1,0 +1,8 @@
+{ "name":"walk-m","description":"run forward across facet boundaries",
+  "legs":[ {"name":"run fwd 640","steps":[
+    {"op":"move","blocks":128,"heading":"forward","gait":"run"},
+    {"op":"move","blocks":128,"heading":"forward","gait":"run"},
+    {"op":"move","blocks":128,"heading":"forward","gait":"run"},
+    {"op":"move","blocks":128,"heading":"forward","gait":"run"},
+    {"op":"move","blocks":128,"heading":"forward","gait":"run"}
+  ],"settle_s":1.0} ] }

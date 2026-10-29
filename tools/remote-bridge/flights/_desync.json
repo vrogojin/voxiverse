@@ -1,0 +1,4 @@
+{ "name":"desync","description":"reproduce the desync (set_fly off) then re-arm dev + thrust; must lift again","legs":[
+  {"name":"fly off","steps":[{"op":"set_fly","on":false}],"settle_s":3.0},
+  {"name":"re-arm dev","steps":[{"op":"dev_nav","on":true}],"settle_s":1.0},
+  {"name":"thrust up","steps":[{"op":"thrust","dy":1.0,"seconds":14,"gait":"run"}],"settle_s":1.5}]}

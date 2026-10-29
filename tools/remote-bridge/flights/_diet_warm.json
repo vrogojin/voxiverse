@@ -1,0 +1,2 @@
+{ "name":"diet-warm","description":"#129 floor-ON warm standing forest re-measure","legs":[
+  {"name":"tp","steps":[{"op":"teleport","lat_deg":-40.15,"lon_deg":-153.95,"alt":8,"yaw_deg":118,"pitch_deg":-3}],"settle_s":45.0}]}

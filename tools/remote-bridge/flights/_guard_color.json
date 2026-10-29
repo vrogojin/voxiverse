@@ -1,0 +1,3 @@
+{ "name":"guard-color","description":"#132 defect-3 near/far leaf colour handoff pixel-check","legs":[
+  {"name":"tp","steps":[{"op":"teleport","lat_deg":-40.152,"lon_deg":-153.965,"alt":7,"yaw_deg":118,"pitch_deg":3}],"settle_s":20.0},
+  {"name":"s0","steps":[{"op":"screenshot","label":"guardcolor-a"}],"settle_s":10.0}]}

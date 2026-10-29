@@ -1,0 +1,3 @@
+{ "name":"far_again","description":"same frozen view, 12s later","legs":[
+  {"name":"wait","steps":[{"op":"wait","seconds":12}],"settle_s":0.5},
+  {"name":"shot","steps":[{"op":"screenshot","label":"far-again"}],"settle_s":2.0}]}

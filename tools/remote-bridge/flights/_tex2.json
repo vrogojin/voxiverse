@@ -1,0 +1,6 @@
+{ "name":"tex2","description":"noon + moderate climb + oblique look at near-far→far textured terrain","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":1.2},
+  {"name":"dev on","steps":[{"op":"dev_nav","on":true}],"settle_s":1.0},
+  {"name":"climb","steps":[{"op":"thrust","dy":1.0,"seconds":6,"gait":"run"}],"settle_s":1.2},
+  {"name":"look","steps":[{"op":"look","pitch_deg":-25}],"settle_s":1.5},
+  {"name":"shoot","steps":[{"op":"screenshot","label":"tex2"}],"settle_s":2.5}]}

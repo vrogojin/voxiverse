@@ -1,0 +1,7 @@
+{ "name":"restore","description":"clean daylit spot","legs":[
+  {"name":"dn","steps":[{"op":"dev_nav","on":false}],"settle_s":0.6},
+  {"name":"tp","steps":[{"op":"teleport","lat_deg":8,"lon_deg":2,"alt":3}],"settle_s":2.0},
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":1.2},
+  {"name":"look","steps":[{"op":"look","pitch_deg":-8}],"settle_s":1.0},
+  {"name":"bake","steps":[{"op":"wait","seconds":3}],"settle_s":3.0},
+  {"name":"shot","steps":[{"op":"screenshot"}],"settle_s":1.6}]}

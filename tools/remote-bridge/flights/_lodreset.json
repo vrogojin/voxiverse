@@ -1,0 +1,5 @@
+{ "name":"lodreset","description":"reset control state then climb clean","legs":[
+  {"name":"flyoff","steps":[{"op":"set_fly","on":false}],"settle_s":0.3},
+  {"name":"level","steps":[{"op":"look","pitch_deg":0}],"settle_s":0.3},
+  {"name":"dev on","steps":[{"op":"dev_nav","on":true}],"settle_s":0.4},
+  {"name":"climb","steps":[{"op":"thrust","dy":1.0,"seconds":20,"gait":"run"}],"settle_s":0.4}]}

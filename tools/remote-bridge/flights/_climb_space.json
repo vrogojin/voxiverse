@@ -1,0 +1,4 @@
+{ "name":"climb-space","description":"climb into space (att=space, G3 active) + stable nadir survey","legs":[
+  {"name":"climb","steps":[{"op":"thrust","dy":1.0,"seconds":10,"gait":"run"}],"settle_s":2.5},
+  {"name":"nadir","steps":[{"op":"look","planet_lock":true}],"settle_s":2.0},
+  {"name":"s1","steps":[{"op":"screenshot","label":"space-survey"}],"settle_s":1.5}]}

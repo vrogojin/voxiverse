@@ -1,0 +1,5 @@
+{ "name":"nc","description":"midnight uniformity check","legs":[
+  {"name":"look","steps":[{"op":"look","pitch_deg":-8}],"settle_s":0.6},
+  {"name":"mid","steps":[{"op":"set_time","local_hours":0}],"settle_s":1.5},
+  {"name":"bake","steps":[{"op":"wait","seconds":2}],"settle_s":2.0},
+  {"name":"shot","steps":[{"op":"screenshot"}],"settle_s":1.6}]}

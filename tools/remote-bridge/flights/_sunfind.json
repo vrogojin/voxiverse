@@ -1,0 +1,4 @@
+{ "name":"sf","description":"aim at warm glow","legs":[
+  {"name":"tr","steps":[{"op":"turn","dir":"right","seconds":0.8}],"settle_s":1.0},
+  {"name":"up","steps":[{"op":"look","pitch_deg":12}],"settle_s":0.8},
+  {"name":"s","steps":[{"op":"screenshot"}],"settle_s":1.5}]}

@@ -1,0 +1,5 @@
+{ "name":"l1band","description":"noon + climb to ~150 + look down at the L1 megablock band","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":1.5},
+  {"name":"dev on","steps":[{"op":"dev_nav","on":true}],"settle_s":0.8},
+  {"name":"climb","steps":[{"op":"thrust","dy":1.0,"seconds":9,"gait":"run"}],"settle_s":1.0},
+  {"name":"look down","steps":[{"op":"look","pitch_deg":-32}],"settle_s":4.0}]}

@@ -1,0 +1,7 @@
+{ "name":"bl","description":"live devnav low orbit band bake","legs":[
+  {"name":"unfreeze","steps":[{"op":"freeze_player","on":false}],"settle_s":0.3},
+  {"name":"alt","steps":[{"op":"set_alt","alt":700}],"settle_s":2.0},
+  {"name":"dn","steps":[{"op":"dev_nav","on":true}],"settle_s":1.0},
+  {"name":"look","steps":[{"op":"look","planet_lock":true,"pitch_off_deg":0}],"settle_s":1.5},
+  {"name":"bake","steps":[{"op":"wait","seconds":50}],"settle_s":50.0},
+  {"name":"shot","steps":[{"op":"screenshot"}],"settle_s":1.8}]}

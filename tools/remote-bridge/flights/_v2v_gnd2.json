@@ -1,0 +1,5 @@
+{ "name":"v2v_gnd2","description":"§2V ground fix: climb above surface, drop dev-nav to land, horizon seam look","legs":[
+  {"name":"up to surface","steps":[{"op":"thrust","dy":1.0,"seconds":6,"gait":"walk"}],"settle_s":1.5},
+  {"name":"level look","steps":[{"op":"look","pitch_deg":-4}],"settle_s":1.0},
+  {"name":"land","steps":[{"op":"dev_nav","on":false}],"settle_s":3.0},
+  {"name":"horizon","steps":[{"op":"look","pitch_deg":-6}],"settle_s":2.5}]}

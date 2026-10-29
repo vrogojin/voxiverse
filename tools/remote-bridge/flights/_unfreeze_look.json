@@ -1,0 +1,5 @@
+{ "name":"unfreezelook","description":"release freeze then pitch to nadir","legs":[
+  {"name":"unfreeze","steps":[{"op":"freeze_player","on":false}],"settle_s":1.0},
+  {"name":"pitch","steps":[{"op":"look","pitch_deg":-80}],"settle_s":2.0},
+  {"name":"settle","steps":[{"op":"wait","seconds":4}],"settle_s":4.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"g3-unfrozen"}],"settle_s":2.0}]}

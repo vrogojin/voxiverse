@@ -1,0 +1,6 @@
+{ "name":"lower","description":"noon, lower orbit 2500 to show real space","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":0.5},
+  {"name":"freeze time","steps":[{"op":"freeze_time","on":true}],"settle_s":0.3},
+  {"name":"orbit 2500","steps":[{"op":"set_alt","alt":2500}],"settle_s":1.2},
+  {"name":"freeze player","steps":[{"op":"freeze_player","on":true}],"settle_s":0.3},
+  {"name":"look down","steps":[{"op":"look","pitch_deg":-70}],"settle_s":2.0}]}

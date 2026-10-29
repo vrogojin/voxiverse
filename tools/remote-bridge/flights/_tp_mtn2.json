@@ -1,0 +1,5 @@
+{ "name":"tp-mtn2","description":"teleport to saved mountain, settle + heal","legs":[
+  {"name":"settle","steps":[{"op":"wait","seconds":10}],"settle_s":0.5},
+  {"name":"tp","steps":[{"op":"teleport","lat_deg":38.844,"lon_deg":-146.028,"alt":108.7,"yaw_deg":-86.11,"pitch_deg":-77.65}],"settle_s":6.0},
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":2.0},
+  {"name":"heal","steps":[{"op":"wait","seconds":14}],"settle_s":1.0}]}

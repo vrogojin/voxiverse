@@ -1,0 +1,6 @@
+{ "name":"hoverhi","description":"climb to ~900 and HOVER static (no vertical motion) — is high-alt slow even static?",
+  "legs":[
+    {"name":"dev_nav on","steps":[{"op":"dev_nav","on":true}],"settle_s":0.5},
+    {"name":"climb to ~900","steps":[{"op":"thrust","dy":1.0,"seconds":30,"gait":"run"}],"settle_s":1.0},
+    {"name":"HOVER static 18s","steps":[{"op":"wait","seconds":18}],"settle_s":0.5,"expect":{"flying":true,"alt_gt":384}}
+  ] }

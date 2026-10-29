@@ -1,0 +1,5 @@
+{ "name":"tb_day","description":"noon daylight, look at terrain+horizon for far/near colour match","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":1.5},
+  {"name":"look","steps":[{"op":"look","pitch_deg":-18}],"settle_s":1.5},
+  {"name":"shot","steps":[{"op":"screenshot","label":"tb-day-horizon"}],"settle_s":2.5}
+]}

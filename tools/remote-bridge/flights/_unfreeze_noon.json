@@ -1,0 +1,3 @@
+{ "name":"unfreeze-noon","description":"hand back a normal playable daytime state","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":11}],"settle_s":1.0},
+  {"name":"unfreeze","steps":[{"op":"freeze_time","on":false}],"settle_s":0.5}]}

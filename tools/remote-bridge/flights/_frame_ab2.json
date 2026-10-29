@@ -1,0 +1,6 @@
+{ "name":"frame-ab2","description":"onto the grassy tree field, horizon view of far/near tree band","legs":[
+  {"name":"fly","steps":[{"op":"set_fly","on":true}],"settle_s":1.0},
+  {"name":"tp","steps":[{"op":"teleport","lat_deg":-40.15,"lon_deg":-153.95,"alt":30,"yaw_deg":110,"pitch_deg":-6}],"settle_s":14.0},
+  {"name":"s0","steps":[{"op":"screenshot","label":"frame2-a"}],"settle_s":5.0},
+  {"name":"turn","steps":[{"op":"turn","dir":"right","deg":50}],"settle_s":5.0},
+  {"name":"s1","steps":[{"op":"screenshot","label":"frame2-b"}],"settle_s":3.0}]}

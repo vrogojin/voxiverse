@@ -1,0 +1,8 @@
+{ "name":"day-relief","description":"day view + oblique tilt to reveal G3 far 3D relief geometry","legs":[
+  {"name":"day","steps":[{"op":"set_time","local_hours":10}],"settle_s":2.5},
+  {"name":"nadir","steps":[{"op":"look","planet_lock":true}],"settle_s":1.5},
+  {"name":"s-nadir","steps":[{"op":"screenshot","label":"relief-nadir"}],"settle_s":1.5},
+  {"name":"tilt1","steps":[{"op":"look","pitch_deg":45}],"settle_s":2.0},
+  {"name":"s-obl1","steps":[{"op":"screenshot","label":"relief-oblique1"}],"settle_s":1.5},
+  {"name":"tilt2","steps":[{"op":"look","pitch_deg":25}],"settle_s":2.0},
+  {"name":"s-obl2","steps":[{"op":"screenshot","label":"relief-oblique2"}],"settle_s":1.5}]}

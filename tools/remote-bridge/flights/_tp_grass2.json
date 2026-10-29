@@ -1,0 +1,4 @@
+{ "name":"tp-grass2","description":"teleport to concave grass base","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":1.5},
+  {"name":"tp","steps":[{"op":"teleport","lat_deg":39.030,"lon_deg":-146.183,"alt":33,"yaw_deg":-86.11,"pitch_deg":-6}],"settle_s":10.0},
+  {"name":"s1","steps":[{"op":"screenshot","label":"ab113-b"}],"settle_s":2.0}]}

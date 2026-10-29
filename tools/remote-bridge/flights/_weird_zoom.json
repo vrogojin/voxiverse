@@ -1,0 +1,6 @@
+{ "name":"weird-zoom","description":"turn toward the weird-colored transition trees + capture","legs":[
+  {"name":"turn","steps":[{"op":"look","yaw_deg":88}],"settle_s":1.5},
+  {"name":"lvl","steps":[{"op":"look","pitch_deg":-2}],"settle_s":1.5},
+  {"name":"s0","steps":[{"op":"screenshot","label":"weird-0"}],"settle_s":1.5},
+  {"name":"t2","steps":[{"op":"look","yaw_deg":40}],"settle_s":1.2},
+  {"name":"s1","steps":[{"op":"screenshot","label":"weird-1"}],"settle_s":1.5}]}

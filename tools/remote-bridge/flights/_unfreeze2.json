@@ -1,0 +1,2 @@
+{ "name":"unfreeze2","description":"release freeze_player (retry)","legs":[
+  {"name":"unfreeze player","steps":[{"op":"freeze_player","on":false}],"settle_s":1.0}]}

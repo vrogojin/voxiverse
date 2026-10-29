@@ -1,0 +1,6 @@
+{ "name":"g3wait","description":"long g2 sweep then steep pitch no-lock","legs":[
+  {"name":"sweep1","steps":[{"op":"wait","seconds":30}],"settle_s":30.0},
+  {"name":"sweep2","steps":[{"op":"wait","seconds":30}],"settle_s":30.0},
+  {"name":"pitch","steps":[{"op":"look","pitch_deg":-85}],"settle_s":2.0},
+  {"name":"settle","steps":[{"op":"wait","seconds":6}],"settle_s":6.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"g3-nadir"}],"settle_s":2.0}]}

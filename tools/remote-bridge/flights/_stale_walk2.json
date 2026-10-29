@@ -1,0 +1,13 @@
+{ "name":"stale-walk2","description":"#132 P1 floor-ON sustained walk — many short hops, fps+worst_ms+spd sampling","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":13}],"settle_s":1.5},
+  {"name":"tp","steps":[{"op":"teleport","lat_deg":-40.15,"lon_deg":-153.95,"alt":9,"yaw_deg":95,"pitch_deg":-4}],"settle_s":16.0},
+  {"name":"w01","steps":[{"op":"move","blocks":24,"heading":"forward","gait":"walk"}],"settle_s":0.4},
+  {"name":"w02","steps":[{"op":"move","blocks":24,"heading":"forward","gait":"walk"}],"settle_s":0.4},
+  {"name":"w03","steps":[{"op":"move","blocks":24,"heading":"forward","gait":"walk"}],"settle_s":0.4},
+  {"name":"w04","steps":[{"op":"move","blocks":24,"heading":"forward","gait":"walk"}],"settle_s":0.4},
+  {"name":"w05","steps":[{"op":"move","blocks":24,"heading":"forward","gait":"walk"}],"settle_s":0.4},
+  {"name":"w06","steps":[{"op":"move","blocks":24,"heading":"forward","gait":"walk"}],"settle_s":0.4},
+  {"name":"w07","steps":[{"op":"move","blocks":24,"heading":"forward","gait":"walk"}],"settle_s":0.4},
+  {"name":"w08","steps":[{"op":"move","blocks":24,"heading":"forward","gait":"walk"}],"settle_s":0.4},
+  {"name":"w09","steps":[{"op":"move","blocks":24,"heading":"forward","gait":"walk"}],"settle_s":0.4},
+  {"name":"w10","steps":[{"op":"move","blocks":24,"heading":"forward","gait":"walk"}],"settle_s":0.4}]}

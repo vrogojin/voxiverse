@@ -1,0 +1,5 @@
+{ "name":"do","description":"deep orbit nadir skin coverage","legs":[
+  {"name":"up","steps":[{"op":"set_alt","alt":8000}],"settle_s":2.5},
+  {"name":"look","steps":[{"op":"look","planet_lock":true,"pitch_off_deg":0}],"settle_s":1.5},
+  {"name":"bake","steps":[{"op":"wait","seconds":6}],"settle_s":6.0},
+  {"name":"shot","steps":[{"op":"screenshot"}],"settle_s":1.8}]}

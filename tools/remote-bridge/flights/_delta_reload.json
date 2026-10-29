@@ -1,0 +1,2 @@
+{ "name":"delta-reload","description":"reload to pick up FP_FAR_TREES_DELTA build","legs":[
+  {"name":"reload","steps":[{"op":"reload"}],"settle_s":1.0}]}

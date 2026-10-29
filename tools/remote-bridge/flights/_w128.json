@@ -1,0 +1,3 @@
+{ "name":"w128","description":"walk 128 toward edge","legs":[
+  {"name":"walk","steps":[{"op":"move","blocks":128}],"settle_s":45.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"nb-near"}],"settle_s":2.0}]}

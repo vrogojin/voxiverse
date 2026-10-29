@@ -1,0 +1,6 @@
+{ "name":"fv","description":"low orbit nadir flat map","legs":[
+  {"name":"up","steps":[{"op":"set_alt","alt":800}],"settle_s":2.5},
+  {"name":"fp","steps":[{"op":"freeze_player","on":true}],"settle_s":0.3},
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":0.6},
+  {"name":"look","steps":[{"op":"look","planet_lock":true,"pitch_off_deg":0}],"settle_s":1.5},
+  {"name":"shot0","steps":[{"op":"screenshot"}],"settle_s":1.5}]}

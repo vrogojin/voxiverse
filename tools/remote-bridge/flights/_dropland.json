@@ -1,0 +1,5 @@
+{ "name":"dropland","description":"repro the fall-through: set_alt 1800, freeze, release, let it drop","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":0.6},
+  {"name":"to orbit","steps":[{"op":"set_alt","alt":1800}],"settle_s":1.0},
+  {"name":"freeze","steps":[{"op":"freeze_player","on":true}],"settle_s":1.0},
+  {"name":"release (drop)","steps":[{"op":"freeze_player","on":false}],"settle_s":1.0}]}

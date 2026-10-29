@@ -1,0 +1,4 @@
+{ "name":"lodjump","description":"jump airborne then space-climb","legs":[
+  {"name":"jump","steps":[{"op":"jump"}],"settle_s":0.2},
+  {"name":"dev on","steps":[{"op":"dev_nav","on":true}],"settle_s":0.2},
+  {"name":"climb","steps":[{"op":"thrust","dy":1.0,"seconds":18,"gait":"run"}],"settle_s":0.4}]}

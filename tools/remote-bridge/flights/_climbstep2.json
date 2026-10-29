@@ -1,0 +1,2 @@
+{ "name":"climbstep2","description":"stage 2: climb into ~210 hang zone","legs":[
+  {"name":"climb","steps":[{"op":"thrust","dy":1.0,"seconds":3,"gait":"run"}],"settle_s":1.5}]}

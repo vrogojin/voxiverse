@@ -1,0 +1,3 @@
+{ "name":"guard-ground","description":"#132 ground-level, grassy field, level look at near/far tree band","legs":[
+  {"name":"tp","steps":[{"op":"teleport","lat_deg":-40.15,"lon_deg":-153.95,"alt":7,"yaw_deg":118,"pitch_deg":0}],"settle_s":20.0},
+  {"name":"s0","steps":[{"op":"screenshot","label":"guardground-a"}],"settle_s":12.0}]}

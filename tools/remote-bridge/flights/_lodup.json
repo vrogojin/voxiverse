@@ -1,0 +1,5 @@
+{ "name":"lodup","description":"free-fly straight up, look down, screenshot lit surface from altitude","legs":[
+  {"name":"up1","steps":[{"op":"thrust","dy":1.0,"seconds":14,"gait":"run"}],"settle_s":0.3},
+  {"name":"aim down","steps":[{"op":"look","pitch_deg":-88}],"settle_s":0.3},
+  {"name":"hold","steps":[{"op":"wait","seconds":1}],"settle_s":0.2},
+  {"name":"shoot","steps":[{"op":"screenshot","label":"up"}],"settle_s":0.4}]}

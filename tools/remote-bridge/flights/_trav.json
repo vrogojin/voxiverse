@@ -1,0 +1,4 @@
+{ "name":"trav","description":"descend to limb alt + traverse forward toward day","legs":[
+  {"name":"descend","steps":[{"op":"thrust","dy":-1.0,"seconds":45,"gait":"run"}],"settle_s":0.3},
+  {"name":"forward","steps":[{"op":"thrust","dz":1.0,"seconds":100,"gait":"run"}],"settle_s":0.3},
+  {"name":"pitch","steps":[{"op":"look","pitch_deg":-30}],"settle_s":0.1}]}

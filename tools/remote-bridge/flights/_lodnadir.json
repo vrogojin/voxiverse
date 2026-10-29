@@ -1,0 +1,6 @@
+{ "name":"lodnadir","description":"high orbit, aim nadir, screenshot textured surface","legs":[
+  {"name":"dev on","steps":[{"op":"dev_nav","on":true}],"settle_s":0.3},
+  {"name":"climb","steps":[{"op":"thrust","dy":1.0,"seconds":16,"gait":"run"}],"settle_s":0.4},
+  {"name":"look down hard","steps":[{"op":"look","pitch_deg":-89}],"settle_s":0.4},
+  {"name":"more down","steps":[{"op":"look","pitch_deg":-89}],"settle_s":0.4},
+  {"name":"shoot","steps":[{"op":"screenshot","label":"nadir"}],"settle_s":1.5}]}

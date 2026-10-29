@@ -1,0 +1,6 @@
+{ "name":"tilebake_orbit","description":"climb to orbit, nadir, freeze — measure the C++ tile bake engaging","legs":[
+  {"name":"orbit","steps":[{"op":"set_alt","alt":3000}],"settle_s":2.5,"expect":{"alt_gt":384}},
+  {"name":"nadir","steps":[{"op":"look","pitch_deg":-88}],"settle_s":1.0},
+  {"name":"freeze","steps":[{"op":"freeze_player","on":true}],"settle_s":1.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"tilebake-orbit-nadir"}],"settle_s":2.0}
+]}

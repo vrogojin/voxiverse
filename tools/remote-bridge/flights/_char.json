@@ -1,0 +1,5 @@
+{ "name":"char","description":"lift above the buggy column + look down","legs":[
+  {"name":"up","steps":[{"op":"set_alt","alt":400}],"settle_s":1.0},
+  {"name":"hold","steps":[{"op":"freeze_player","on":true}],"settle_s":0.4},
+  {"name":"down","steps":[{"op":"look","pitch_deg":-70}],"settle_s":1.0},
+  {"name":"shot","steps":[{"op":"screenshot"}],"settle_s":1.5}]}

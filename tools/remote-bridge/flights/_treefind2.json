@@ -1,0 +1,6 @@
+{ "name":"treefind2","description":"freeze noon, find trees in daylight for chop test","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":0.6},
+  {"name":"freeze","steps":[{"op":"freeze_time","on":true}],"settle_s":0.4},
+  {"name":"tp","steps":[{"op":"teleport","lat_deg":38,"lon_deg":62,"alt":20}],"settle_s":5.0,"expect":{"alt_gt":-1}},
+  {"name":"look","steps":[{"op":"look","pitch_deg":-2}],"settle_s":2.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"treefind2"}],"settle_s":2.0}]}

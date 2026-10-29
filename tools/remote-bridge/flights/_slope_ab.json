@@ -1,0 +1,6 @@
+{ "name":"slope-ab","description":"steep mud/dirt slope close-up to check smooth-carve vs ladder","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":13}],"settle_s":1.5},
+  {"name":"tp","steps":[{"op":"teleport","lat_deg":-40.20,"lon_deg":-154.19,"alt":35,"yaw_deg":35,"pitch_deg":-28}],"settle_s":16.0},
+  {"name":"s0","steps":[{"op":"screenshot","label":"slope-a"}],"settle_s":6.0},
+  {"name":"look","steps":[{"op":"look","pitch_deg":-18}],"settle_s":4.0},
+  {"name":"s1","steps":[{"op":"screenshot","label":"slope-b"}],"settle_s":3.0}]}

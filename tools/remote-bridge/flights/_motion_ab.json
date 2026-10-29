@@ -1,0 +1,11 @@
+{ "name":"motion-ab","description":"#129 F1+F2a motion A/B — walk the forest, measure moving fps + credit","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":13}],"settle_s":1.5},
+  {"name":"tp","steps":[{"op":"teleport","lat_deg":-40.15,"lon_deg":-153.95,"alt":8,"yaw_deg":95,"pitch_deg":-4}],"settle_s":22.0},
+  {"name":"w01","steps":[{"op":"move","blocks":30,"heading":"forward","gait":"run"}],"settle_s":0.5},
+  {"name":"w02","steps":[{"op":"move","blocks":30,"heading":"forward","gait":"run"}],"settle_s":0.5},
+  {"name":"w03","steps":[{"op":"move","blocks":30,"heading":"forward","gait":"run"}],"settle_s":0.5},
+  {"name":"w04","steps":[{"op":"move","blocks":30,"heading":"forward","gait":"run"}],"settle_s":0.5},
+  {"name":"w05","steps":[{"op":"move","blocks":30,"heading":"right","gait":"run"}],"settle_s":0.5},
+  {"name":"w06","steps":[{"op":"move","blocks":30,"heading":"right","gait":"run"}],"settle_s":0.5},
+  {"name":"w07","steps":[{"op":"move","blocks":30,"heading":"back","gait":"run"}],"settle_s":0.5},
+  {"name":"w08","steps":[{"op":"move","blocks":30,"heading":"back","gait":"run"}],"settle_s":0.5}]}

@@ -1,0 +1,6 @@
+{ "name":"l2band","description":"teleport to L2 band alt 1000, freeze, look down","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":0.6},
+  {"name":"freeze time","steps":[{"op":"freeze_time","on":true}],"settle_s":0.4},
+  {"name":"set alt 1000","steps":[{"op":"set_alt","alt":1000}],"settle_s":0.6},
+  {"name":"freeze player","steps":[{"op":"freeze_player","on":true}],"settle_s":0.4},
+  {"name":"look down","steps":[{"op":"look","pitch_deg":-50}],"settle_s":1.0}]}

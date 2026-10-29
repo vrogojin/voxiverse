@@ -1,0 +1,8 @@
+{ "name":"cl","description":"noon + low + surface fills view","legs":[
+  {"name":"unfp","steps":[{"op":"freeze_player","on":false}],"settle_s":0.3},
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":0.6},
+  {"name":"alt","steps":[{"op":"set_alt","alt":440}],"settle_s":2.0},
+  {"name":"look","steps":[{"op":"look","planet_lock":true,"pitch_off_deg":0}],"settle_s":1.2},
+  {"name":"fp","steps":[{"op":"freeze_player","on":true}],"settle_s":0.3},
+  {"name":"bake","steps":[{"op":"wait","seconds":22}],"settle_s":22.0},
+  {"name":"shot","steps":[{"op":"screenshot"}],"settle_s":1.8}]}

@@ -1,0 +1,2 @@
+{ "name":"p2-sanity","description":"reload, fly up, sanity-check trees render + perf under FADE","legs":[
+  {"name":"reload","steps":[{"op":"reload"}],"settle_s":3.0}]}

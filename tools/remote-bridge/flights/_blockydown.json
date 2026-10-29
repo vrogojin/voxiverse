@@ -1,0 +1,3 @@
+{ "name":"blockydown","description":"look down at the blocky terrain grid from altitude (night)","legs":[
+  {"name":"look down","steps":[{"op":"look","pitch_deg":-55}],"settle_s":0.5},
+  {"name":"shoot","steps":[{"op":"screenshot","label":"blockydown1"}],"settle_s":1.6}]}

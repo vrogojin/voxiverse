@@ -1,0 +1,7 @@
+{ "name":"hold","description":"climb high and hold altitude with periodic thrust so g1 shot cursor runs","legs":[
+  {"name":"dev on","steps":[{"op":"dev_nav","on":true}],"settle_s":0.8},
+  {"name":"level","steps":[{"op":"look","pitch_deg":-30}],"settle_s":0.3},
+  {"name":"climb big","steps":[{"op":"thrust","dy":1.0,"seconds":34,"gait":"run"}],"settle_s":1.0},
+  {"name":"hold1","steps":[{"op":"thrust","dy":1.0,"seconds":6,"gait":"run"}],"settle_s":0.4},
+  {"name":"hold2","steps":[{"op":"thrust","dy":1.0,"seconds":6,"gait":"run"}],"settle_s":0.4},
+  {"name":"nadir","steps":[{"op":"look","pitch_deg":-85}],"settle_s":0.5}]}

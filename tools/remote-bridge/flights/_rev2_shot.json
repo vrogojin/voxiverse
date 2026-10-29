@@ -1,0 +1,5 @@
+{ "name":"rev2_shot","description":"noon horizon view of near<->far after REV2","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":1.5},
+  {"name":"up","steps":[{"op":"set_alt","alt":110}],"settle_s":3.0},
+  {"name":"look","steps":[{"op":"look","pitch_deg":-14}],"settle_s":1.5},
+  {"name":"shot","steps":[{"op":"screenshot","label":"rev2-nearfar"}],"settle_s":2.5}]}

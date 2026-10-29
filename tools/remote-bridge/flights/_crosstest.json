@@ -1,0 +1,5 @@
+{ "name":"crosstest","description":"horizontal traverse across facet boundaries — block-LOD async crossing stall check","legs":[
+  {"name":"dev on","steps":[{"op":"dev_nav","on":true}],"settle_s":0.8},
+  {"name":"climb bit","steps":[{"op":"thrust","dy":1.0,"seconds":4,"gait":"run"}],"settle_s":0.5},
+  {"name":"traverse A","steps":[{"op":"thrust","dz":1.0,"seconds":15,"gait":"run"}],"settle_s":0.3},
+  {"name":"traverse B","steps":[{"op":"thrust","dz":1.0,"seconds":15,"gait":"run"}],"settle_s":0.3}]}

@@ -1,0 +1,6 @@
+{ "name":"n2l1","description":"BEFORE: near->L1 handoff at S1 release band alt 800","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":0.6},
+  {"name":"freeze time","steps":[{"op":"freeze_time","on":true}],"settle_s":0.4},
+  {"name":"set alt 800","steps":[{"op":"set_alt","alt":800}],"settle_s":0.8},
+  {"name":"freeze player","steps":[{"op":"freeze_player","on":true}],"settle_s":0.4},
+  {"name":"look down","steps":[{"op":"look","pitch_deg":-55}],"settle_s":1.0}]}

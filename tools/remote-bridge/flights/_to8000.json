@@ -1,0 +1,4 @@
+{ "name":"to8000","description":"teleport to alt 8000, noon, hold for viewing","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":0.5},
+  {"name":"alt 8000","steps":[{"op":"set_alt","alt":8000}],"settle_s":1.0},
+  {"name":"hold","steps":[{"op":"freeze_player","on":true}],"settle_s":0.4}]}

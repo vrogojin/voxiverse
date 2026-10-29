@@ -1,0 +1,4 @@
+{ "name":"holdtest","description":"dev on + climb + COAST (no thrust) to test altitude hold","legs":[
+  {"name":"dev on","steps":[{"op":"dev_nav","on":true}],"settle_s":1.0},
+  {"name":"level","steps":[{"op":"look","pitch_deg":-20}],"settle_s":0.5},
+  {"name":"climb","steps":[{"op":"thrust","dy":1.0,"seconds":18,"gait":"run"}],"settle_s":1.0}]}

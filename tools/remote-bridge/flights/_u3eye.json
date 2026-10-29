@@ -1,0 +1,6 @@
+{ "name":"u3eye","description":"noon + modest climb + look down at near/far seam (same-level check)","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":1.2},
+  {"name":"dev on","steps":[{"op":"dev_nav","on":true}],"settle_s":1.0},
+  {"name":"climb","steps":[{"op":"thrust","dy":1.0,"seconds":2,"gait":"run"}],"settle_s":1.2},
+  {"name":"look","steps":[{"op":"look","pitch_deg":-16}],"settle_s":1.5},
+  {"name":"shoot","steps":[{"op":"screenshot","label":"u3eye"}],"settle_s":2.5}]}

@@ -1,0 +1,2 @@
+{ "name":"probe","description":"grant probe: screenshot only, no motion","legs":[
+  {"name":"probe","steps":[{"op":"screenshot","label":"grant-probe"}],"settle_s":0.3}]}

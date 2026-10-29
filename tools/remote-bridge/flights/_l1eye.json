@@ -1,0 +1,6 @@
+{ "name":"l1eye","description":"noon + modest climb + look down at L1 band + long hold for a clean daylight frame","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":2.0},
+  {"name":"dev on","steps":[{"op":"dev_nav","on":true}],"settle_s":0.8},
+  {"name":"climb","steps":[{"op":"thrust","dy":1.0,"seconds":5,"gait":"run"}],"settle_s":1.0},
+  {"name":"look down","steps":[{"op":"look","pitch_deg":-35}],"settle_s":1.0},
+  {"name":"hold noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":6.0}]}

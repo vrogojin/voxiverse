@@ -1,0 +1,4 @@
+{ "name":"litzoom","description":"turn toward lit terrain, aim down, capture","legs":[
+  {"name":"turn","steps":[{"op":"turn","degrees":55,"dir":"left"}],"settle_s":0.3},
+  {"name":"aim","steps":[{"op":"look","pitch_deg":-50}],"settle_s":0.2},
+  {"name":"settle","steps":[{"op":"wait","seconds":1}],"settle_s":0.1}]}

@@ -1,0 +1,3 @@
+{ "name":"freetest","description":"teleport to fresh open ground, test if movement frees + lag clears","legs":[
+  {"name":"tp","steps":[{"op":"teleport","lat_deg":33,"lon_deg":80,"alt":25}],"settle_s":5.0},
+  {"name":"fwd","steps":[{"op":"thrust","dz":1.0,"seconds":2.0,"gait":"run"}],"settle_s":1.5}]}

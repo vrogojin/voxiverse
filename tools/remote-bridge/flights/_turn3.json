@@ -1,0 +1,3 @@
+{ "name":"turn3","description":"yaw 90 + pitch down","legs":[
+  {"name":"turn","steps":[{"op":"turn","degrees":90,"dir":"right"}],"settle_s":0.3},
+  {"name":"pitch","steps":[{"op":"look","pitch_deg":-40}],"settle_s":0.1}]}

@@ -1,0 +1,7 @@
+{ "name":"far_stab","description":"frozen far view, two shots 6s apart — is FAR terrain changing?","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":1.0},
+  {"name":"up","steps":[{"op":"set_alt","alt":420}],"settle_s":3.0},
+  {"name":"freeze","steps":[{"op":"freeze_player","on":true}],"settle_s":0.5},
+  {"name":"look","steps":[{"op":"look","pitch_deg":-22}],"settle_s":1.5},
+  {"name":"shotA","steps":[{"op":"screenshot","label":"far_A"}],"settle_s":6.0},
+  {"name":"shotB","steps":[{"op":"screenshot","label":"far_B"}],"settle_s":2.0}]}

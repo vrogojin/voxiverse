@@ -1,0 +1,6 @@
+{ "name":"blob-day","description":"midday at the mesa grey-blob spot (already here), frame it","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":13}],"settle_s":2.0},
+  {"name":"frame","steps":[{"op":"look","pitch_deg":-14}],"settle_s":2.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"blob-day-a"}],"settle_s":2.0},
+  {"name":"pan","steps":[{"op":"look","pitch_deg":-6}],"settle_s":2.0},
+  {"name":"shot2","steps":[{"op":"screenshot","label":"blob-day-b"}],"settle_s":2.0}]}

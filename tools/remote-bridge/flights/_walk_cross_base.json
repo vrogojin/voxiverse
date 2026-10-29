@@ -1,0 +1,9 @@
+{ "name":"walkcross-base","description":"run forward across facet boundaries, measure crossing spikes",
+  "legs":[ {"name":"run forward 768","steps":[
+    {"op":"move","blocks":128,"heading":"forward","gait":"run"},
+    {"op":"move","blocks":128,"heading":"forward","gait":"run"},
+    {"op":"move","blocks":128,"heading":"forward","gait":"run"},
+    {"op":"move","blocks":128,"heading":"forward","gait":"run"},
+    {"op":"move","blocks":128,"heading":"forward","gait":"run"},
+    {"op":"move","blocks":128,"heading":"forward","gait":"run"}
+  ],"settle_s":1.0} ] }

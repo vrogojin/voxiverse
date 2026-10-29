@@ -1,0 +1,9 @@
+{ "name":"transect","description":"walk a transect across the slope to cross a facet edge","legs":[
+  {"name":"settle","steps":[{"op":"wait","seconds":8}],"settle_s":1.0},
+  {"name":"level","steps":[{"op":"look","pitch_deg":-8}],"settle_s":1.0},
+  {"name":"w1","steps":[{"op":"move","blocks":64,"heading":"forward","gait":"walk"}],"settle_s":3.0},
+  {"name":"w2","steps":[{"op":"move","blocks":64,"heading":"forward","gait":"walk"}],"settle_s":3.0},
+  {"name":"w3","steps":[{"op":"move","blocks":64,"heading":"forward","gait":"walk"}],"settle_s":3.0},
+  {"name":"w4","steps":[{"op":"move","blocks":64,"heading":"forward","gait":"walk"}],"settle_s":3.0},
+  {"name":"w5","steps":[{"op":"move","blocks":64,"heading":"forward","gait":"walk"}],"settle_s":3.0},
+  {"name":"w6","steps":[{"op":"move","blocks":64,"heading":"forward","gait":"walk"}],"settle_s":3.0}]}

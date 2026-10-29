@@ -1,0 +1,10 @@
+{ "name":"walkvillage","description":"walk around near a village to capture ground movement jerkiness","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":1},
+  {"name":"w1","steps":[{"op":"thrust","dz":1.0,"seconds":18,"gait":"run"}],"settle_s":0.5},
+  {"name":"t1","steps":[{"op":"look","yaw_deg":90}],"settle_s":0.3},
+  {"name":"w2","steps":[{"op":"thrust","dz":1.0,"seconds":18,"gait":"run"}],"settle_s":0.5},
+  {"name":"t2","steps":[{"op":"look","yaw_deg":90}],"settle_s":0.3},
+  {"name":"w3","steps":[{"op":"thrust","dz":1.0,"seconds":18,"gait":"run"}],"settle_s":0.5},
+  {"name":"t3","steps":[{"op":"look","yaw_deg":90}],"settle_s":0.3},
+  {"name":"w4","steps":[{"op":"thrust","dz":1.0,"seconds":18,"gait":"run"}],"settle_s":0.5}
+]}

@@ -1,0 +1,2 @@
+{ "name":"landshot","description":"fresh look for a landing frame","legs":[
+  {"name":"look","steps":[{"op":"look","pitch_deg":-18}],"settle_s":3.0}]}

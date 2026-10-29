@@ -1,0 +1,4 @@
+{ "name":"p2frame","description":"settle + horizon frame (far relief intact?)","legs":[
+  {"name":"w","steps":[{"op":"wait","seconds":40}],"settle_s":2.0},
+  {"name":"aim","steps":[{"op":"look","pitch_deg":-3}],"settle_s":1.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"p2-horizon"}],"settle_s":2.0}]}

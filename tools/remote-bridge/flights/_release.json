@@ -1,0 +1,5 @@
+{ "name":"release","description":"unfreeze the player + noon daylight so the user can fly and see it","legs":[
+  {"name":"unfreeze","steps":[{"op":"freeze_player","on":false}],"settle_s":0.5},
+  {"name":"freetime","steps":[{"op":"freeze_time","on":false}],"settle_s":0.5},
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":0.5}
+]}

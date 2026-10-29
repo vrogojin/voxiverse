@@ -1,0 +1,3 @@
+{ "name":"climbstep4","description":"stage 4: climb well past to ~500+ blocks","legs":[
+  {"name":"climb","steps":[{"op":"thrust","dy":1.0,"seconds":6,"gait":"run"}],"settle_s":1.5},
+  {"name":"shoot","steps":[{"op":"screenshot","label":"climbtop"}],"settle_s":1.5}]}

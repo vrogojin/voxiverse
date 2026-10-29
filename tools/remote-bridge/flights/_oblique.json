@@ -1,0 +1,4 @@
+{ "name":"oblique","description":"lower alt for oblique surface view","legs":[
+  {"name":"down","steps":[{"op":"set_alt","alt":650}],"settle_s":3.0},
+  {"name":"w","steps":[{"op":"wait","seconds":25}],"settle_s":25.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"final-oblique"}],"settle_s":2.0}]}

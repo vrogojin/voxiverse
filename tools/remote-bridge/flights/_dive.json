@@ -1,0 +1,4 @@
+{ "name":"dive","description":"pitch toward lit surface + descend closer","legs":[
+  {"name":"aim","steps":[{"op":"look","pitch_deg":-55}],"settle_s":0.2},
+  {"name":"dive","steps":[{"op":"thrust","dz":1.0,"seconds":90,"gait":"run"}],"settle_s":0.3},
+  {"name":"reaim","steps":[{"op":"look","pitch_deg":-45}],"settle_s":0.1}]}

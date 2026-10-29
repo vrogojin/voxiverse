@@ -1,0 +1,6 @@
+{ "name":"fallthru","description":"lat8/lon2 fall-through test","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":0.4},
+  {"name":"tp","steps":[{"op":"teleport","lat_deg":8,"lon_deg":2,"alt":30}],"settle_s":1.0},
+  {"name":"settle","steps":[{"op":"wait","seconds":5}],"settle_s":5.0},
+  {"name":"look","steps":[{"op":"look","pitch_deg":-35}],"settle_s":1.0},
+  {"name":"shot","steps":[{"op":"screenshot"}],"settle_s":1.8}]}

@@ -1,0 +1,4 @@
+{ "name":"trav3","description":"keep traversing toward the day side","legs":[
+  {"name":"t1","steps":[{"op":"thrust","dz":1.0,"seconds":115,"gait":"run"}],"settle_s":0.3},
+  {"name":"t2","steps":[{"op":"thrust","dz":1.0,"seconds":115,"gait":"run"}],"settle_s":0.3},
+  {"name":"look","steps":[{"op":"look","pitch_deg":-20}],"settle_s":0.2}]}

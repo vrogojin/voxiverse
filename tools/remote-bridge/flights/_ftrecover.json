@@ -1,0 +1,7 @@
+{ "name":"ftrecover","description":"recover from orbit to surface at the band spot, land clean",
+  "legs":[
+    {"name":"dev off","steps":[{"op":"dev_nav","on":false}],"settle_s":0.5},
+    {"name":"tp surface","steps":[{"op":"teleport","lat_deg":8,"lon_deg":2,"alt":22}],"settle_s":4.0},
+    {"name":"settle","steps":[{"op":"wait","seconds":4}],"settle_s":4.0,"expect":{"alt_gt":-1}},
+    {"name":"look","steps":[{"op":"look","pitch_deg":-8}],"settle_s":1.0},
+    {"name":"shot","steps":[{"op":"screenshot","label":"ftrecover"}],"settle_s":1.8}]}

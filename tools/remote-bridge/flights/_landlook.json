@@ -1,0 +1,3 @@
+{ "name":"landlook","description":"look down to see the landing + release all freezes","legs":[
+  {"name":"look down","steps":[{"op":"look","pitch_deg":-30}],"settle_s":2.0},
+  {"name":"resume time","steps":[{"op":"freeze_time","on":false}],"settle_s":0.4}]}

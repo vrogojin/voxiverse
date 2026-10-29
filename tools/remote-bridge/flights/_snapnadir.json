@@ -1,0 +1,8 @@
+{ "name":"snapnadir","description":"orbit nadir shot","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":0.4},
+  {"name":"ftime","steps":[{"op":"freeze_time","on":true}],"settle_s":0.3},
+  {"name":"alt","steps":[{"op":"set_alt","alt":8000}],"settle_s":1.5},
+  {"name":"fplayer","steps":[{"op":"freeze_player","on":true}],"settle_s":0.3},
+  {"name":"lock","steps":[{"op":"look","planet_lock":true,"pitch_off_deg":0}],"settle_s":1.5},
+  {"name":"bake","steps":[{"op":"wait","seconds":4}],"settle_s":4.0},
+  {"name":"shot","steps":[{"op":"screenshot"}],"settle_s":2.0}]}

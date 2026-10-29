@@ -1,0 +1,7 @@
+{ "name":"guard-ab","description":"#132 FP_FT_NEAR_GUARD live A/B — forest near/far tree band, credit-0 double-render heal check","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":13}],"settle_s":1.5},
+  {"name":"tp","steps":[{"op":"teleport","lat_deg":-40.15,"lon_deg":-153.95,"alt":26,"yaw_deg":110,"pitch_deg":-5}],"settle_s":18.0},
+  {"name":"s0","steps":[{"op":"screenshot","label":"guard-a"}],"settle_s":10.0},
+  {"name":"s1","steps":[{"op":"screenshot","label":"guard-b"}],"settle_s":10.0},
+  {"name":"turn","steps":[{"op":"turn","dir":"right","deg":45}],"settle_s":8.0},
+  {"name":"s2","steps":[{"op":"screenshot","label":"guard-c"}],"settle_s":6.0}]}

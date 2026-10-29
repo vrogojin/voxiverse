@@ -1,0 +1,7 @@
+{ "name":"repro-lod","description":"repro far-too-low (horizon) + facet misalignment (orbit/deorbit)","legs":[
+  {"name":"dev on","steps":[{"op":"dev_nav","on":true}],"settle_s":0.4},
+  {"name":"horizon look","steps":[{"op":"look","pitch_deg":-4},{"op":"screenshot","label":"ground-horizon"}],"settle_s":0.5},
+  {"name":"climb","steps":[{"op":"thrust","dy":1.0,"seconds":30,"gait":"run"},{"op":"look","pitch_deg":-35},{"op":"screenshot","label":"orbit-nadir"}],"settle_s":1.0},
+  {"name":"desc a","steps":[{"op":"thrust","dy":-1.0,"seconds":9,"gait":"run"},{"op":"screenshot","label":"deorbit-mid"}],"settle_s":0.6},
+  {"name":"desc b","steps":[{"op":"thrust","dy":-1.0,"seconds":9,"gait":"run"},{"op":"screenshot","label":"deorbit-low"}],"settle_s":0.6}
+]}

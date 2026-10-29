@@ -1,0 +1,4 @@
+{ "name":"l1eye4","description":"drop low then hold+look — rise through L1 band as frame catches up","legs":[
+  {"name":"down","steps":[{"op":"thrust","dy":-1.0,"seconds":5,"gait":"run"}],"settle_s":1.0},
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":0.5},
+  {"name":"look","steps":[{"op":"look","pitch_deg":-30}],"settle_s":8.0}]}

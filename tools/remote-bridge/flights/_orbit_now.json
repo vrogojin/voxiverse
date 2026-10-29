@@ -1,0 +1,7 @@
+{ "name":"orbit-now","description":"settle, daytime, ascend to orbit, nadir","legs":[
+  {"name":"settle","steps":[{"op":"wait","seconds":12}],"settle_s":0.5},
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":1.5},
+  {"name":"devnav","steps":[{"op":"dev_nav","on":true}],"settle_s":1.5,"expect":{"dev_nav":true}},
+  {"name":"ascend","steps":[{"op":"thrust","dy":1.0,"seconds":32,"gait":"run"}],"settle_s":3.0,"expect":{"alt_gt":384}},
+  {"name":"nadir","steps":[{"op":"look","planet_lock":true}],"settle_s":2.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"orbit-trees"}],"settle_s":2.0}]}

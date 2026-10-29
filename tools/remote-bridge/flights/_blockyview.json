@@ -1,0 +1,6 @@
+{ "name":"blockyview","description":"modest climb + horizon look to eyeball the blocky far-ring terrain (night)","legs":[
+  {"name":"dev on","steps":[{"op":"dev_nav","on":true}],"settle_s":0.3},
+  {"name":"level","steps":[{"op":"look","pitch_deg":0}],"settle_s":0.2},
+  {"name":"climb","steps":[{"op":"thrust","dy":1.0,"seconds":9,"gait":"run"}],"settle_s":0.6},
+  {"name":"look horizon","steps":[{"op":"look","pitch_deg":-8}],"settle_s":0.5},
+  {"name":"shoot","steps":[{"op":"screenshot","label":"blockyview1"}],"settle_s":1.8}]}

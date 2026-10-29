@@ -1,0 +1,8 @@
+{ "name":"chop","description":"cut the trunk, watch canopy detach + settle","legs":[
+  {"name":"aim","steps":[{"op":"look","pitch_deg":2}],"settle_s":0.8},
+  {"name":"b1","steps":[{"op":"break"}],"settle_s":0.6},
+  {"name":"b2","steps":[{"op":"break"}],"settle_s":0.6},
+  {"name":"b3","steps":[{"op":"break"}],"settle_s":0.6},
+  {"name":"shot1","steps":[{"op":"screenshot","label":"chop-t0"}],"settle_s":1.0},
+  {"name":"watch","steps":[{"op":"wait","seconds":9}],"settle_s":9.0},
+  {"name":"shot2","steps":[{"op":"screenshot","label":"chop-t9"}],"settle_s":1.8}]}

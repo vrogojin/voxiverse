@@ -1,0 +1,4 @@
+{ "name":"tb_shot","description":"nadir shot for colour eyeball","legs":[
+  {"name":"nadir","steps":[{"op":"look","pitch_deg":-85}],"settle_s":1.5},
+  {"name":"shot","steps":[{"op":"screenshot","label":"tilebake-colours"}],"settle_s":2.5}
+]}

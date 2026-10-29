@@ -1,0 +1,3 @@
+{ "name":"ttu2","description":"reload + full boot->settle window","legs":[
+  {"name":"reload","steps":[{"op":"reload"}],"settle_s":3.0},
+  {"name":"w","steps":[{"op":"wait","seconds":50}],"settle_s":50.0}]}

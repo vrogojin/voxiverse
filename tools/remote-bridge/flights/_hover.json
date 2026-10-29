@@ -1,0 +1,6 @@
+{ "name":"hover","description":"climb then hover at altitude (fly, no fall)",
+  "legs":[
+    {"name":"dev_nav on","steps":[{"op":"dev_nav","on":true}],"settle_s":0.5},
+    {"name":"climb","steps":[{"op":"thrust","dy":1.0,"seconds":22,"gait":"run"}],"settle_s":1.0},
+    {"name":"hover 16s","steps":[{"op":"wait","seconds":16}],"settle_s":0.5,"expect":{"alt_gt":384,"flying":true}}
+  ] }

@@ -1,0 +1,2 @@
+{ "name":"rev4_reload","description":"reload to REV4 + noon + horizon view","legs":[
+  {"name":"reload","steps":[{"op":"reload"}],"settle_s":3.0}]}

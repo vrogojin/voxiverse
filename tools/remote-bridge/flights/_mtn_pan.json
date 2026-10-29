@@ -1,0 +1,5 @@
+{ "name":"mtn-pan","description":"pan up to see the broader mountain surface (blob check)","legs":[
+  {"name":"up","steps":[{"op":"look","pitch_deg":-25}],"settle_s":1.5},
+  {"name":"s1","steps":[{"op":"screenshot","label":"mtn-pan-1"}],"settle_s":1.5},
+  {"name":"t","steps":[{"op":"look","yaw_deg":60}],"settle_s":1.2},
+  {"name":"s2","steps":[{"op":"screenshot","label":"mtn-pan-2"}],"settle_s":1.5}]}

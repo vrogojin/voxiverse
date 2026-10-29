@@ -1,0 +1,18 @@
+{ "name":"ftdrill2","description":"FALL-THROUGH BAND DRILL v2: cross facet seams at speed (ground + descent), assert alt>-1",
+  "legs":[
+    {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":0.4},
+    {"name":"tp band","steps":[{"op":"teleport","lat_deg":8,"lon_deg":2,"alt":30}],"settle_s":3.0,"expect":{"alt_gt":-1}},
+    {"name":"E1","steps":[{"op":"thrust","dx":1.0,"seconds":12,"gait":"run"}],"settle_s":0.8,"expect":{"alt_gt":-1}},
+    {"name":"E2","steps":[{"op":"thrust","dx":1.0,"seconds":12,"gait":"run"}],"settle_s":0.8,"expect":{"alt_gt":-1}},
+    {"name":"E3","steps":[{"op":"thrust","dx":1.0,"seconds":12,"gait":"run"}],"settle_s":0.8,"expect":{"alt_gt":-1}},
+    {"name":"E4","steps":[{"op":"thrust","dx":1.0,"seconds":12,"gait":"run"}],"settle_s":0.8,"expect":{"alt_gt":-1}},
+    {"name":"E5","steps":[{"op":"thrust","dx":1.0,"seconds":12,"gait":"run"}],"settle_s":0.8,"expect":{"alt_gt":-1}},
+    {"name":"N1","steps":[{"op":"thrust","dz":1.0,"seconds":12,"gait":"run"}],"settle_s":0.8,"expect":{"alt_gt":-1}},
+    {"name":"N2","steps":[{"op":"thrust","dz":1.0,"seconds":12,"gait":"run"}],"settle_s":0.8,"expect":{"alt_gt":-1}},
+    {"name":"N3","steps":[{"op":"thrust","dz":1.0,"seconds":12,"gait":"run"}],"settle_s":0.8,"expect":{"alt_gt":-1}},
+    {"name":"climb","steps":[{"op":"dev_nav","on":true}],"settle_s":0.5},
+    {"name":"up","steps":[{"op":"thrust","dy":1.0,"seconds":10,"gait":"run"}],"settle_s":0.8},
+    {"name":"skimE","steps":[{"op":"thrust","dx":1.0,"seconds":18,"gait":"run"}],"settle_s":0.8},
+    {"name":"descend-across","steps":[{"op":"thrust","dx":1.0,"dy":-1.0,"seconds":16,"gait":"run"}],"settle_s":1.0},
+    {"name":"land off","steps":[{"op":"dev_nav","on":false}],"settle_s":4.0,"expect":{"alt_gt":-1}},
+    {"name":"shot","steps":[{"op":"screenshot","label":"ftdrill2"}],"settle_s":1.8}]}

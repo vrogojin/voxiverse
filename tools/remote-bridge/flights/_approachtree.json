@@ -1,0 +1,4 @@
+{ "name":"approachtree","description":"walk to the centre tree, aim at trunk base","legs":[
+  {"name":"fwd","steps":[{"op":"thrust","dz":1.0,"seconds":1.6,"gait":"run"}],"settle_s":1.0},
+  {"name":"aimtrunk","steps":[{"op":"look","pitch_deg":-16}],"settle_s":1.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"approachtree"}],"settle_s":1.8}]}

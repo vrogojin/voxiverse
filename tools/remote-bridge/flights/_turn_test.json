@@ -1,0 +1,4 @@
+{ "name":"turn_test","description":"camera turns — R-A stability (no evict/flicker on heading change)","legs":[
+  {"name":"t1","steps":[{"op":"turn","yaw_deg":120}],"settle_s":2.0},
+  {"name":"t2","steps":[{"op":"turn","yaw_deg":-240}],"settle_s":2.0},
+  {"name":"t3","steps":[{"op":"turn","yaw_deg":120}],"settle_s":2.0}]}

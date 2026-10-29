@@ -1,0 +1,3 @@
+{ "name":"near-now","description":"capture near tree resolution at low alt","legs":[
+  {"name":"aim","steps":[{"op":"look","pitch_deg":-12}],"settle_s":1.5},
+  {"name":"s","steps":[{"op":"screenshot","label":"near-trees"}],"settle_s":2.0}]}

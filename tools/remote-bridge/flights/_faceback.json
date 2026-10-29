@@ -1,0 +1,4 @@
+{ "name":"faceback","description":"turn 180 to face the trees for the user","legs":[
+  {"name":"turn","steps":[{"op":"turn","degrees":180,"dir":"right"}],"settle_s":1.5},
+  {"name":"look","steps":[{"op":"look","pitch_deg":0}],"settle_s":1.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"faceback"}],"settle_s":1.8}]}

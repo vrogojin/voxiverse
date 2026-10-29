@@ -1,0 +1,6 @@
+{ "name":"waitorbit","description":"wait for load, force orbit","legs":[
+  {"name":"w1","steps":[{"op":"wait","seconds":50}],"settle_s":50.0},
+  {"name":"nav","steps":[{"op":"dev_nav","on":true}],"settle_s":1.0},
+  {"name":"up","steps":[{"op":"set_alt","alt":1500}],"settle_s":3.0},
+  {"name":"w2","steps":[{"op":"wait","seconds":15}],"settle_s":15.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"final-b"}],"settle_s":2.0}]}

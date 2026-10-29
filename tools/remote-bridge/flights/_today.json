@@ -1,0 +1,4 @@
+{ "name":"today","description":"fly over terminator to be above day terrain, aim down","legs":[
+  {"name":"level","steps":[{"op":"look","pitch_deg":0}],"settle_s":0.2},
+  {"name":"cross","steps":[{"op":"thrust","dz":1.0,"seconds":115,"gait":"run"}],"settle_s":0.3},
+  {"name":"down","steps":[{"op":"look","pitch_deg":-85}],"settle_s":0.15}]}

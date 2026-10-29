@@ -1,0 +1,4 @@
+{ "name":"coast","description":"near orbit, unfreeze to coast","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":0.4},
+  {"name":"alt","steps":[{"op":"set_alt","alt":2500}],"settle_s":1.0},
+  {"name":"unfreeze","steps":[{"op":"freeze_player","on":false}],"settle_s":0.4}]}

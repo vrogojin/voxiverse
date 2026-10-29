@@ -1,0 +1,8 @@
+{ "name":"g3v2perf","description":"reload + orbit + perf check (silent)","legs":[
+  {"name":"reload","steps":[{"op":"reload"}],"settle_s":3.0},
+  {"name":"boot","steps":[{"op":"wait","seconds":30}],"settle_s":30.0},
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":1.0},
+  {"name":"orbit","steps":[{"op":"nav","verb":"orbit"}],"settle_s":2.0},
+  {"name":"up","steps":[{"op":"set_alt","alt":1500}],"settle_s":2.0},
+  {"name":"build","steps":[{"op":"wait","seconds":25}],"settle_s":25.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"g3v2-orbit"}],"settle_s":2.0}]}

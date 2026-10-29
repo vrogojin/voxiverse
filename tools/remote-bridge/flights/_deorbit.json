@@ -1,0 +1,5 @@
+{ "name":"deorbit","description":"from O-coast, thrust retrograde to de-orbit (coast + altitude changing)",
+  "legs":[
+    {"name":"retrograde","steps":[{"op":"thrust","dx":-1.0,"seconds":10,"gait":"run"}],"settle_s":0.3},
+    {"name":"coast down","steps":[{"op":"wait","seconds":22}],"settle_s":0.2}
+  ] }

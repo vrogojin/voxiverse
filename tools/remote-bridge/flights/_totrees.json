@@ -1,0 +1,5 @@
+{ "name":"totrees","description":"turn to the left-horizon trees and approach","legs":[
+  {"name":"turn","steps":[{"op":"turn","degrees":42,"dir":"left"}],"settle_s":1.2},
+  {"name":"fwd","steps":[{"op":"thrust","dz":1.0,"seconds":3.0,"gait":"run"}],"settle_s":1.2},
+  {"name":"look","steps":[{"op":"look","pitch_deg":-2}],"settle_s":1.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"totrees"}],"settle_s":1.8}]}

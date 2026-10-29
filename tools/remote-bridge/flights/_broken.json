@@ -1,0 +1,2 @@
+{ "name":"broken","description":"capture current view","legs":[
+  {"name":"shot","steps":[{"op":"screenshot","label":"broken"}],"settle_s":1.5}]}

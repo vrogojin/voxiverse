@@ -1,0 +1,5 @@
+{ "name":"nadirwait","description":"nadir aim + long g2 sweep + re-emit catch-up","legs":[
+  {"name":"aim","steps":[{"op":"look","planet_lock":true,"pitch_deg":-90}],"settle_s":2.0},
+  {"name":"sweep1","steps":[{"op":"wait","seconds":25}],"settle_s":25.0},
+  {"name":"sweep2","steps":[{"op":"wait","seconds":25}],"settle_s":25.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"orbit-relief-b"}],"settle_s":2.0}]}

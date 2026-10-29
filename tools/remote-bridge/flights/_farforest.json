@@ -1,0 +1,5 @@
+{ "name":"farforest","description":"teleport far from spawn, find trees for sink double-check","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":0.5},
+  {"name":"tp","steps":[{"op":"teleport","lat_deg":46,"lon_deg":178,"alt":20}],"settle_s":6.0,"expect":{"alt_gt":-1}},
+  {"name":"look","steps":[{"op":"look","pitch_deg":-2}],"settle_s":2.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"farforest"}],"settle_s":2.0}]}

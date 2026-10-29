@@ -1,0 +1,4 @@
+{ "name":"ds","description":"sweep to noon at same spot","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":1.5},
+  {"name":"bake","steps":[{"op":"wait","seconds":2}],"settle_s":2.0},
+  {"name":"shot","steps":[{"op":"screenshot"}],"settle_s":1.8}]}

@@ -1,0 +1,7 @@
+{ "name":"fv","description":"vantage over far terrain","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":11}],"settle_s":1.0},
+  {"name":"up","steps":[{"op":"set_alt","alt":40}],"settle_s":1.5},
+  {"name":"fp","steps":[{"op":"freeze_player","on":true}],"settle_s":0.3},
+  {"name":"look","steps":[{"op":"look","pitch_deg":-6}],"settle_s":1.0},
+  {"name":"bake","steps":[{"op":"wait","seconds":4}],"settle_s":4.0},
+  {"name":"shot","steps":[{"op":"screenshot"}],"settle_s":1.8}]}

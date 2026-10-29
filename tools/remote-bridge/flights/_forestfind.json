@@ -1,0 +1,4 @@
+{ "name":"forestfind","description":"find temperate forest with round-canopy trees for chop test","legs":[
+  {"name":"tp","steps":[{"op":"teleport","lat_deg":48,"lon_deg":35,"alt":22}],"settle_s":5.0,"expect":{"alt_gt":-1}},
+  {"name":"look","steps":[{"op":"look","pitch_deg":-3}],"settle_s":2.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"forestfind"}],"settle_s":2.0}]}

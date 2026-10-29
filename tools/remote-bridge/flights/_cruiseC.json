@@ -1,0 +1,3 @@
+{ "name":"cC","description":"cruise while looking at planet","legs":[
+  {"name":"cruise","steps":[{"op":"thrust","cruise":true,"seconds":7}],"settle_s":8.5},
+  {"name":"post","steps":[{"op":"screenshot"}],"settle_s":1.5}]}

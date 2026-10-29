@@ -1,0 +1,8 @@
+{ "name":"descent","description":"staged descent from orbit to landing","legs":[
+  {"name":"dev on","steps":[{"op":"dev_nav","on":true}],"settle_s":0.5},
+  {"name":"desc a","steps":[{"op":"thrust","dy":-1.0,"seconds":8,"gait":"run"},{"op":"screenshot","label":"desc-a"}],"settle_s":0.7},
+  {"name":"desc b","steps":[{"op":"thrust","dy":-1.0,"seconds":8,"gait":"run"},{"op":"screenshot","label":"desc-b"}],"settle_s":0.7},
+  {"name":"desc c","steps":[{"op":"thrust","dy":-1.0,"seconds":8,"gait":"walk"},{"op":"screenshot","label":"desc-c"}],"settle_s":0.7},
+  {"name":"desc d","steps":[{"op":"thrust","dy":-1.0,"seconds":8,"gait":"walk"},{"op":"screenshot","label":"desc-d"}],"settle_s":0.7},
+  {"name":"land","steps":[{"op":"thrust","dy":-1.0,"seconds":12,"gait":"walk"},{"op":"screenshot","label":"landed2"}],"settle_s":1.0}
+]}

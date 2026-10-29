@@ -1,0 +1,4 @@
+{ "name":"nudge","description":"look sweep to force capture","legs":[
+  {"name":"a","steps":[{"op":"look","pitch_deg":-70}],"settle_s":1.0},
+  {"name":"b","steps":[{"op":"look","pitch_deg":-80}],"settle_s":1.0},
+  {"name":"c","steps":[{"op":"look","pitch_deg":-75}],"settle_s":2.5}]}

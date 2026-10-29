@@ -1,0 +1,5 @@
+{ "name":"mesa-level","description":"level view to survey the terrain that replaced the oval","legs":[
+  {"name":"level","steps":[{"op":"look","pitch_deg":2}],"settle_s":3.0},
+  {"name":"s0","steps":[{"op":"screenshot","label":"mesa-level-a"}],"settle_s":3.0},
+  {"name":"turn","steps":[{"op":"turn","dir":"left","deg":60}],"settle_s":3.0},
+  {"name":"s1","steps":[{"op":"screenshot","label":"mesa-level-b"}],"settle_s":2.0}]}

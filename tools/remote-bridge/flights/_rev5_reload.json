@@ -1,0 +1,1 @@
+{ "name":"rev5_reload","description":"reload to REV5","legs":[{"name":"reload","steps":[{"op":"reload"}],"settle_s":3.0}]}

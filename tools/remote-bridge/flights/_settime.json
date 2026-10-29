@@ -1,0 +1,2 @@
+{ "name":"settime","description":"diagnose set_time","legs":[
+  {"name":"noon","steps":[{"op":"set_time","hours":12}],"settle_s":1.5}]}

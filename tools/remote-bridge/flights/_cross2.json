@@ -1,0 +1,2 @@
+{ "name":"cross2","description":"second traverse — diagnose the proc spike","legs":[
+  {"name":"traverse","steps":[{"op":"thrust","dz":1.0,"seconds":18,"gait":"run"}],"settle_s":0.3}]}

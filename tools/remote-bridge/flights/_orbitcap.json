@@ -1,0 +1,6 @@
+{ "name":"orbitcap","description":"noon + climb to orbit + look down","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":0.6},
+  {"name":"freeze time","steps":[{"op":"freeze_time","on":true}],"settle_s":0.4},
+  {"name":"orbit","steps":[{"op":"set_alt","alt":8000}],"settle_s":1.5},
+  {"name":"freeze player","steps":[{"op":"freeze_player","on":true}],"settle_s":0.4},
+  {"name":"look down","steps":[{"op":"look","pitch_deg":-80}],"settle_s":2.5}]}

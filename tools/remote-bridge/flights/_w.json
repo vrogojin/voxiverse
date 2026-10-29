@@ -1,0 +1,2 @@
+{ "name":"w","description":"wait for settle","legs":[
+  {"name":"w1","steps":[{"op":"wait","seconds":55}],"settle_s":55.0}]}

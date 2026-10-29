@@ -1,0 +1,8 @@
+{ "name":"survey","description":"fly up, look down at the concave base, survey for grey","legs":[
+  {"name":"dev","steps":[{"op":"dev_nav","on":true}],"settle_s":1.0},
+  {"name":"up","steps":[{"op":"thrust","dy":1.0,"seconds":3,"gait":"walk"}],"settle_s":2.0},
+  {"name":"settle","steps":[{"op":"wait","seconds":10}],"settle_s":1.0},
+  {"name":"down","steps":[{"op":"look","pitch_deg":-45}],"settle_s":1.5},
+  {"name":"s0","steps":[{"op":"screenshot","label":"surv-0"}],"settle_s":1.5},
+  {"name":"t1","steps":[{"op":"look","yaw_deg":70}],"settle_s":1.2},
+  {"name":"s1","steps":[{"op":"screenshot","label":"surv-1"}],"settle_s":1.5}]}

@@ -1,0 +1,6 @@
+{ "name":"groundday","description":"daylight ground horizon view of far skin block colours","legs":[
+  {"name":"noon","steps":[{"op":"set_time","hours":12}],"settle_s":1.0},
+  {"name":"freeze","steps":[{"op":"freeze_time"}],"settle_s":0.5},
+  {"name":"horizon","steps":[{"op":"look","pitch_deg":-8}],"settle_s":1.0},
+  {"name":"settle","steps":[{"op":"wait","seconds":8}],"settle_s":8.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"ground-day"}],"settle_s":2.0}]}

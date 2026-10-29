@@ -1,0 +1,6 @@
+{ "name":"ff","description":"low orbit freeze fast bake","legs":[
+  {"name":"up","steps":[{"op":"set_alt","alt":650}],"settle_s":2.0},
+  {"name":"dn","steps":[{"op":"dev_nav","on":true}],"settle_s":1.0},
+  {"name":"look","steps":[{"op":"look","planet_lock":true,"pitch_off_deg":0}],"settle_s":1.2},
+  {"name":"fp","steps":[{"op":"freeze_player","on":true}],"settle_s":0.3},
+  {"name":"bake","steps":[{"op":"wait","seconds":25}],"settle_s":25.0}]}

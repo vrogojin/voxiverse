@@ -1,0 +1,4 @@
+{ "name":"lad-low","description":"settle at low alt + capture near tree resolution","legs":[
+  {"name":"settle","steps":[{"op":"wait","seconds":8}],"settle_s":1.0},
+  {"name":"aim","steps":[{"op":"look","pitch_deg":-14}],"settle_s":1.5},
+  {"name":"s","steps":[{"op":"screenshot","label":"lad-3-low"}],"settle_s":2.0}]}

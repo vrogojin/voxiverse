@@ -1,0 +1,6 @@
+{ "name":"u23_a35","description":"U2+U3 at true alt~35: descend to low alt, sustained gentle forward motion, watch cull cost","legs":[
+  {"name":"descend to ~35","steps":[{"op":"thrust","dy":-1.0,"seconds":19,"gait":"run"}],"settle_s":2.0},
+  {"name":"level","steps":[{"op":"look","pitch_deg":-10}],"settle_s":1.0},
+  {"name":"move A","steps":[{"op":"thrust","dz":1.0,"seconds":10,"gait":"walk"}],"settle_s":0.3},
+  {"name":"move B","steps":[{"op":"thrust","dz":1.0,"seconds":10,"gait":"walk"}],"settle_s":0.3},
+  {"name":"move C","steps":[{"op":"thrust","dz":1.0,"seconds":10,"gait":"walk"}],"settle_s":2.0}]}

@@ -1,0 +1,3 @@
+{ "name":"climbstep","description":"stage 1: dev-fly up ~120 blocks","legs":[
+  {"name":"dev on","steps":[{"op":"dev_nav","on":true}],"settle_s":1.0},
+  {"name":"climb","steps":[{"op":"thrust","dy":1.0,"seconds":3,"gait":"run"}],"settle_s":1.0}]}

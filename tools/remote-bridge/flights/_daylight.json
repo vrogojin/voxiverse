@@ -1,0 +1,6 @@
+{ "name":"daylight","description":"light this hemisphere + full bake + shot","legs":[
+  {"name":"t0","steps":[{"op":"set_time","hours":0}],"settle_s":1.0},
+  {"name":"freeze","steps":[{"op":"freeze_time"}],"settle_s":0.5},
+  {"name":"aim","steps":[{"op":"look","planet_lock":true}],"settle_s":1.0},
+  {"name":"bake","steps":[{"op":"wait","seconds":14}],"settle_s":14.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"orbit-day0"}],"settle_s":2.0}]}

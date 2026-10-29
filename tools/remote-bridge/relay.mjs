@@ -40,10 +40,13 @@
 
 import { WebSocketServer } from 'ws';
 import { createServer } from 'node:http';
-import { readFileSync, mkdirSync, appendFileSync, writeFileSync, statSync, readdirSync, unlinkSync, renameSync, existsSync } from 'node:fs';
+import { readFileSync, mkdirSync, appendFileSync, writeFileSync, statSync, readdirSync, unlinkSync, renameSync, existsSync, watch } from 'node:fs';
 import { createHash, createHmac, timingSafeEqual, randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
+// COSMOS-AGENT-CONTROL §5.2 — the query NEVER-OOM caps + validator live in a pure, ws-free module so the
+// caps matrix is unit-testable (validate_step.test.mjs) and the rover (remote_bridge.gd) mirrors ONE source.
+import { validateQueryStep, QUERY_HALF_MAX, QUERY_CELLS_MAX, QUERY_RAY_MAX, validateActStep } from './validate.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -81,9 +84,14 @@ const FRAME_RING = 60;               // keep the newest N frames in frames/ (old
 
 const FRAME_TAG = 0x01;              // ambient frame  [0x01][jpeg]           — must match RemoteBridge.FRAME_TAG
 const SHOT_TAG = 0x02;               // commanded shot [0x02][u16 hlen][hdr][jpeg] — design §3.3
+const QUERY_TAG = 0x03;              // query payload  [0x03][u16 hlen][hdr JSON {seq,id,kind,origin,dims,order,fmt}][u8 ids] — COSMOS-AGENT-CONTROL §5.2
 
 // ── Control caps (design §1.3; validated here AND re-validated on the rover) ──────────────────
-const POLL_MS = parseInt(process.env.REMOTE_BRIDGE_POLL_MS || '500', 10);     // outbox poll cadence (fs.watch is unreliable on bind mounts)
+// COSMOS-AGENT-CONTROL §3.1 (P0-AGENT-LATENCY): the outbox poll floor drops 500 → 100 ms and an
+// fs.watch accelerator (below) forwards on-write. fs.watch stays unreliable on bind mounts, so the
+// poll remains the AUTHORITATIVE reconciliation floor; the watch only shortens the typical wait.
+const POLL_MS = parseInt(process.env.REMOTE_BRIDGE_POLL_MS || '100', 10);     // outbox poll floor (watch accelerates; poll reconciles)
+const WATCH_ENABLED = process.env.REMOTE_BRIDGE_WATCH !== '0';                 // default ON; set REMOTE_BRIDGE_WATCH=0 for the pre-P0 poll-only relay
 const CTRL_PING_MS = parseInt(process.env.REMOTE_BRIDGE_PING_MS || '5000', 10); // control heartbeat while granted
 const CTRL_MAX_MISSED_PINGS = 3;     // missed pongs while granted => drop consent (fail-safe to stop, §5.4)
 const MAX_STEPS = 64;                // steps per sequence
@@ -95,8 +103,27 @@ const STALE_S = 120;                 // `issued` older than this => rejected (a 
 const OP_WHITELIST = new Set(['move', 'turn', 'look', 'wait', 'jump', 'screenshot', 'set_fly', 'stop', 'break', 'place', 'select_slot', 'reload',
   // COSMOS SPACE-FLY (docs/COSMOS-SPACEFLY-DESIGN.md) — dev/test space-nav verbs. Still consent-gated + control-token
   // gated exactly like every op; the relay only ROUTES, the rover re-validates and executes behind the grant.
-  'dev_nav', 'nav', 'thrust', 'roll']);
+  'dev_nav', 'nav', 'thrust', 'roll',
+  // DEV TIME-CHEAT (docs/COSMOS-REMOTE-CONTROL-DESIGN.md) — set celestial time-of-day at the player. The relay
+  // only ROUTES + bounds-checks; the rover re-validates and executes behind the grant, like every op.
+  'set_time',
+  // DEV/TEST INSTRUMENTATION (dev-instrument tooling) — precise camera placement + stable capture: teleport to an
+  // absolute pose, set altitude over the current spot, freeze the celestial clock, freeze the player. Consent- +
+  // control-token gated like every op; the relay only ROUTES + bounds-checks, the rover re-validates + executes.
+  'teleport', 'set_alt', 'freeze_time', 'freeze_player',
+  // COSMOS-AGENT-CONTROL §5 (FP_AGENT_QUERY) — structured world reads: a box of block ids over the
+  // neighbourhood, and a DDA raycast (default = the aim ray). Consent- + control-token gated like every
+  // op; the relay only ROUTES + bounds-checks (never-OOM caps below), the rover re-validates + executes.
+  'query_box', 'query_ray',
+  // COSMOS-AGENT-AUTONOMY — actuation ops. Consent- + FP_AGENT_ACT/NAV/SKILL gated like every op; the relay
+  // routes + shape-caps (validateActStep), the rover re-caps + flag-gates + executes behind the grant.
+  'break_cell', 'place_cell', 'aim_cell', 'goto', 'chop_tree']);
 const MAX_HOLD_S = 120;              // SPACE-FLY: cap on a single thrust/roll timed HELD-input step
+const TELEPORT_ALT_MIN = -64;        // DEV: min altitude (blocks above the local surface) — allow a small underground peek
+const TELEPORT_ALT_MAX = 200000;     // DEV: max altitude (blocks) — deep space, but finite
+const TELEPORT_XYZ_MAX = 1e6;        // DEV: |x|,|y|,|z| bound for absolute lattice teleport (finite, generous)
+// COSMOS-AGENT-CONTROL §5.2 — NEVER-OOM query caps (QUERY_HALF_MAX/CELLS_MAX/RAY_MAX) are imported from
+// validate.mjs and enforced HERE (validateStep), on the rover (_validate_cmd) AND in block_box_slice.
 
 // ── Token ────────────────────────────────────────────────────────────────────────────────────
 function loadToken() {
@@ -249,8 +276,9 @@ function okEst(est) { return { ok: true, est }; }
 // that could be interpreted elsewhere (the relay only routes; the rover re-validates against reach).
 function validTarget(t) {
   if (typeof t === 'string') return t === 'aim' || t === 'look';
-  if (Array.isArray(t)) return t.length === 3 && t.every((n) => typeof n === 'number' && isFinite(n));
-  return typeof t === 'object' && t !== null;
+  // AGENT-AUTONOMY: [x,y,z] arrays are NO LONGER accepted here — they never broke by cell (silent aim-downgrade);
+  // absolute-cell mutation is break_cell/place_cell. The {dx,dy,dz} offset object stays valid.
+  return typeof t === 'object' && t !== null && !Array.isArray(t);
 }
 
 function validateStep(st) {
@@ -311,18 +339,71 @@ function validateStep(st) {
       if (st.dir !== undefined && !['left', 'right'].includes(st.dir)) return rej('caps', `bad roll dir '${st.dir}'`);
       return okEst(st.seconds);
     }
+    case 'set_time': {                                   // DEV TIME-CHEAT: local_hours ∈ [0,24]; optional sun_elev_deg ∈ [-90,90]
+      if (typeof st.local_hours !== 'number' || !isFinite(st.local_hours) || st.local_hours < 0 || st.local_hours > 24)
+        return rej('caps', 'set_time.local_hours must be in [0,24]');
+      if (st.sun_elev_deg !== undefined && (typeof st.sun_elev_deg !== 'number' || !isFinite(st.sun_elev_deg) || st.sun_elev_deg < -90 || st.sun_elev_deg > 90))
+        return rej('caps', 'set_time.sun_elev_deg must be in [-90,90]');
+      return okEst(0.2);
+    }
+    case 'teleport': {                                   // DEV: EITHER {x,y,z} (active-facet lattice) OR {lat_deg,lon_deg,alt}
+      const hasGeo = st.lat_deg !== undefined || st.lon_deg !== undefined;
+      const hasXyz = st.x !== undefined || st.y !== undefined || st.z !== undefined;
+      if (hasGeo && hasXyz) return rej('caps', 'teleport: give EITHER {x,y,z} OR {lat_deg,lon_deg,alt}, not both');
+      if (hasGeo) {
+        if (typeof st.lat_deg !== 'number' || !isFinite(st.lat_deg) || st.lat_deg < -90 || st.lat_deg > 90) return rej('caps', 'teleport.lat_deg must be in [-90,90]');
+        if (typeof st.lon_deg !== 'number' || !isFinite(st.lon_deg) || st.lon_deg < -180 || st.lon_deg > 180) return rej('caps', 'teleport.lon_deg must be in [-180,180]');
+        if (typeof st.alt !== 'number' || !isFinite(st.alt) || st.alt < TELEPORT_ALT_MIN || st.alt > TELEPORT_ALT_MAX) return rej('caps', `teleport.alt must be in [${TELEPORT_ALT_MIN},${TELEPORT_ALT_MAX}]`);
+      } else if (hasXyz) {
+        for (const k of ['x', 'y', 'z']) if (typeof st[k] !== 'number' || !isFinite(st[k]) || Math.abs(st[k]) > TELEPORT_XYZ_MAX) return rej('caps', `teleport.${k} must be finite, |.| <= ${TELEPORT_XYZ_MAX}`);
+      } else return rej('caps', 'teleport needs {x,y,z} or {lat_deg,lon_deg,alt}');
+      return okEst(0.5);
+    }
+    case 'set_alt': {                                    // DEV: teleport to `alt` above the current sub-player surface
+      if (typeof st.alt !== 'number' || !isFinite(st.alt) || st.alt < TELEPORT_ALT_MIN || st.alt > TELEPORT_ALT_MAX) return rej('caps', `set_alt.alt must be in [${TELEPORT_ALT_MIN},${TELEPORT_ALT_MAX}]`);
+      return okEst(0.5);
+    }
+    case 'freeze_time': {                                // DEV: hold/resume the celestial clock
+      if (typeof st.on !== 'boolean') return rej('caps', 'freeze_time.on must be a bool');
+      return okEst(0.2);
+    }
+    case 'freeze_player': {                              // DEV: pin/release the player for a stationary capture
+      if (typeof st.on !== 'boolean') return rej('caps', 'freeze_player.on must be a bool');
+      return okEst(0.2);
+    }
     case 'break': {                                     // D5 world mutation — routed the same, still consent-gated
+      // AGENT-AUTONOMY hardening: a [x,y,z] array target NEVER broke by cell (the executor silently downgraded
+      // it to "aim") — reject it loudly instead of validating a command with different semantics than sent.
+      if (Array.isArray(st.target)) return rej('caps', 'array target never breaks by cell — use break_cell');
       if (st.target === undefined || !validTarget(st.target)) return rej('caps', 'break.target invalid');
       return okEst(0.5);
     }
     case 'place': {
       if (st.block === undefined || (typeof st.block !== 'number' && typeof st.block !== 'string')) return rej('caps', 'place.block required');
+      if (Array.isArray(st.target)) return rej('caps', 'array target never places by cell — use place_cell');
       if (st.target === undefined || !validTarget(st.target)) return rej('caps', 'place.target invalid');
       return okEst(0.5);
     }
     case 'select_slot': {
       if (typeof st.n !== 'number' || !Number.isInteger(st.n) || st.n < 0 || st.n > 15) return rej('caps', 'select_slot.n out of range');
       return okEst(0.1);
+    }
+    // COSMOS-AGENT-CONTROL §5.2 — structured world reads. NEVER-OOM caps here (relay), re-checked on the
+    // rover (_validate_cmd) and in block_box_slice itself. The rover FLAG-gates these (FP_AGENT_QUERY);
+    // the relay only routes + bounds-checks, exactly like every dev op above.
+    case 'query_box':
+    case 'query_ray': {
+      const q = validateQueryStep(st);              // shared caps (validate.mjs), mirrored on the rover
+      return q.ok ? okEst(q.est) : rej('caps', q.detail);
+    }
+    // COSMOS-AGENT-AUTONOMY — actuation ops. Shared shape-caps (validate.mjs); the rover flag-gates + re-caps.
+    case 'break_cell':
+    case 'place_cell':
+    case 'aim_cell':
+    case 'goto':
+    case 'chop_tree': {
+      const a = validateActStep(st);
+      return a.ok ? okEst(a.est) : rej('caps', a.detail);
     }
     default: return rej('caps', `unhandled op '${st.op}'`); // unreachable — whitelist checked in validateCmd
   }
@@ -645,7 +726,8 @@ function onControlState(conn, msg) {
 }
 
 // Set of downlink RESULT types that must be tagged to the owning granted socket (F1).
-const RESULT_TYPES = new Set(['cmd_ack', 'cmd_nack', 'step_start', 'step_done', 'seq_done']);
+// COSMOS-AGENT-CONTROL §5.2: query_result (text, for query_ray + small boxes) rides the same owner gate.
+const RESULT_TYPES = new Set(['cmd_ack', 'cmd_nack', 'step_start', 'step_done', 'seq_done', 'query_result']);
 
 // Route a downlink text frame. Returns true if it was a recognized control event. Game-originated
 // messages are RECORD-ONLY — never forwarded to another socket or reflected back.
@@ -682,6 +764,14 @@ function routeControlEvent(conn, obj) {
       if (inFlightSeq === obj.seq) { inFlightSeq = null; inFlightOwner = null; }
       audit('seq_done', { seq: obj.seq, status: obj.status });
       return true;
+    case 'query_result': {
+      // COSMOS-AGENT-CONTROL §5.2: a text query answer (query_ray, or a small box inlined as JSON).
+      // Owner-gated by the ownsDownlink check above, exactly like its result siblings.
+      const idPart = safeId(String(obj.id)) ? String(obj.id) : 'x';
+      writeResult(obj.seq, `query-${idPart}.json`, obj);
+      audit('query_result', { seq: obj.seq, id: idPart, kind: obj.kind });
+      return true;
+    }
   }
   return true;
 }
@@ -705,6 +795,33 @@ function handleShotFrame(conn, data) {
   try { writeFileSync(join(d, `shot-${idPart}-${labelPart}.jpg`), jpg); } catch (e) { log('shot write error:', e.message); }
   try { writeFrame(jpg); } catch { /* frame-latest refresh is best-effort */ }
   audit('shot', { seq: hdr.seq, id: idPart, label: labelPart, bytes: jpg.length });
+}
+
+// COSMOS-AGENT-CONTROL §5.2 — a commanded voxel box: [0x03][u16 BE header_len][header JSON:
+// {seq,id,kind:"box",origin,dims,order,fmt:"u8"}][u8 ids]. Mirrors handleShotFrame line-for-line:
+// seq-dir gate → owner gate → header/payload validation (a malformed game frame is dropped + audited,
+// never written) → write query-<id>.bin (payload) + query-<id>.json (header, agent-readable sidecar).
+function handleQueryFrame(conn, data) {
+  if (data.length < 3) return;
+  const hlen = data.readUInt16BE(1);
+  if (data.length < 3 + hlen) return;
+  let hdr;
+  try { hdr = JSON.parse(data.subarray(3, 3 + hlen).toString('utf8')); } catch { return; }
+  const payload = data.subarray(3 + hlen);
+  const d = resultsDirFor(hdr.seq);
+  if (!d) { audit('query_orphan', { seq: String(hdr.seq).slice(0, 60) }); return; }
+  if (!ownsDownlink(conn, hdr.seq)) { audit('query_forged', { peer: conn.peer, seq: String(hdr.seq).slice(0, 60) }); return; }
+  if (hdr.fmt !== 'u8' || !Array.isArray(hdr.dims) || hdr.dims.length !== 3) {
+    audit('query_bad_hdr', { seq: String(hdr.seq).slice(0, 60) }); return;
+  }
+  const want = hdr.dims[0] * hdr.dims[1] * hdr.dims[2];
+  if (!(want > 0) || want > QUERY_CELLS_MAX || payload.length !== want) {
+    audit('query_bad_len', { seq: String(hdr.seq).slice(0, 60), want, got: payload.length }); return;
+  }
+  const idPart = safeId(String(hdr.id)) ? String(hdr.id) : 'x';
+  try { writeFileSync(join(d, `query-${idPart}.bin`), payload); } catch (e) { log('query bin write error:', e.message); }
+  try { writeFileSync(join(d, `query-${idPart}.json`), JSON.stringify({ ...hdr, _rx: ts() })); } catch (e) { log('query hdr write error:', e.message); }
+  audit('query_box', { seq: hdr.seq, id: idPart, cells: want });
 }
 
 // ── WS server (behind an http server so nginx can proxy_pass to it) ──────────────────────────────
@@ -853,6 +970,9 @@ wss.on('connection', (ws, req) => {
       } else if (data[0] === SHOT_TAG) {
         // Commanded screenshot: [SHOT_TAG][u16 hlen][header][jpeg...].
         try { handleShotFrame(conn, data); } catch (e) { log('shot frame error:', e.message); }
+      } else if (data[0] === QUERY_TAG) {
+        // Commanded voxel box: [QUERY_TAG][u16 hlen][header][u8 ids...] (COSMOS-AGENT-CONTROL §5.2).
+        try { handleQueryFrame(conn, data); } catch (e) { log('query frame error:', e.message); }
       }
       // unknown binary tag — ignore
       return;
@@ -905,9 +1025,26 @@ httpServer.listen(PORT, HOST, () => {
   }
 });
 
-// Outbox poller — the ONLY command ingress (design §5.1). Polling (not fs.watch) because fs.watch is
-// unreliable on bind mounts, and 500 ms is ample for a half-duplex, latency-tolerant control loop.
+// Outbox poller — the reconciliation floor (design §5.1). fs.watch is unreliable on bind mounts, so
+// the poll stays AUTHORITATIVE; the watch below (COSMOS-AGENT-CONTROL §3.1) only shortens the typical
+// pickup wait from ~POLL_MS/2 to a few ms. POLL_MS default dropped 500 → 100 (watch carries the latency).
 const outboxPoller = setInterval(pollOutbox, POLL_MS);
+
+// COSMOS-AGENT-CONTROL §3.1 (P0-AGENT-LATENCY): forward on-write. The watch callback runs the SAME
+// pollOutbox() (never a private ingest path), so validation/dedup(ingestedFiles/seenSeqs)/audit stay
+// byte-for-byte the poll path; pollOutbox is idempotent + cheap. A 5 ms debounce coalesces the
+// tmp+rename event pair. { persistent: false } so the watcher never keeps the process alive on shutdown.
+let watchKick = null;
+let outboxWatcher = null;
+if (WATCH_ENABLED) {
+  try {
+    outboxWatcher = watch(OUTBOX_DIR, { persistent: false }, () => {
+      if (watchKick) return;
+      watchKick = setTimeout(() => { watchKick = null; pollOutbox(); }, 5);
+    });
+    log('outbox watch armed (poll floor ' + POLL_MS + 'ms)');
+  } catch (e) { log('fs.watch unavailable — poll-only:', e.message); }
+}
 
 // F5: periodic NEVER-OOM housekeeping for the run-lifetime maps (seenSeqs / ipConnects).
 const MAINT_MS = 30000;
@@ -919,6 +1056,7 @@ for (const sig of ['SIGINT', 'SIGTERM']) {
     log('shutting down on', sig);
     clearInterval(outboxPoller);
     clearInterval(maintPoller);
+    if (outboxWatcher) { try { outboxWatcher.close(); } catch { /* ignore */ } }
     for (const c of authedSockets) stopHeartbeat(c);
     wss.close();
     httpServer.close(() => process.exit(0));

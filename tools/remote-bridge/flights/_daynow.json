@@ -1,0 +1,1 @@
+{ "name":"daynow","description":"restore daytime","legs":[{"name":"noon","steps":[{"op":"set_time","local_hours":11}],"settle_s":1.0}]}

@@ -1,0 +1,2 @@
+{ "name":"reloadtex","description":"reload to the T1 textured build","legs":[
+  {"name":"reload","steps":[{"op":"reload"}],"settle_s":1.0}]}

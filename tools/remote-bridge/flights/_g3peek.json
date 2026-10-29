@@ -1,0 +1,2 @@
+{ "name":"g3peek","description":"current G3 live frame","legs":[
+  {"name":"shot","steps":[{"op":"screenshot","label":"g3-live-now"}],"settle_s":2.0}]}

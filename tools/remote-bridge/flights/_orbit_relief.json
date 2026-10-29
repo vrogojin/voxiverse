@@ -1,0 +1,9 @@
+{ "name":"orbitrelief","description":"orbit A/B for FP_RELIEF_REEMIT hillshade + g2 sweep","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":1.0},
+  {"name":"freeze","steps":[{"op":"freeze_time","on":true}],"settle_s":0.5},
+  {"name":"nav","steps":[{"op":"dev_nav","on":true}],"settle_s":0.5},
+  {"name":"up","steps":[{"op":"set_alt","alt":1500}],"settle_s":2.0},
+  {"name":"hold","steps":[{"op":"freeze_player","on":true}],"settle_s":0.5},
+  {"name":"aim","steps":[{"op":"look","planet_lock":true}],"settle_s":1.5},
+  {"name":"sweep","steps":[{"op":"wait","seconds":20}],"settle_s":20.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"orbit-relief-a"}],"settle_s":2.0}]}

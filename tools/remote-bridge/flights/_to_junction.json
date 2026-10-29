@@ -1,0 +1,7 @@
+{ "name":"to-junction","description":"dawn + walk to the facet 2->3 junction (border-seam repro)","legs":[
+  {"name":"settle","steps":[{"op":"wait","seconds":6}],"settle_s":0.5},
+  {"name":"dawn","steps":[{"op":"set_time","local_hours":6}],"settle_s":2.0},
+  {"name":"aim","steps":[{"op":"look","pitch_deg":-6}],"settle_s":1.0},
+  {"name":"walk1","steps":[{"op":"move","blocks":128,"heading":"forward","gait":"run"}],"settle_s":6.0},
+  {"name":"walk2","steps":[{"op":"move","blocks":128,"heading":"forward","gait":"run"}],"settle_s":8.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"junction-dawn-before"}],"settle_s":2.0}]}

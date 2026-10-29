@@ -1,0 +1,5 @@
+{ "name":"envperf","description":"run + climb to orbit (stress far-ring env-cache rebuilds)","legs":[
+  {"name":"run","steps":[{"op":"thrust","dz":0,"seconds":0.1}],"settle_s":0.1},
+  {"name":"dev on","steps":[{"op":"dev_nav","on":true}],"settle_s":0.3},
+  {"name":"climb","steps":[{"op":"thrust","dy":1.0,"seconds":22,"gait":"run"}],"settle_s":0.3},
+  {"name":"lookdown","steps":[{"op":"look","pitch_deg":-40},{"op":"screenshot","label":"envorbit"}],"settle_s":0.3}]}

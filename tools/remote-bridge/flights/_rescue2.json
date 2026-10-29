@@ -1,0 +1,2 @@
+{ "name":"rescue2","description":"rescue via fixed teleport floor-settle","legs":[
+  {"name":"surface","steps":[{"op":"set_alt","alt":5}],"settle_s":2.5}]}

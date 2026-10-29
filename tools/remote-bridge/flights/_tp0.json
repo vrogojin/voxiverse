@@ -1,0 +1,5 @@
+{ "name":"tp0","description":"geo-teleport alt0 (grounded placement)","legs":[
+  {"name":"tp","steps":[{"op":"teleport","lat_deg":8,"lon_deg":2,"alt":0}],"settle_s":1.0},
+  {"name":"wait","steps":[{"op":"wait","seconds":4}],"settle_s":4.0},
+  {"name":"look","steps":[{"op":"look","pitch_deg":-20}],"settle_s":1.0},
+  {"name":"shot","steps":[{"op":"screenshot"}],"settle_s":1.8}]}

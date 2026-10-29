@@ -1,0 +1,3 @@
+{ "name":"lodaim","description":"aim down + shoot in one step (no re-level gap)","legs":[
+  {"name":"dev on","steps":[{"op":"dev_nav","on":true}],"settle_s":0.2},
+  {"name":"aim+shoot A","steps":[{"op":"look","pitch_deg":-55},{"op":"screenshot","label":"aimA"}],"settle_s":0.1}]}

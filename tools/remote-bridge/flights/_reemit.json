@@ -1,0 +1,7 @@
+{ "name":"reemit","description":"force shell re-emit at lower alt after G2 sweep, check relief","legs":[
+  {"name":"unfreeze","steps":[{"op":"freeze_player","on":false}],"settle_s":0.5},
+  {"name":"g2wait","steps":[{"op":"wait","seconds":10}],"settle_s":10.0},
+  {"name":"lower","steps":[{"op":"set_alt","alt":520}],"settle_s":3.0},
+  {"name":"settle","steps":[{"op":"wait","seconds":8}],"settle_s":8.0},
+  {"name":"look","steps":[{"op":"look","pitch_deg":-32}],"settle_s":2.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"reemit"}],"settle_s":2.0}]}

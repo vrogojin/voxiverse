@@ -1,0 +1,3 @@
+{ "name":"ttu3","description":"reload + boot window (fixed settle_s)","legs":[
+  {"name":"reload","steps":[{"op":"reload"}],"settle_s":2.0},
+  {"name":"w1","steps":[{"op":"wait","seconds":58}],"settle_s":2.0}]}

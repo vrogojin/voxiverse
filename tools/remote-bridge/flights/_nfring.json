@@ -1,0 +1,8 @@
+{ "name":"nfring","description":"near-far boundary ring A/B: ~300 alt, nadir, framed near disc inside far skin",
+  "legs":[
+    {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":0.6},
+    {"name":"alt300","steps":[{"op":"set_alt","alt":300}],"settle_s":1.5},
+    {"name":"nadir","steps":[{"op":"look","pitch_deg":-89}],"settle_s":0.8},
+    {"name":"hold","steps":[{"op":"freeze_player","on":true}],"settle_s":0.4},
+    {"name":"bake","steps":[{"op":"wait","seconds":5}],"settle_s":5.0},
+    {"name":"shot","steps":[{"op":"screenshot","label":"nfring"}],"settle_s":2.0}]}

@@ -1,0 +1,5 @@
+{ "name":"guard-close","description":"#132 close ground-level inspection inside the tree band","legs":[
+  {"name":"tp","steps":[{"op":"teleport","lat_deg":-40.20,"lon_deg":-154.19,"alt":9,"yaw_deg":-71,"pitch_deg":-2}],"settle_s":18.0},
+  {"name":"s0","steps":[{"op":"screenshot","label":"guardclose-a"}],"settle_s":10.0},
+  {"name":"look","steps":[{"op":"look","yaw_deg":30,"pitch_deg":2}],"settle_s":8.0},
+  {"name":"s1","steps":[{"op":"screenshot","label":"guardclose-b"}],"settle_s":6.0}]}

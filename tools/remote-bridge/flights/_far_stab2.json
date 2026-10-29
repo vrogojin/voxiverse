@@ -1,0 +1,4 @@
+{ "name":"far_stab2","description":"two far shots 6s apart from frozen view","legs":[
+  {"name":"look","steps":[{"op":"look","pitch_deg":-22}],"settle_s":1.5},
+  {"name":"shota","steps":[{"op":"screenshot","label":"far-a"}],"settle_s":6.0},
+  {"name":"shotb","steps":[{"op":"screenshot","label":"far-b"}],"settle_s":1.5}]}

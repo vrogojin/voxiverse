@@ -1,0 +1,4 @@
+{ "name":"turnright","description":"turn to examine the grey column (tree?)","legs":[
+  {"name":"turn","steps":[{"op":"turn","yaw_deg":55}],"settle_s":1.5},
+  {"name":"look","steps":[{"op":"look","pitch_deg":2}],"settle_s":1.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"turnright"}],"settle_s":2.0}]}

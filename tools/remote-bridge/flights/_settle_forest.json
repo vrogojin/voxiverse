@@ -1,0 +1,4 @@
+{ "name":"settle-forest","description":"daytime + level view in the warm forest","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":13}],"settle_s":1.5},
+  {"name":"level","steps":[{"op":"look","pitch_deg":-2}],"settle_s":1.5},
+  {"name":"shot","steps":[{"op":"screenshot","label":"forest-rest"}],"settle_s":1.5}]}

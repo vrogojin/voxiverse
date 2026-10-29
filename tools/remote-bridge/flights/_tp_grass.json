@@ -1,0 +1,6 @@
+{ "name":"tp-grass","description":"teleport to concave grass base (lat/lon), verify #113 blob gone","legs":[
+  {"name":"settle","steps":[{"op":"wait","seconds":16}],"settle_s":0.5},
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":1.5},
+  {"name":"tp","steps":[{"op":"teleport","lat_deg":39.030,"lon_deg":-146.183,"alt":33,"yaw_deg":-86.11,"pitch_deg":-10}],"settle_s":8.0},
+  {"name":"look","steps":[{"op":"look","pitch_deg":-6}],"settle_s":1.5},
+  {"name":"s1","steps":[{"op":"screenshot","label":"ab113-a"}],"settle_s":2.0}]}

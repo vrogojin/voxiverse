@@ -1,0 +1,5 @@
+{ "name":"ff2","description":"climb high + free-fall (rails A/B)","legs":[
+  {"name":"dev on","steps":[{"op":"dev_nav","on":true}],"settle_s":0.3},
+  {"name":"climb high","steps":[{"op":"thrust","dy":1.0,"seconds":30,"gait":"run"}],"settle_s":0.3},
+  {"name":"drop","steps":[{"op":"dev_nav","on":false}],"settle_s":0.2},
+  {"name":"fall","steps":[{"op":"wait","seconds":40}],"settle_s":0.2}]}

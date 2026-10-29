@@ -1,0 +1,4 @@
+{ "name":"desctest","description":"dev-fly down to ~1400 then free-fall","legs":[
+  {"name":"down","steps":[{"op":"thrust","dy":-1.0,"seconds":60,"gait":"run"}],"settle_s":0.3},
+  {"name":"freefall","steps":[{"op":"dev_nav","on":false}],"settle_s":0.2},
+  {"name":"fall","steps":[{"op":"wait","seconds":10}],"settle_s":0.1}]}

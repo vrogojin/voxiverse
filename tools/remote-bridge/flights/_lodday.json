@@ -1,0 +1,4 @@
+{ "name":"lodday","description":"day-side space-fly climb, pitch to catch lit surface, screenshot","legs":[
+  {"name":"dev on","steps":[{"op":"dev_nav","on":true}],"settle_s":0.3},
+  {"name":"climb","steps":[{"op":"thrust","dy":1.0,"seconds":15,"gait":"run"}],"settle_s":0.4},
+  {"name":"aim+shoot","steps":[{"op":"look","pitch_deg":-78},{"op":"screenshot","label":"day"}],"settle_s":0.15}]}

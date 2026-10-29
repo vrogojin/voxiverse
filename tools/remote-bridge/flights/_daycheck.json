@@ -1,0 +1,4 @@
+{ "name":"dc","description":"noon uniformity + water check","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":1.5},
+  {"name":"bake","steps":[{"op":"wait","seconds":3}],"settle_s":3.0},
+  {"name":"shot","steps":[{"op":"screenshot"}],"settle_s":1.6}]}

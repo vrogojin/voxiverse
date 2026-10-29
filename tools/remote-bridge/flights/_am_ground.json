@@ -1,0 +1,5 @@
+{ "name":"am_ground","description":"morning eyeball: descend to ground, land, horizon seam view","legs":[
+  {"name":"descend","steps":[{"op":"thrust","dy":-1.0,"seconds":22,"gait":"run"}],"settle_s":2.0},
+  {"name":"up to surface","steps":[{"op":"thrust","dy":1.0,"seconds":4,"gait":"walk"}],"settle_s":1.0},
+  {"name":"land","steps":[{"op":"dev_nav","on":false}],"settle_s":3.0},
+  {"name":"horizon","steps":[{"op":"look","pitch_deg":-7}],"settle_s":2.5}]}

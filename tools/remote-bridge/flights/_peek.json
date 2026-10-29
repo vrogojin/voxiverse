@@ -1,0 +1,2 @@
+{ "name":"peek","description":"telemetry snapshot","legs":[
+  {"name":"shot","steps":[{"op":"screenshot","label":"peek"}],"settle_s":2.0}]}

@@ -1,0 +1,5 @@
+{ "name":"rel","description":"release + dev-nav off","legs":[
+  {"name":"dn","steps":[{"op":"dev_nav","on":false}],"settle_s":0.3},
+  {"name":"fp","steps":[{"op":"freeze_player","on":false}],"settle_s":0.3},
+  {"name":"ft","steps":[{"op":"freeze_time","on":false}],"settle_s":0.3},
+  {"name":"fly","steps":[{"op":"set_fly","on":false}],"settle_s":0.3}]}

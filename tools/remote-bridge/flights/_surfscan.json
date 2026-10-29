@@ -1,0 +1,5 @@
+{ "name":"surfscan","description":"surface, pan for facet-border cliffs","legs":[
+  {"name":"geo","steps":[{"op":"teleport","lat_deg":8,"lon_deg":2,"alt":6}],"settle_s":2.0},
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":0.5},
+  {"name":"look","steps":[{"op":"look","pitch_deg":-6}],"settle_s":1.0},
+  {"name":"shot","steps":[{"op":"screenshot"}],"settle_s":1.5}]}

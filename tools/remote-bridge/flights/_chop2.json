@@ -1,0 +1,10 @@
+{ "name":"chop2","description":"aim onto trunk, break via target aim, watch canopy","legs":[
+  {"name":"aimup","steps":[{"op":"look","pitch_deg":4}],"settle_s":0.8},
+  {"name":"checkaim","steps":[{"op":"screenshot","label":"chop2-aim"}],"settle_s":1.2},
+  {"name":"b1","steps":[{"op":"break","target":"aim"}],"settle_s":0.6},
+  {"name":"b2","steps":[{"op":"break","target":"aim"}],"settle_s":0.6},
+  {"name":"b3","steps":[{"op":"break","target":"aim"}],"settle_s":0.6},
+  {"name":"b4","steps":[{"op":"break","target":"aim"}],"settle_s":0.6},
+  {"name":"shot0","steps":[{"op":"screenshot","label":"chop2-t0"}],"settle_s":1.0},
+  {"name":"watch","steps":[{"op":"wait","seconds":10}],"settle_s":10.0},
+  {"name":"shot9","steps":[{"op":"screenshot","label":"chop2-t10"}],"settle_s":1.8}]}

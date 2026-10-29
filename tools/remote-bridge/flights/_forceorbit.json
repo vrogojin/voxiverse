@@ -1,0 +1,5 @@
+{ "name":"forceorbit","description":"force orbit + measure","legs":[
+  {"name":"nav","steps":[{"op":"dev_nav","on":true}],"settle_s":1.0},
+  {"name":"up","steps":[{"op":"set_alt","alt":1600}],"settle_s":3.0},
+  {"name":"w","steps":[{"op":"wait","seconds":30}],"settle_s":30.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"g3v2-orbit2"}],"settle_s":2.0}]}

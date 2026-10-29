@@ -1,0 +1,8 @@
+{ "name":"reorbitrelief","description":"dev_nav re-orbit nadir + long g2 sweep for shading A/B","legs":[
+  {"name":"nav","steps":[{"op":"dev_nav","on":true}],"settle_s":0.5},
+  {"name":"up","steps":[{"op":"set_alt","alt":1600}],"settle_s":2.0},
+  {"name":"hold","steps":[{"op":"freeze_player","on":true}],"settle_s":0.5},
+  {"name":"aim","steps":[{"op":"look","planet_lock":true}],"settle_s":1.5},
+  {"name":"sweep1","steps":[{"op":"wait","seconds":25}],"settle_s":25.0},
+  {"name":"sweep2","steps":[{"op":"wait","seconds":25}],"settle_s":25.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"orbit-relief-d"}],"settle_s":2.0}]}

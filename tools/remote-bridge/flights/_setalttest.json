@@ -1,0 +1,4 @@
+{ "name":"setalttest","description":"set_alt 3 at spawn — verify lands on surface not sunk","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":0.6},
+  {"name":"set alt 3","steps":[{"op":"set_alt","alt":3}],"settle_s":2.0},
+  {"name":"look down","steps":[{"op":"look","pitch_deg":-45}],"settle_s":2.0}]}

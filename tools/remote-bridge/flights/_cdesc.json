@@ -1,0 +1,6 @@
+{ "name":"cdesc","description":"controlled descent under dev-nav (not free-fall) to isolate altitude-change cost",
+  "legs":[
+    {"name":"dev_nav on","steps":[{"op":"dev_nav","on":true}],"settle_s":0.5},
+    {"name":"climb","steps":[{"op":"thrust","dy":1.0,"seconds":24,"gait":"run"}],"settle_s":1.0},
+    {"name":"descend controlled","steps":[{"op":"thrust","dy":-1.0,"seconds":20,"gait":"walk"}],"settle_s":0.5}
+  ] }

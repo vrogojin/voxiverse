@@ -1,0 +1,6 @@
+{ "name":"fullladder","description":"low alt + horizon to see near->L1->L2->L3->L4 to the horizon","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":0.5},
+  {"name":"freeze time","steps":[{"op":"freeze_time","on":true}],"settle_s":0.4},
+  {"name":"set alt 150","steps":[{"op":"set_alt","alt":150}],"settle_s":0.8},
+  {"name":"look horizon","steps":[{"op":"look","pitch_deg":-9}],"settle_s":0.5},
+  {"name":"freeze player","steps":[{"op":"freeze_player","on":true}],"settle_s":0.4}]}

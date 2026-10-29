@@ -1,0 +1,12 @@
+{ "name":"tiltab","description":"tilt A/B: noon, high-alt horizon (Class C roll), then drop+land (Class A upright)",
+  "legs":[
+    {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":1.0},
+    {"name":"ground-level","steps":[{"op":"look","pitch_deg":0}],"settle_s":1.5},
+    {"name":"shot-ground","steps":[{"op":"screenshot","label":"tilt-ground"}],"settle_s":1.8},
+    {"name":"lift","steps":[{"op":"set_alt","alt":600}],"settle_s":2.5},
+    {"name":"horizon-high","steps":[{"op":"look","pitch_deg":0}],"settle_s":1.5},
+    {"name":"shot-high","steps":[{"op":"screenshot","label":"tilt-high"}],"settle_s":1.8},
+    {"name":"drop","steps":[{"op":"set_alt","alt":40}],"settle_s":2.0},
+    {"name":"settle-land","steps":[{"op":"wait","seconds":6}],"settle_s":6.0,"expect":{"alt_gt":-1}},
+    {"name":"land-level","steps":[{"op":"look","pitch_deg":0}],"settle_s":1.5},
+    {"name":"shot-land","steps":[{"op":"screenshot","label":"tilt-land"}],"settle_s":1.8}]}

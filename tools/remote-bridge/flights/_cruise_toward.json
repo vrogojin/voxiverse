@@ -1,0 +1,4 @@
+{ "name":"ct","description":"look at planet + cruise 6s","legs":[
+  {"name":"look","steps":[{"op":"look","planet_lock":true,"pitch_off_deg":0}],"settle_s":1.5},
+  {"name":"cruise","steps":[{"op":"thrust","cruise":true,"seconds":6}],"settle_s":7.0},
+  {"name":"shot","steps":[{"op":"screenshot"}],"settle_s":1.5}]}

@@ -1,0 +1,3 @@
+{ "name":"trav2","description":"continue toward day side, catch lit surface at terminator","legs":[
+  {"name":"forward","steps":[{"op":"thrust","dz":1.0,"seconds":110,"gait":"run"}],"settle_s":0.3},
+  {"name":"pitch","steps":[{"op":"look","pitch_deg":-20}],"settle_s":0.1}]}

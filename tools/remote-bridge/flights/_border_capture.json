@@ -1,0 +1,7 @@
+{ "name":"border-capture","description":"frame the interfacet border + sweep sun to reveal the brightness seam","legs":[
+  {"name":"look-horizon","steps":[{"op":"look","pitch_deg":-8}],"settle_s":1.5},
+  {"name":"shot-night","steps":[{"op":"screenshot","label":"border-night"}],"settle_s":1.5},
+  {"name":"dawn","steps":[{"op":"set_time","local_hours":6}],"settle_s":2.5},
+  {"name":"shot-dawn","steps":[{"op":"screenshot","label":"border-dawn"}],"settle_s":1.5},
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":2.5},
+  {"name":"shot-noon","steps":[{"op":"screenshot","label":"border-noon"}],"settle_s":1.5}]}

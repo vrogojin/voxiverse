@@ -1,0 +1,11 @@
+{ "name":"naturalfall","description":"NATURAL de-orbit (no freeze): dev-nav climb above the ~590 release knee, gradual release + fall through it","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":1},
+  {"name":"dev-on","steps":[{"op":"dev_nav","on":true}],"settle_s":1},
+  {"name":"climb","steps":[{"op":"thrust","dy":1.0,"seconds":55,"gait":"run"}],"settle_s":2},
+  {"name":"release","steps":[{"op":"dev_nav","on":false}],"settle_s":0.3},
+  {"name":"fall1","steps":[{"op":"wait","seconds":12}],"settle_s":0.2},
+  {"name":"fall2","steps":[{"op":"wait","seconds":12}],"settle_s":0.2},
+  {"name":"fall3","steps":[{"op":"wait","seconds":12}],"settle_s":0.2},
+  {"name":"fall4","steps":[{"op":"wait","seconds":12}],"settle_s":0.2},
+  {"name":"land","steps":[{"op":"wait","seconds":10}],"settle_s":1}
+]}

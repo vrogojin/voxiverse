@@ -1,0 +1,5 @@
+{ "name":"tpfrozen","description":"teleport low + freeze BEFORE fall","legs":[
+  {"name":"tp","steps":[{"op":"teleport","lat_deg":8,"lon_deg":2,"alt":30}],"settle_s":0.2},
+  {"name":"fp","steps":[{"op":"freeze_player","on":true}],"settle_s":0.3},
+  {"name":"look","steps":[{"op":"look","pitch_deg":-85}],"settle_s":1.0},
+  {"name":"shot","steps":[{"op":"screenshot"}],"settle_s":1.8}]}

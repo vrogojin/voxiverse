@@ -1,0 +1,1 @@
+{ "name":"reproshot","steps_desc":"shot","legs":[{"name":"s","steps":[{"op":"screenshot"}],"settle_s":1.2}]}

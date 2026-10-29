@@ -1,0 +1,4 @@
+{ "name":"toground","description":"descend to ground for a clean ascent baseline","legs":[
+  {"name":"dev on","steps":[{"op":"dev_nav","on":true}],"settle_s":0.5},
+  {"name":"down","steps":[{"op":"thrust","dy":-1.0,"seconds":26,"gait":"run"}],"settle_s":1.0},
+  {"name":"land","steps":[{"op":"dev_nav","on":false}],"settle_s":3.0}]}

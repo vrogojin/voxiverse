@@ -1,0 +1,8 @@
+{ "name":"od","description":"orbit-churn then descend","legs":[
+  {"name":"nofly","steps":[{"op":"set_fly","on":false}],"settle_s":0.4},
+  {"name":"orbit","steps":[{"op":"set_alt","alt":8000}],"settle_s":2.0},
+  {"name":"churn","steps":[{"op":"wait","seconds":15}],"settle_s":15.0},
+  {"name":"desc","steps":[{"op":"set_alt","alt":0}],"settle_s":2.5},
+  {"name":"look","steps":[{"op":"look","pitch_deg":-10}],"settle_s":1.0},
+  {"name":"bake","steps":[{"op":"wait","seconds":3}],"settle_s":3.0},
+  {"name":"shot","steps":[{"op":"screenshot"}],"settle_s":1.8}]}

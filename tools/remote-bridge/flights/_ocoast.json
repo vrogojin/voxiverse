@@ -1,0 +1,8 @@
+{ "name":"ocoast","description":"climb, then O-coast orbit (nav orbit) vs free-fall",
+  "legs":[
+    {"name":"dev on","steps":[{"op":"dev_nav","on":true}],"settle_s":0.3},
+    {"name":"climb","steps":[{"op":"thrust","dy":1.0,"seconds":28,"gait":"run"}],"settle_s":0.3},
+    {"name":"prograde","steps":[{"op":"thrust","dx":1.0,"seconds":10,"gait":"run"}],"settle_s":0.3},
+    {"name":"O-coast","steps":[{"op":"nav","verb":"orbit"}],"settle_s":0.3},
+    {"name":"hold","steps":[{"op":"wait","seconds":14}],"settle_s":0.2}
+  ] }

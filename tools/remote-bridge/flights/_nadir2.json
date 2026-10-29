@@ -1,0 +1,4 @@
+{ "name":"nadir2","description":"steep nadir pitch + g2 catch-up","legs":[
+  {"name":"aim","steps":[{"op":"look","planet_lock":true,"pitch_deg":-85}],"settle_s":2.0},
+  {"name":"sweep","steps":[{"op":"wait","seconds":22}],"settle_s":22.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"orbit-relief-c"}],"settle_s":2.0}]}

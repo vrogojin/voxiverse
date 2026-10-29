@@ -1,0 +1,4 @@
+{ "name":"sunscan","description":"dawn sun scan","legs":[
+  {"name":"dawn","steps":[{"op":"set_time","local_hours":6.5}],"settle_s":1.5},
+  {"name":"p","steps":[{"op":"look","pitch_deg":6}],"settle_s":0.6},
+  {"name":"s0","steps":[{"op":"screenshot"}],"settle_s":1.4}]}

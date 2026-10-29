@@ -1,0 +1,6 @@
+{ "name":"eye7","description":"teleport 240 + freeze_player (fixed) to hold + look","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":0.6},
+  {"name":"freeze time","steps":[{"op":"freeze_time","on":true}],"settle_s":0.4},
+  {"name":"set alt 240","steps":[{"op":"set_alt","alt":240}],"settle_s":0.6},
+  {"name":"freeze player","steps":[{"op":"freeze_player","on":true}],"settle_s":0.4},
+  {"name":"look down","steps":[{"op":"look","pitch_deg":-40}],"settle_s":1.0}]}

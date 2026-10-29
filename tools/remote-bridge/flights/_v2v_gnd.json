@@ -1,0 +1,4 @@
+{ "name":"v2v_gnd","description":"§2V ground: descend to surface, horizon look at near-voxel↔far-skin seam (V1 seamless lighting)","legs":[
+  {"name":"descend","steps":[{"op":"thrust","dy":-1.0,"seconds":12,"gait":"walk"}],"settle_s":2.0},
+  {"name":"settle low","steps":[{"op":"thrust","dy":-1.0,"seconds":6,"gait":"walk"}],"settle_s":2.0},
+  {"name":"horizon look","steps":[{"op":"look","pitch_deg":-6}],"settle_s":2.5}]}

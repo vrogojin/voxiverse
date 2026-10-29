@@ -1,0 +1,9 @@
+{ "name":"back-to-ridge","description":"turn around + step back toward the facet ridge (border seam)","legs":[
+  {"name":"turn","steps":[{"op":"look","yaw_deg":180}],"settle_s":1.5},
+  {"name":"aim","steps":[{"op":"look","pitch_deg":-8}],"settle_s":1.0},
+  {"name":"back1","steps":[{"op":"move","blocks":64,"heading":"forward","gait":"walk"}],"settle_s":4.0},
+  {"name":"s1","steps":[{"op":"screenshot","label":"ridge-a"}],"settle_s":1.5},
+  {"name":"back2","steps":[{"op":"move","blocks":48,"heading":"forward","gait":"walk"}],"settle_s":4.0},
+  {"name":"s2","steps":[{"op":"screenshot","label":"ridge-b"}],"settle_s":1.5},
+  {"name":"back3","steps":[{"op":"move","blocks":48,"heading":"forward","gait":"walk"}],"settle_s":4.0},
+  {"name":"s3","steps":[{"op":"screenshot","label":"ridge-c"}],"settle_s":1.5}]}

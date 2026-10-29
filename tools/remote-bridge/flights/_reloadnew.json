@@ -1,0 +1,2 @@
+{ "name":"reloadnew","description":"reload the tab to the new cheats build (auto-dismiss should carry into world)","legs":[
+  {"name":"reload","steps":[{"op":"reload"}],"settle_s":1.0}]}

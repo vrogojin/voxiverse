@@ -1,0 +1,4 @@
+{ "name":"noon","description":"set local noon (sun overhead) then eyeball the blocky far terrain at the horizon","legs":[
+  {"name":"set noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":2.0},
+  {"name":"look horizon","steps":[{"op":"look","pitch_deg":-4}],"settle_s":0.6},
+  {"name":"shoot horizon","steps":[{"op":"screenshot","label":"noonhorizon"}],"settle_s":1.6}]}

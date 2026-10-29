@@ -1,0 +1,5 @@
+{ "name":"climbonly","description":"climb (vertical motion up) — measure high-alt vertical-motion fps, atmo off",
+  "legs":[
+    {"name":"dev_nav on","steps":[{"op":"dev_nav","on":true}],"settle_s":0.3},
+    {"name":"climb","steps":[{"op":"thrust","dy":1.0,"seconds":28,"gait":"run"}],"settle_s":0.3}
+  ] }

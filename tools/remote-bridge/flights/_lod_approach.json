@@ -1,0 +1,8 @@
+{ "name":"lod-approach","description":"approach the repro peak, capture coarse->fine LOD transition","legs":[
+  {"name":"s-470","steps":[{"op":"screenshot","label":"app-470"}],"settle_s":1.5},
+  {"name":"m1","steps":[{"op":"move","blocks":128,"heading":"forward","gait":"run"}],"settle_s":5.0},
+  {"name":"s-340","steps":[{"op":"screenshot","label":"app-340"}],"settle_s":1.5},
+  {"name":"m2","steps":[{"op":"move","blocks":128,"heading":"forward","gait":"run"}],"settle_s":5.0},
+  {"name":"s-210","steps":[{"op":"screenshot","label":"app-210"}],"settle_s":1.5},
+  {"name":"m3","steps":[{"op":"move","blocks":128,"heading":"forward","gait":"run"}],"settle_s":5.0},
+  {"name":"s-80","steps":[{"op":"screenshot","label":"app-80"}],"settle_s":1.5}]}

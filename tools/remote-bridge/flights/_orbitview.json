@@ -1,0 +1,6 @@
+{ "name":"orbitview","description":"climb to high orbit, freeze noon, look down at whole planet","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":0.6},
+  {"name":"freeze time","steps":[{"op":"freeze_time","on":true}],"settle_s":0.4},
+  {"name":"high orbit","steps":[{"op":"set_alt","alt":9000}],"settle_s":1.2},
+  {"name":"freeze player","steps":[{"op":"freeze_player","on":true}],"settle_s":0.4},
+  {"name":"look down","steps":[{"op":"look","pitch_deg":-75}],"settle_s":2.0}]}

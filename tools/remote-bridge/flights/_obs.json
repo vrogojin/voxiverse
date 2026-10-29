@@ -1,0 +1,2 @@
+{ "name":"obs","description":"#129 observer decomp — standing forest, aggregate telem_ms/fh","legs":[
+  {"name":"tp","steps":[{"op":"teleport","lat_deg":-40.15,"lon_deg":-153.95,"alt":8,"yaw_deg":118,"pitch_deg":-3}],"settle_s":40.0}]}

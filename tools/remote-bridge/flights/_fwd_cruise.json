@@ -1,0 +1,2 @@
+{ "name":"fc","description":"cruise toward centered planet","legs":[
+  {"name":"cruise","steps":[{"op":"thrust","cruise":true,"seconds":6}],"settle_s":7.5}]}

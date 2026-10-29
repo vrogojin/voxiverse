@@ -1,0 +1,9 @@
+{ "name":"g3orbit","description":"G3 A/B: re-orbit nadir + g2 sweep + G3 build","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":1.0},
+  {"name":"freezet","steps":[{"op":"freeze_time","on":true}],"settle_s":0.5},
+  {"name":"nav","steps":[{"op":"dev_nav","on":true}],"settle_s":0.5},
+  {"name":"up","steps":[{"op":"set_alt","alt":1500}],"settle_s":2.0},
+  {"name":"hold","steps":[{"op":"freeze_player","on":true}],"settle_s":0.5},
+  {"name":"aim","steps":[{"op":"look","planet_lock":true}],"settle_s":1.5},
+  {"name":"sweep","steps":[{"op":"wait","seconds":30}],"settle_s":30.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"g3-orbit-a"}],"settle_s":2.0}]}

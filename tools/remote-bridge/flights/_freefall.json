@@ -1,0 +1,10 @@
+{ "name":"freefall","description":"climb to orbit then free-fall de-orbit (natural), diagnostic","legs":[
+  {"name":"dev on","steps":[{"op":"dev_nav","on":true}],"settle_s":0.4},
+  {"name":"climb","steps":[{"op":"thrust","dy":1.0,"seconds":30,"gait":"run"},{"op":"look","pitch_deg":-30},{"op":"screenshot","label":"orbit"}],"settle_s":1.0},
+  {"name":"release to fall","steps":[{"op":"dev_nav","on":false}],"settle_s":0.3},
+  {"name":"fall1","steps":[{"op":"wait","seconds":10},{"op":"screenshot","label":"fall1"}],"settle_s":0.3},
+  {"name":"fall2","steps":[{"op":"wait","seconds":10},{"op":"screenshot","label":"fall2"}],"settle_s":0.3},
+  {"name":"fall3","steps":[{"op":"wait","seconds":10},{"op":"screenshot","label":"fall3"}],"settle_s":0.3},
+  {"name":"fall4","steps":[{"op":"wait","seconds":12},{"op":"screenshot","label":"fall4"}],"settle_s":0.3},
+  {"name":"settle","steps":[{"op":"wait","seconds":8},{"op":"screenshot","label":"settle"}],"settle_s":0.5}
+]}

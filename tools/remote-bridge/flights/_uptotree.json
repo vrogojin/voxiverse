@@ -1,0 +1,4 @@
+{ "name":"uptotree","description":"close on the tree stand for user handoff","legs":[
+  {"name":"fwd","steps":[{"op":"thrust","dz":1.0,"seconds":4.0,"gait":"run"}],"settle_s":1.2},
+  {"name":"look","steps":[{"op":"look","pitch_deg":0}],"settle_s":1.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"uptotree"}],"settle_s":1.8}]}

@@ -1,0 +1,4 @@
+{ "name":"hifi","description":"climb to close-up band, look down at distant surface","legs":[
+  {"name":"dev on","steps":[{"op":"dev_nav","on":true}],"settle_s":0.3},
+  {"name":"climb","steps":[{"op":"thrust","dy":1.0,"seconds":24,"gait":"run"}],"settle_s":0.5},
+  {"name":"aim+shoot","steps":[{"op":"look","pitch_deg":-40},{"op":"screenshot","label":"hifi"}],"settle_s":0.2}]}

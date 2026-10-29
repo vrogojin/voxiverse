@@ -1,0 +1,5 @@
+{ "name":"climbhi","description":"climb very high to see the whole planet disc","legs":[
+  {"name":"level","steps":[{"op":"look","pitch_deg":0}],"settle_s":0.2},
+  {"name":"climb1","steps":[{"op":"thrust","dy":1.0,"seconds":60,"gait":"run"}],"settle_s":0.3},
+  {"name":"climb2","steps":[{"op":"thrust","dy":1.0,"seconds":40,"gait":"run"}],"settle_s":0.3},
+  {"name":"pitch","steps":[{"op":"look","pitch_deg":-30}],"settle_s":0.1}]}

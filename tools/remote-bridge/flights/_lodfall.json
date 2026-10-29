@@ -1,0 +1,4 @@
+{ "name":"lodfall","description":"drop from orbit facing planet + screenshot mid-fall","legs":[
+  {"name":"drop","steps":[{"op":"dev_nav","on":false}],"settle_s":0.2},
+  {"name":"fall a bit","steps":[{"op":"wait","seconds":4}],"settle_s":0.1},
+  {"name":"shoot1","steps":[{"op":"screenshot","label":"fall1"}],"settle_s":0.3}]}

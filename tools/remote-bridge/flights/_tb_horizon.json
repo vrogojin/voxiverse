@@ -1,0 +1,6 @@
+{ "name":"tb_horizon","description":"low alt, look at horizon — near blocks meet far skin (colour match)","legs":[
+  {"name":"unfreeze","steps":[{"op":"freeze_player","on":false}],"settle_s":0.5},
+  {"name":"descend","steps":[{"op":"set_alt","alt":90}],"settle_s":3.0},
+  {"name":"horizon","steps":[{"op":"look","pitch_deg":-12}],"settle_s":1.5},
+  {"name":"shot","steps":[{"op":"screenshot","label":"tb-horizon"}],"settle_s":2.5}
+]}

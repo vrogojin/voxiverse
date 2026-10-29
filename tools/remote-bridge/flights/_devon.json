@@ -1,0 +1,2 @@
+{ "name":"devon","description":"enable dev_nav, verify via telemetry","legs":[
+  {"name":"dev on","steps":[{"op":"dev_nav","on":true}],"settle_s":1.5}]}

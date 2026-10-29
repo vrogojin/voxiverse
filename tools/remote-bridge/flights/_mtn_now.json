@@ -1,0 +1,2 @@
+{ "name":"mtn-now","description":"capture the summit now (near blocks arrived?)","legs":[
+  {"name":"shot","steps":[{"op":"screenshot","label":"mtn-arrived"}],"settle_s":1.5}]}

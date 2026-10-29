@@ -1,0 +1,6 @@
+{ "name":"probe2","description":"confirm control + space-nav availability",
+  "legs":[
+    {"name":"look","steps":[{"op":"look","yaw_deg":10}],"settle_s":0.8},
+    {"name":"dev_nav on","steps":[{"op":"dev_nav","on":true}],"settle_s":1.2,"expect":{"dev_nav":true}},
+    {"name":"dev_nav off","steps":[{"op":"dev_nav","on":false}],"settle_s":1.0,"expect":{"dev_nav":false}}
+  ] }

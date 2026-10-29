@@ -1,0 +1,2 @@
+{ "name":"set-dawn","description":"leave the view at dawn where the border seam is clearest","legs":[
+  {"name":"dawn","steps":[{"op":"set_time","local_hours":6}],"settle_s":1.0}]}

@@ -1,0 +1,2 @@
+{ "name":"reload-trees","description":"reload for far-trees P0 build","legs":[
+  {"name":"reload","steps":[{"op":"reload"}],"settle_s":3.0}]}

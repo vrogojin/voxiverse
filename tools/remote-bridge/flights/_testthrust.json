@@ -1,0 +1,4 @@
+{ "name":"tt","description":"test thrust sign","legs":[
+  {"name":"fly","steps":[{"op":"set_fly","on":true}],"settle_s":0.5},
+  {"name":"up","steps":[{"op":"look","pitch_deg":80}],"settle_s":0.5},
+  {"name":"thr","steps":[{"op":"thrust","dz":-1,"seconds":5,"gait":"run"}],"settle_s":5.5}]}

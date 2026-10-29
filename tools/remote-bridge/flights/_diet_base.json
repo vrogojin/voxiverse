@@ -1,0 +1,3 @@
+{ "name":"diet-base","description":"#129 floor-OFF standing forest fps baseline","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":13}],"settle_s":1.5},
+  {"name":"tp","steps":[{"op":"teleport","lat_deg":-40.15,"lon_deg":-153.95,"alt":8,"yaw_deg":118,"pitch_deg":-3}],"settle_s":30.0}]}

@@ -1,0 +1,7 @@
+{ "name":"snap","description":"teleport 3000 + screenshot","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":0.4},
+  {"name":"ftime","steps":[{"op":"freeze_time","on":true}],"settle_s":0.3},
+  {"name":"alt","steps":[{"op":"set_alt","alt":3000}],"settle_s":1.2},
+  {"name":"fplayer","steps":[{"op":"freeze_player","on":true}],"settle_s":0.3},
+  {"name":"look","steps":[{"op":"look","pitch_deg":-78}],"settle_s":1.2},
+  {"name":"shot","steps":[{"op":"screenshot"}],"settle_s":1.8}]}

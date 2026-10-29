@@ -1,0 +1,5 @@
+{ "name":"horizon","description":"near-orbit horizon grazing for atmosphere edge","legs":[
+  {"name":"alt","steps":[{"op":"set_alt","alt":2000}],"settle_s":1.2},
+  {"name":"fplayer","steps":[{"op":"freeze_player","on":true}],"settle_s":0.3},
+  {"name":"graze","steps":[{"op":"look","planet_lock":true,"pitch_off_deg":58}],"settle_s":1.0},
+  {"name":"shot","steps":[{"op":"screenshot"}],"settle_s":1.5}]}

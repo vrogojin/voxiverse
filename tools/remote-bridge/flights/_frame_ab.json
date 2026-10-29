@@ -1,0 +1,6 @@
+{ "name":"frame-ab","description":"cube-face-fold viewpoint: far/near tree pose (position+rotation) weld check","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":13}],"settle_s":1.5},
+  {"name":"tp","steps":[{"op":"teleport","lat_deg":-40.20,"lon_deg":-154.19,"alt":16,"yaw_deg":-71,"pitch_deg":-14}],"settle_s":16.0},
+  {"name":"s0","steps":[{"op":"screenshot","label":"frame-a"}],"settle_s":6.0},
+  {"name":"pan","steps":[{"op":"look","yaw_deg":20,"pitch_deg":-10}],"settle_s":6.0},
+  {"name":"s1","steps":[{"op":"screenshot","label":"frame-b"}],"settle_s":3.0}]}

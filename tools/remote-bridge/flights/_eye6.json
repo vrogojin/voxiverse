@@ -1,0 +1,5 @@
+{ "name":"eye6","description":"clean L1 eyeball: noon+freeze_time, teleport 240, look down","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":0.6},
+  {"name":"freeze time","steps":[{"op":"freeze_time","on":true}],"settle_s":0.5},
+  {"name":"set alt 240","steps":[{"op":"set_alt","alt":240}],"settle_s":1.5},
+  {"name":"look down","steps":[{"op":"look","pitch_deg":-40}],"settle_s":1.0}]}

@@ -1,0 +1,4 @@
+{ "name":"bw","description":"long band bake wait","legs":[
+  {"name":"w1","steps":[{"op":"wait","seconds":58}],"settle_s":58.0},
+  {"name":"w2","steps":[{"op":"wait","seconds":58}],"settle_s":58.0},
+  {"name":"shot","steps":[{"op":"screenshot"}],"settle_s":1.8}]}

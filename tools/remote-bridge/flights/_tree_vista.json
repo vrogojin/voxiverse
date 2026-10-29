@@ -1,0 +1,9 @@
+{ "name":"tree-vista","description":"noon, fly up, look out at the forest band (far trees?)","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":1.5},
+  {"name":"dev","steps":[{"op":"dev_nav","on":true}],"settle_s":1.0},
+  {"name":"up","steps":[{"op":"thrust","dy":1.0,"seconds":5,"gait":"walk"}],"settle_s":2.0},
+  {"name":"settle","steps":[{"op":"wait","seconds":12}],"settle_s":1.0},
+  {"name":"out","steps":[{"op":"look","pitch_deg":-10}],"settle_s":1.5},
+  {"name":"s0","steps":[{"op":"screenshot","label":"tv-0"}],"settle_s":1.5},
+  {"name":"t1","steps":[{"op":"look","yaw_deg":70}],"settle_s":1.2},
+  {"name":"s1","steps":[{"op":"screenshot","label":"tv-1"}],"settle_s":1.5}]}

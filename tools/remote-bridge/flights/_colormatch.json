@@ -1,0 +1,6 @@
+{ "name":"cm","description":"surface horizon near-vs-far colour","legs":[
+  {"name":"tp","steps":[{"op":"teleport","lat_deg":18,"lon_deg":24,"alt":35}],"settle_s":2.5},
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":1.0},
+  {"name":"settle","steps":[{"op":"wait","seconds":6}],"settle_s":6.0},
+  {"name":"look","steps":[{"op":"look","pitch_deg":-8}],"settle_s":1.2},
+  {"name":"shot","steps":[{"op":"screenshot"}],"settle_s":1.8}]}

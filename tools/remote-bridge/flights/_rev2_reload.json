@@ -1,0 +1,2 @@
+{ "name":"rev2_reload","description":"reload to the REV2 build","legs":[
+  {"name":"reload","steps":[{"op":"reload"}],"settle_s":3.0}]}

@@ -1,0 +1,9 @@
+{ "name":"descend-ladder","description":"drop from orbit in stages, capture tree ladder at each band","legs":[
+  {"name":"aim","steps":[{"op":"look","pitch_deg":-35}],"settle_s":1.5},
+  {"name":"s-orbit","steps":[{"op":"screenshot","label":"lad-0-orbit"}],"settle_s":1.5},
+  {"name":"d1","steps":[{"op":"thrust","dy":-1.0,"seconds":14,"gait":"run"}],"settle_s":6.0},
+  {"name":"s-high","steps":[{"op":"screenshot","label":"lad-1-high"}],"settle_s":1.5},
+  {"name":"d2","steps":[{"op":"thrust","dy":-1.0,"seconds":9,"gait":"run"}],"settle_s":6.0},
+  {"name":"s-mid","steps":[{"op":"screenshot","label":"lad-2-mid"}],"settle_s":1.5},
+  {"name":"d3","steps":[{"op":"thrust","dy":-1.0,"seconds":6,"gait":"walk"}],"settle_s":7.0},
+  {"name":"s-low","steps":[{"op":"screenshot","label":"lad-3-low"}],"settle_s":2.0}]}

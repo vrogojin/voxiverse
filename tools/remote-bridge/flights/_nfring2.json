@@ -1,0 +1,5 @@
+{ "name":"nfring2","description":"near-far ring: nadir look -85 then shoot (already at alt300 frozen)",
+  "legs":[
+    {"name":"nadir","steps":[{"op":"look","pitch_deg":-85}],"settle_s":1.0},
+    {"name":"bake","steps":[{"op":"wait","seconds":4}],"settle_s":4.0},
+    {"name":"shot","steps":[{"op":"screenshot","label":"nfring2"}],"settle_s":2.0}]}

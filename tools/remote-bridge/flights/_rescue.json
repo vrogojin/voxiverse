@@ -1,0 +1,4 @@
+{ "name":"rescue","description":"lift out of the ground","legs":[
+  {"name":"nofly","steps":[{"op":"set_fly","on":false}],"settle_s":0.4},
+  {"name":"up","steps":[{"op":"set_alt","alt":8}],"settle_s":2.5},
+  {"name":"settle","steps":[{"op":"wait","seconds":3}],"settle_s":3.0}]}

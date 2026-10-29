@@ -1,0 +1,6 @@
+{ "name":"rev4_day","description":"noon, elevate, look — daylight far colour + perf settle","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":1.5},
+  {"name":"up","steps":[{"op":"set_alt","alt":130}],"settle_s":4.0},
+  {"name":"freeze","steps":[{"op":"freeze_player","on":true}],"settle_s":0.5},
+  {"name":"look","steps":[{"op":"look","pitch_deg":-14}],"settle_s":2.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"rev4-day"}],"settle_s":2.0}]}

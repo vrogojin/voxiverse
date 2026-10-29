@@ -1,0 +1,4 @@
+{ "name":"safe","description":"release freezes + surface","legs":[
+  {"name":"drop","steps":[{"op":"set_alt","alt":6}],"settle_s":1.0},
+  {"name":"unfreeze player","steps":[{"op":"freeze_player","on":false}],"settle_s":0.5},
+  {"name":"unfreeze time","steps":[{"op":"freeze_time","on":false}],"settle_s":0.5}]}

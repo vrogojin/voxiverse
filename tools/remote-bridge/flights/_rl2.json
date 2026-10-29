@@ -1,0 +1,1 @@
+{ "name":"rl2","description":"reload to FP_BLOCK_DETAIL build","legs":[{"name":"reload","steps":[{"op":"reload"}],"settle_s":1.0}]}

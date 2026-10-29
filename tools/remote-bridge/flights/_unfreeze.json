@@ -1,0 +1,3 @@
+{ "name":"unfreeze","description":"release freeze","legs":[
+  {"name":"fp","steps":[{"op":"freeze_player","on":false}],"settle_s":0.4},
+  {"name":"ft","steps":[{"op":"freeze_time","on":false}],"settle_s":0.4}]}

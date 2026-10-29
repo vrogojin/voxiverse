@@ -1,0 +1,7 @@
+{ "name":"disk","description":"full lit disc for halo-ring check","legs":[
+  {"name":"geo","steps":[{"op":"teleport","lat_deg":5,"lon_deg":0,"alt":7000}],"settle_s":1.5},
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":0.6},
+  {"name":"ftime","steps":[{"op":"freeze_time","on":true}],"settle_s":0.3},
+  {"name":"fplayer","steps":[{"op":"freeze_player","on":true}],"settle_s":0.3},
+  {"name":"nadir","steps":[{"op":"look","planet_lock":true,"pitch_off_deg":0}],"settle_s":1.0},
+  {"name":"shot","steps":[{"op":"screenshot"}],"settle_s":1.5}]}

@@ -1,0 +1,6 @@
+{ "name":"rev3_check","description":"noon, freeze, shot — shader + quiescence base","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":1.0},
+  {"name":"up","steps":[{"op":"set_alt","alt":140}],"settle_s":3.0},
+  {"name":"freeze","steps":[{"op":"freeze_player","on":true}],"settle_s":0.5},
+  {"name":"look","steps":[{"op":"look","pitch_deg":-14}],"settle_s":1.5},
+  {"name":"shot","steps":[{"op":"screenshot","label":"rev3-check"}],"settle_s":2.0}]}

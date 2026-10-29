@@ -1,0 +1,4 @@
+{ "name":"tsw","description":"time sweep","legs":[
+  {"name":"look","steps":[{"op":"look","pitch_deg":-25}],"settle_s":0.6},
+  {"name":"mid","steps":[{"op":"set_time","local_hours":0}],"settle_s":1.5},
+  {"name":"s1","steps":[{"op":"screenshot"}],"settle_s":1.6}]}

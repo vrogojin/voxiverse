@@ -1,0 +1,5 @@
+{ "name":"ground-trees","description":"drop to ground, look horizontally at the trees","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":1.5},
+  {"name":"down","steps":[{"op":"set_alt","alt":3}],"settle_s":5.0},
+  {"name":"level","steps":[{"op":"look","pitch_deg":-3}],"settle_s":1.5},
+  {"name":"s","steps":[{"op":"screenshot","label":"ground-trees"}],"settle_s":2.0}]}

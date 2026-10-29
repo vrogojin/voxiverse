@@ -1,0 +1,7 @@
+{ "name":"fastfall","description":"climb high then fast free-fall (shell-off A/B)",
+  "legs":[
+    {"name":"dev_nav on","steps":[{"op":"dev_nav","on":true}],"settle_s":0.5},
+    {"name":"climb high","steps":[{"op":"thrust","dy":1.0,"seconds":30,"gait":"run"}],"settle_s":1.0,"expect":{"alt_gt":384}},
+    {"name":"drop","steps":[{"op":"dev_nav","on":false}],"settle_s":0.3},
+    {"name":"fall 45s","steps":[{"op":"wait","seconds":45}],"settle_s":0.5}
+  ] }

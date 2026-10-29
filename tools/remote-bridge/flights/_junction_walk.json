@@ -1,0 +1,6 @@
+{ "name":"junction-walk","description":"walk to a facet junction to eyeball the NB slab (before-fix baseline)","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":1.5},
+  {"name":"aim","steps":[{"op":"look","pitch_deg":-6}],"settle_s":1.0},
+  {"name":"walk1","steps":[{"op":"move","blocks":128,"heading":"forward","gait":"run"}],"settle_s":6.0},
+  {"name":"walk2","steps":[{"op":"move","blocks":128,"heading":"forward","gait":"run"}],"settle_s":8.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"junction-before"}],"settle_s":2.0}]}

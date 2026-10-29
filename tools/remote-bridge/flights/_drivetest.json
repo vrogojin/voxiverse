@@ -1,0 +1,9 @@
+{ "name":"drivetest","description":"climb to orbit then staged descent to landing — descent coverage/hitch test","legs":[
+  {"name":"dev on","steps":[{"op":"dev_nav","on":true}],"settle_s":0.5},
+  {"name":"climb to orbit","steps":[{"op":"thrust","dy":1.0,"seconds":30,"gait":"run"},{"op":"look","pitch_deg":-25},{"op":"screenshot","label":"orbit-top"}],"settle_s":1.5},
+  {"name":"descend A","steps":[{"op":"thrust","dy":-1.0,"seconds":7,"gait":"run"},{"op":"screenshot","label":"desc-A"}],"settle_s":0.6},
+  {"name":"descend B","steps":[{"op":"thrust","dy":-1.0,"seconds":7,"gait":"run"},{"op":"screenshot","label":"desc-B"}],"settle_s":0.6},
+  {"name":"descend C","steps":[{"op":"thrust","dy":-1.0,"seconds":7,"gait":"walk"},{"op":"screenshot","label":"desc-C"}],"settle_s":0.6},
+  {"name":"descend D","steps":[{"op":"thrust","dy":-1.0,"seconds":8,"gait":"walk"},{"op":"screenshot","label":"desc-D"}],"settle_s":0.6},
+  {"name":"land","steps":[{"op":"thrust","dy":-1.0,"seconds":10,"gait":"walk"},{"op":"screenshot","label":"landed"}],"settle_s":1.0}
+]}

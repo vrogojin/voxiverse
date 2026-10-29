@@ -1,0 +1,4 @@
+{ "name":"p2","description":"reload settle + move to trigger smooth_v2","legs":[
+  {"name":"reload","steps":[{"op":"reload"}],"settle_s":2.0},
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":1.0},
+  {"name":"w","steps":[{"op":"wait","seconds":56}],"settle_s":2.0}]}

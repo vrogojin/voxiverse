@@ -1,0 +1,5 @@
+{ "name":"l1eye2","description":"descend to ~250 (into the L1 band view) + hold + capture","legs":[
+  {"name":"down","steps":[{"op":"thrust","dy":-1.0,"seconds":4,"gait":"walk"}],"settle_s":1.0},
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":1.0},
+  {"name":"look","steps":[{"op":"look","pitch_deg":-38}],"settle_s":1.0},
+  {"name":"hold","steps":[{"op":"set_time","local_hours":12}],"settle_s":7.0}]}

@@ -1,0 +1,4 @@
+{ "name":"ontrunk","description":"close to centre tree, aim crosshair on trunk","legs":[
+  {"name":"fwd","steps":[{"op":"thrust","dz":1.0,"seconds":0.55,"gait":"run"}],"settle_s":1.0},
+  {"name":"aim","steps":[{"op":"look","pitch_deg":-2}],"settle_s":1.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"ontrunk"}],"settle_s":1.8}]}

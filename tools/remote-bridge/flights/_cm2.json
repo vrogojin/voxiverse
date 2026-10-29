@@ -1,0 +1,7 @@
+{ "name":"cm2","description":"near->far colour transition","legs":[
+  {"name":"up","steps":[{"op":"set_alt","alt":300}],"settle_s":2.0},
+  {"name":"fp","steps":[{"op":"freeze_player","on":true}],"settle_s":0.3},
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":0.6},
+  {"name":"bake","steps":[{"op":"wait","seconds":6}],"settle_s":6.0},
+  {"name":"look","steps":[{"op":"look","pitch_deg":-32}],"settle_s":1.3},
+  {"name":"shot","steps":[{"op":"screenshot"}],"settle_s":1.8}]}

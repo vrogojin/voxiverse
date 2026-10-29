@@ -1,0 +1,2 @@
+{ "name":"bound2","description":"look down at the near-block edge -> far-skin boundary","legs":[
+  {"name":"look mid-down","steps":[{"op":"look","pitch_deg":-26}],"settle_s":2.5}]}

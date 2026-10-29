@@ -1,0 +1,5 @@
+{ "name":"walkedge","description":"day + walk toward/across a facet edge","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":1.5},
+  {"name":"aim","steps":[{"op":"look","pitch_deg":-4}],"settle_s":1.0},
+  {"name":"walk","steps":[{"op":"move","blocks":220}],"settle_s":55.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"nb-edge"}],"settle_s":2.0}]}

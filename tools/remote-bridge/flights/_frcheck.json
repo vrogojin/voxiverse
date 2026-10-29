@@ -1,0 +1,3 @@
+{ "name":"frcheck","description":"fresh frame of standing spot to check near blocky terrain","legs":[
+  {"name":"look","steps":[{"op":"look","pitch_deg":-12}],"settle_s":1.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"frcheck"}],"settle_s":2.0}]}

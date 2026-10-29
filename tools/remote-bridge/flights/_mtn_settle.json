@@ -1,0 +1,4 @@
+{ "name":"mtn-settle","description":"daylight at facet 578 + settle + stream, re-capture","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":2.0},
+  {"name":"wait","steps":[{"op":"wait","seconds":12}],"settle_s":1.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"mtn-after-2"}],"settle_s":2.0}]}

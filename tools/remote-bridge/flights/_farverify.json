@@ -1,0 +1,3 @@
+{ "name":"farverify","description":"teleport far + verify streaming settle","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":0.6},
+  {"name":"teleport far","steps":[{"op":"teleport","lat_deg":30,"lon_deg":90,"alt":5}],"settle_s":1.0}]}

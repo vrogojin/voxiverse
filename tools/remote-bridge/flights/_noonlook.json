@@ -1,0 +1,4 @@
+{ "name":"noonlook","description":"daylight aerial: climb a bit more, look down at near->far blocky transition","legs":[
+  {"name":"climb","steps":[{"op":"thrust","dy":1.0,"seconds":5,"gait":"run"}],"settle_s":0.6},
+  {"name":"look down","steps":[{"op":"look","pitch_deg":-32}],"settle_s":0.6},
+  {"name":"shoot","steps":[{"op":"screenshot","label":"noonlook"}],"settle_s":1.8}]}

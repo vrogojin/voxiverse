@@ -1,0 +1,4 @@
+{ "name":"today2","description":"traverse toward day side + look at lit surface","legs":[
+  {"name":"level","steps":[{"op":"look","pitch_deg":0}],"settle_s":0.2},
+  {"name":"traverse","steps":[{"op":"thrust","dz":1.0,"seconds":115,"gait":"run"}],"settle_s":0.3},
+  {"name":"look","steps":[{"op":"look","pitch_deg":-25}],"settle_s":0.2}]}

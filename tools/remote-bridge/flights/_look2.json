@@ -1,0 +1,2 @@
+{ "name":"look2","description":"re-look down at held alt","legs":[
+  {"name":"look2","steps":[{"op":"look","pitch_deg":-60}],"settle_s":2.0}]}

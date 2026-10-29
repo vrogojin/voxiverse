@@ -1,0 +1,6 @@
+{ "name":"ftcolor","description":"verify far-tree mesh-band colors (128-448) clean after colorfix","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":13}],"settle_s":1.0},
+  {"name":"up","steps":[{"op":"teleport","lat_deg":-42.695,"lon_deg":-140.939,"alt":150,"yaw_deg":0,"pitch_deg":-22}],"settle_s":16.0},
+  {"name":"c0","steps":[{"op":"screenshot","label":"ftcolor-a"}],"settle_s":7.0},
+  {"name":"turn","steps":[{"op":"look","yaw_deg":90,"pitch_deg":-22}],"settle_s":8.0},
+  {"name":"c1","steps":[{"op":"screenshot","label":"ftcolor-b"}],"settle_s":3.0}]}

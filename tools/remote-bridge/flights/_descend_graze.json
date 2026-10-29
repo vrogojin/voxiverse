@@ -1,0 +1,4 @@
+{ "name":"descend-graze","description":"drop to a low vantage + grazing horizon look to test 3D relief","legs":[
+  {"name":"descend","steps":[{"op":"thrust","dy":-1.0,"seconds":12,"gait":"run"}],"settle_s":2.0},
+  {"name":"graze","steps":[{"op":"look","pitch_deg":72}],"settle_s":2.0},
+  {"name":"s1","steps":[{"op":"screenshot","label":"graze-1"}],"settle_s":1.5}]}

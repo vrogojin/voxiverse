@@ -1,0 +1,6 @@
+{ "name":"mesa-revisit","description":"back to the badlands grey-oval spot, midday, verify oval->terrain","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":13}],"settle_s":1.5},
+  {"name":"tp","steps":[{"op":"teleport","lat_deg":-40.20,"lon_deg":-154.19,"alt":30,"yaw_deg":35,"pitch_deg":-8}],"settle_s":16.0},
+  {"name":"s0","steps":[{"op":"screenshot","label":"mesa-revisit-a"}],"settle_s":6.0},
+  {"name":"look","steps":[{"op":"look","pitch_deg":-14}],"settle_s":4.0},
+  {"name":"s1","steps":[{"op":"screenshot","label":"mesa-revisit-b"}],"settle_s":3.0}]}

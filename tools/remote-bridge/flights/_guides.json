@@ -1,0 +1,8 @@
+{ "name":"gd","description":"dev-nav guides on planet from orbit","legs":[
+  {"name":"unfreeze","steps":[{"op":"freeze_player","on":false}],"settle_s":0.3},
+  {"name":"up","steps":[{"op":"set_alt","alt":2600}],"settle_s":2.0},
+  {"name":"fp","steps":[{"op":"freeze_player","on":true}],"settle_s":0.3},
+  {"name":"devnav","steps":[{"op":"dev_nav","on":true}],"settle_s":1.0},
+  {"name":"look","steps":[{"op":"look","planet_lock":true,"pitch_off_deg":0}],"settle_s":1.5},
+  {"name":"settle","steps":[{"op":"wait","seconds":3}],"settle_s":3.0},
+  {"name":"shot","steps":[{"op":"screenshot"}],"settle_s":1.8}]}

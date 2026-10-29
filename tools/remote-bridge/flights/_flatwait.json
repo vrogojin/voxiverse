@@ -1,0 +1,4 @@
+{ "name":"fw","description":"nadir + wait for band bake","legs":[
+  {"name":"look","steps":[{"op":"look","pitch_deg":-72}],"settle_s":1.5},
+  {"name":"bake","steps":[{"op":"wait","seconds":55}],"settle_s":55.0},
+  {"name":"shot","steps":[{"op":"screenshot"}],"settle_s":1.8}]}

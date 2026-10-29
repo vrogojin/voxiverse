@@ -1,0 +1,6 @@
+{ "name":"noonaerial","description":"daylight: climb modestly and look out to eyeball near->far blocky transition","legs":[
+  {"name":"dev on","steps":[{"op":"dev_nav","on":true}],"settle_s":0.3},
+  {"name":"level","steps":[{"op":"look","pitch_deg":0}],"settle_s":0.2},
+  {"name":"climb","steps":[{"op":"thrust","dy":1.0,"seconds":7,"gait":"run"}],"settle_s":0.6},
+  {"name":"look out","steps":[{"op":"look","pitch_deg":-14}],"settle_s":0.6},
+  {"name":"shoot","steps":[{"op":"screenshot","label":"noonaerial"}],"settle_s":1.8}]}

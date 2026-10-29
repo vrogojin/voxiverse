@@ -1,0 +1,4 @@
+{ "name":"closetree","description":"firmer approach to trunk","legs":[
+  {"name":"fwd","steps":[{"op":"thrust","dz":1.0,"seconds":2.2,"gait":"run"}],"settle_s":1.2},
+  {"name":"aim","steps":[{"op":"look","pitch_deg":-1}],"settle_s":1.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"closetree"}],"settle_s":1.8}]}

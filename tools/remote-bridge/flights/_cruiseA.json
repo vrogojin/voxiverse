@@ -1,0 +1,3 @@
+{ "name":"cA","description":"cruise toward planet","legs":[
+  {"name":"look","steps":[{"op":"look","planet_lock":true,"pitch_off_deg":0}],"settle_s":1.2},
+  {"name":"cruise","steps":[{"op":"thrust","cruise":true,"seconds":6}],"settle_s":7.5}]}

@@ -1,0 +1,1 @@
+{ "name":"sw","description":"sweep","legs":[{"name":"look","steps":[{"op":"look","pitch_deg":-70}],"settle_s":1.0},{"name":"shot","steps":[{"op":"screenshot"}],"settle_s":1.2}]}

@@ -1,0 +1,3 @@
+{ "name":"climb2b","description":"climb more + pitch down a touch","legs":[
+  {"name":"climb","steps":[{"op":"thrust","dy":1.0,"seconds":12,"gait":"run"}],"settle_s":0.4},
+  {"name":"pitch","steps":[{"op":"look","pitch_deg":-35}],"settle_s":0.1}]}

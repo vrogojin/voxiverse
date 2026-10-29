@@ -1,0 +1,4 @@
+{ "name":"lookdown","description":"aim nadir + sweep + shot","legs":[
+  {"name":"aim","steps":[{"op":"look","planet_lock":true}],"settle_s":1.5},
+  {"name":"sweep","steps":[{"op":"wait","seconds":16}],"settle_s":16.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"orbit-bc2"}],"settle_s":2.0}]}

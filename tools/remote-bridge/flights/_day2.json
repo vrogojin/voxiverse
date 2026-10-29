@@ -1,0 +1,3 @@
+{ "name":"day2","description":"noon + freeze for chop test","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":0.6},
+  {"name":"freeze","steps":[{"op":"freeze_time","on":true}],"settle_s":0.4}]}

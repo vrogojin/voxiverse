@@ -1,0 +1,4 @@
+{ "name":"l1cap","description":"noon + look down + hold for clean L1 frame","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":1.5},
+  {"name":"look","steps":[{"op":"look","pitch_deg":-40}],"settle_s":1.0},
+  {"name":"hold","steps":[{"op":"set_time","local_hours":12}],"settle_s":7.0}]}

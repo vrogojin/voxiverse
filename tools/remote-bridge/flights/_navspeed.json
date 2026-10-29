@@ -1,0 +1,5 @@
+{ "name":"ns","description":"orbit + devnav + thrust-down speed test","legs":[
+  {"name":"orbit","steps":[{"op":"set_alt","alt":6000}],"settle_s":2.0},
+  {"name":"dn","steps":[{"op":"dev_nav","on":true}],"settle_s":0.8},
+  {"name":"down","steps":[{"op":"look","pitch_deg":-80}],"settle_s":0.6},
+  {"name":"thr","steps":[{"op":"thrust","dz":-1,"seconds":12,"gait":"run"}],"settle_s":12.5}]}

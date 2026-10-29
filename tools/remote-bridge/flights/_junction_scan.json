@@ -1,0 +1,9 @@
+{ "name":"junction-scan","description":"360 horizon scan at the junction to surface the floating far-tier slab","legs":[
+  {"name":"horizon","steps":[{"op":"look","pitch_deg":0}],"settle_s":1.5},
+  {"name":"s0","steps":[{"op":"screenshot","label":"jscan-0"}],"settle_s":1.5},
+  {"name":"t1","steps":[{"op":"look","yaw_deg":90}],"settle_s":1.5},
+  {"name":"s1","steps":[{"op":"screenshot","label":"jscan-1"}],"settle_s":1.5},
+  {"name":"t2","steps":[{"op":"look","yaw_deg":90}],"settle_s":1.5},
+  {"name":"s2","steps":[{"op":"screenshot","label":"jscan-2"}],"settle_s":1.5},
+  {"name":"t3","steps":[{"op":"look","yaw_deg":90}],"settle_s":1.5},
+  {"name":"s3","steps":[{"op":"screenshot","label":"jscan-3"}],"settle_s":1.5}]}

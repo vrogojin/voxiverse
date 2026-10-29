@@ -1,0 +1,2 @@
+{ "name":"l1eye3","description":"firm drop to L1-band altitude + hold + capture","legs":[
+  {"name":"down","steps":[{"op":"thrust","dy":-1.0,"seconds":3,"gait":"run"}],"settle_s":1.5}]}

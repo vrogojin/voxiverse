@@ -1,0 +1,5 @@
+{ "name":"acaciafind","description":"find savanna acacia, test collision (aim registers on trunk)","legs":[
+  {"name":"noon","steps":[{"op":"set_time","local_hours":12}],"settle_s":1.0},
+  {"name":"tp savanna","steps":[{"op":"teleport","lat_deg":20,"lon_deg":0,"alt":20}],"settle_s":5.0,"expect":{"alt_gt":-1}},
+  {"name":"look","steps":[{"op":"look","pitch_deg":-4}],"settle_s":2.0},
+  {"name":"shot","steps":[{"op":"screenshot","label":"acaciafind"}],"settle_s":2.0}]}

@@ -1,0 +1,17 @@
+---
+name: voxiverse-backstop-diet
+description: 2026-08-14
+metadata: 
+  node_type: memory
+  type: project
+---
+
+Task #129 backstop vertex diet, root-caused 2026-08-14 (served-pck-verified, deploy-cheats worktree pck of 2026-08-14).
+
+**The 489k verts decompose:** dense backstop (≤17 facets @ BACKSTOP_CELLS=16, active∪excluded≤4∪sticky≤12) ≈ 40-78k verts (~10-16%); the other ~84-90% is the **coarse CELLS=4 front hemisphere (~1716 facets) wall-expanded ×3.5 by FP_BLOCKY_FARRING** (112 tris/facet worst vs 32 smooth). Emitted in full while WALKING because `shell_set_camera_abs` floors θ_emit to 90° when floored (facet_far_ring.gd:1228) — the camera-set law already computes the correct altitude cap; on the surface ~89% of emitted facets are provably below the horizon (R=6371, H_MAX=112 → nothing beyond θ_h+~23° visible).
+
+**Fix (design, docs/COSMOS-BACKSTOP-DIET-DESIGN.md):** P0 = FP_SHELL_SURF_CAP: replace the 90° floor with θ_h + SHELL_SURF_CAP_DEG(29° = 11° relief-limb + 15° slack + 3° facet slop). 489k → ~135k verts (−72%). One line, rides existing re-emit machinery; roles/sticky/[[voxiverse-stream-idle-diet]] CALM untouched (all ⊂ cap). P1 optional = enable existing U2 FP_FARRING_CULL_COVERED (off live) for the dense share. Honest median bound: shell is ONE draw call → win is GPU vertex + upload; +2-6 fps p50 expected, gate on the forest-doc §6.4(a) `_mi.visible=false` probe FIRST.
+
+**Measurement law:** the async farring telemetry event carries REAL ARRAY_VERTEX size (:2349); the sync event carries a smooth-path ESTIMATE tris*3 (:3034) that under-counts blocky walls — always trust the async number. Blocky per-cell budget: top 2 + internal walls 2/edge (skipped iff |Δr|≤0.01, so flats emit fewer) + unconditional boundary/edge skirts.
+
+**SHIPPED as code (committed 0fde6ea, DEPLOYED live) + gated 48/0 both states (verify_shell.gd G-DIET-VERTS/OFF/SOUND/ROLES; SOUND = exhaustive 3456-facet no-see-through at 4 altitudes; a gate-only absolute-cap override param on shell_set_camera_abs, default -1 = byte-off), FLAT 6042/0. BUT NOT MERGED — the live A/B FALSIFIED the "median unlock" premise:** standing warm forest floor-OFF fps median 55.5 / prims 645k vs floor-ON 54.5 / prims 534k → **−110k prims, fps UNCHANGED.** That is a clean proof the REST frame is NOT shell-vertex-bound (cutting ~110k prims freed GPU it wasn't waiting on; rest fps is ~55 near the 60 vsync cap). Live prim drop (−110k) also << the design's −350k (shell not as dominant of total prims as the 489k suggested; near-field + trees vary). See-through invariant HELD (visual + gate). The diet is still worth something (−20MB upload, 4-5× cheaper re-emits at crossings/climbs, no see-through) but is NOT an fps fix. User verdict: "keep digging for the real fps limiter" → diet left DEPLOYED-not-MERGED; forest-fps root-cause RE-OPENED (see [[voxiverse-forest-fps-root]]): the median is dragged by a ~25ms WORST-FRAME source that is NOT smooth_v2 (0 commits at rest over 536 samples — the 25.8ms is a LATCHED stale value), NOT phys (5.6ms), NOT shell verts; floor_p10=12.2ms (best frames 82fps) but frame_worst_ema 25.5 > setpoint 24.4 pins stream_credit=0. LESSON: prove a perf premise by A/B before shipping the "unlock" — a vertex cut with zero fps delta IS the falsification. Metric traps re-confirmed live: proc_ms=whole-frame(invalid), worst_ms=windowed(not per-frame), smooth_v2_commit_ms/tex_worst_ms=LATCHED last-event.

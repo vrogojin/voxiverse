@@ -1,0 +1,19 @@
+---
+name: voxiverse-far-skin-block-color
+description: "2026-08-10 far skin painted BIOME colour not block colour on 9 GDScript color_for sites (C++ fine-map already block-exact); fix FP_SKIN_BLOCK_COLOR routes them through fine-map's law, GDScript-only NO rebuild; SHIPPED PR #38"
+metadata:
+  node_type: memory
+  type: project
+---
+
+User directive: "We MUST primarily have block colors, not biome colors — each pixel = its respective surface block's texture-induced colour."
+
+ROOT CAUSE (confirmed, doc docs/COSMOS-SKIN-BLOCK-COLOR-DESIGN.md): `FarPalette.color_for(g,biome,t,clamped_sea)` (far_palette.gd:222) returns `biome_base(biome,t)` for ALL dry land — ONE flat colour per biome; the block/height `g` is only used for the sea-level + snow-cap tests, never to pick land colour. The C++ orbit-skin `far_color` (patch 0008) is a byte-equal port of the SAME biome switch. So BOTH far paths were biome-coloured. BUT the **fine-map / tile-bake tier was ALREADY block-exact** (`FP_SKIN_BLOCK_EXACT`, patch 0011: `far_color_index_of_block(top_block_id(g,biome,t,x,z))`) — that C++ path needed NO change. `FP_FAR_COLOR_UNIFIED` only made the biome tints equal the block-exact MEAN-per-biome (closes the tier seam, still one flat colour per biome).
+
+The gap = 9 pure-GDScript `color_for` consumers OUTSIDE the fine map: far-ring shell/backstop/envelope (facet_far_ring.gd ×7 incl. `_weld_node` shared by 5 callers), FacetSmoothV2 relief annulus (facet_smooth_v2.gd `build_tile`), block-LOD (facet_block_lod_ring.gd:481, shared by orbit/global). OUT OF SCOPE (kept color_for): the 3 main-thread lazy-init prewarm calls (block_lod_ring:179 etc.), FacetSkinTier (not constructed, task #60), surface_shot tint pages.
+
+FIX FP_SKIN_BLOCK_COLOR (const:=false, byte-off): new WORKER-SAFE `FarPalette.color_for_block` + `skin_color`/`skin_color_at` helpers routing every site through the fine-map's law `far_color_index_of_block(top_block_id(...))` quantised to the 14-entry `frozen_colors()`. Worker-safe = pure `_fc_rgb`/`_block_idx` array reads (both built main-thread by `ensure_far_index_ready`); NEVER `_top_color`/`BlockTextures.mean_color_of` (they `load()` a PNG → stall/fault on the WorkerThreadPool builders these tiers run on). Per-cell x,z for the taiga podzol-hash speckle from `FacetAtlas.world_to_lattice64(fid,wx,wy,wz)` (the same inverse-lattice tool the fine-map bake uses) off each site's existing world point. **PURE GDSCRIPT — NO ENGINE REBUILD** (only g/biome/temp/dir cross the C++ boundary; colour is applied GDScript-side; the C++ fine-map was already block-exact). NEVER-OOM: zero new resident bytes (reuses _fc_rgb/_block_idx).
+
+Gate verify_skin_block_color.gd 16/0: G-SBC-OFF (skin_color(on=false) byte-exact to color_for), G-SBC-ON-DISCRIMINATES (mixed savanna/taiga/mountain tile ≥2 distinct palette indices ON vs all-flat OFF), G-SBC-PARITY (== fine-map far_color_index_of_block(top_block_id), exact index not tolerance), G-SBC-WORKER-SAFE (grep no _top_color(/mean_color_of( under ON branches). FLAT verify_feature 6042/0.
+
+SHIPPED: deploy/cheats-eyeball @ 350193e, DEPLOYED live @143 flags; MERGED to main PR #38 (f8223ef, 2026-08-10). Live orbit A/B (alt 1606, daylight, 60fps, vmem 163MB) confirmed per-cell block colours: reddish dirt/podzol speckle over grass-green plains, distinct sand/red_sand(badlands orange)/snow/ice/water/mud, block-granular jagged region boundaries (vs prior smooth biome blobs). PR cherry-pick onto main hit ONE conflict at facet_far_ring.gd site-2 composite (main lacks caeca81's FP_SKIN_RELIEF_SHADE relief-multiply, task #99) — resolved to skin_color-only, dropping the relief lines (independent PR). Related: [[voxiverse-far-geometry-prebake]] (task #99 relief, still OPEN), [[voxiverse-bg-prebake-design]], [[voxiverse-remote-bridge]] (flight schema). Deploy CS_FLAGS now ends ...FP_GLOBAL_RELIEF_DATA FP_SKIN_RELIEF_SHADE FP_SKIN_BLOCK_COLOR.

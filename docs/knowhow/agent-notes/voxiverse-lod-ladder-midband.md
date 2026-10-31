@@ -1,0 +1,19 @@
+---
+name: voxiverse-lod-ladder-midband
+description: 2026-08-11 task
+metadata: 
+  node_type: memory
+  type: project
+---
+
+2026-08-11 (task #107): user's "mountain turns into giant low-res blocks on approach" ROOT-CAUSED — the LIVE pck fingerprint (curl index.pck + headless `get_script_constant_map` dump, the reusable script is `scratchpad/dump_flags.gd`) shows **FP_BLOCK_LOD/_RINGS/_GLOBAL/_ORBIT all FALSE — the block-LOD pyramid is NOT live**; the giant blocks are the far-ring dense BACKSTOP (BACKSTOP_CELLS=16 ⇒ ~26-blk cells) emitted as literal flat-top blocks under FP_BLOCKY_FARRING=true, at TRUE heights outside the ~112-blk applied ellipsoid (FP_FARRING_UNCOVERED_TRUE).
+
+The ladder is NON-MONOTONE on live-pool facets: SmoothV2 annulus starts at hop-2 (V2_HOP_B=2, drops the tile when a facet becomes hop-1), FacetLodMesher skips live-pool facets AND its A2 ℓ1 seam pin excludes them (facet_lod_mesher.gd:752-761) — **FP_NB_FULLRES (PR #41) made all 4 edge neighbours live-pool, silently trading their whole-facet 2-blk ℓ1 LOD cover for a ~112-blk full-res patch** ⇒ 1-blk → 26-blk (112..~830) → 8-blk smooth (hop2-4) inversion. Measured repro: peak at d≈430 (g 55-62, biome 9) straddling fid 748 (hop-1 pool) / 797 (hop-2 smooth); 26-blk at 430 ≈ 42 px.
+
+Fix design (docs/COSMOS-LOD-LADDER-MIDBAND-DESIGN.md, branch fix/voxiverse-lod-ladder): **FP_SMOOTH_V2_NEARCOVER** — V2 annulus hop [2..H]→[0..H], uniform ~1.5-blk radial sink on ALL tiles (weld-safe pure-of-pos; near voxels overdraw = skin SINK law, no dynamic holes), and enable the ALREADY-BUILT FP_SMOOTH_V2_EXCL_BLKLOD suppression (facet_far_ring.gd:1846/2803) so the blocky backstop stops emitting under resident V2 tiles. +0.75 MB, kills the crossing unload-pop too, also shrinks task #72's surface. Gate G-LAD-MONO: as-rendered cover pitch monotone along player→peak ray. Fallbacks: dense backstop 16→52 cells on pool facets; M2 ℓ1 re-admission (rejected: z-fight + churn).
+
+CORRECTION (twin-investigation merge, same day): my summit attribution was WRONG — re-probe at g≥66 puts the whole summit cluster (g 66-72, d≈457) on fid 797 (hop-2, NON-pool, smooth-resident) where the backstop never emits; the summit steps are **M2 FacetLodMesher ℓ2/ℓ3 megablocks protruding OVER the resident SmoothV2 TIN** (M2 is smooth-blind; budgeter first-covers at max(target,ℓ3) with idle-only refinement, facet_lod_mesher.gd:333-338; SSE uses facet-CENTRE distance). The 26-blk backstop mechanism holds for the 748 SHOULDER (g 55-62). Merged fixes: + FP_M2_SMOOTH_DEFER (skip ALL M2 wants on smooth-resident facets — NB: the SMOOTH twin's "allow ℓ1" variant transits through the ℓ3 first-cover floor, must gate that too) + FP_M2_EDGE_DIST (nearest-quad-point distance into sse_lc). G-LAD-MONO must include the M2 tier in frontmost-cover.
+
+N0 SHIPPED (branch): verify_lod_ladder.gd G-LAD baseline pin 8/8 (incl. dual-viewport rows vh 540/1080 proving the granted-ℓ3 first-cover floor is canvas-independent) — rung table near-1 (≤112) → backstop-26.1 (130-300, pool fid 773) → m2_l3-8 (430-800 over smooth); summit M2 ℓ3 top 72.0 vs smooth TIN 58.66 = +13.3 blk protrusion MEASURED. Locked: C1 v1 = skip-ALL M2 wants on smooth-resident (ℓ1-allowed variant unsound: budgeter first-covers at max(target,ℓ3), idle-only refine) + REQUIRED immediate-evict on the resident transition (LOD_IDLE_DEMOTE_S=30 s measured, 3× past acceptability). Gate NOTE: pin models the LIVE fingerprint via its own LIVE_NB_FULLRES const (repo consts are default-false — reading CubeSphere.FP_* in a pin gate silently voids it). Acceptance = live approach A/B 800/470/250/130 blk toward the 797 summit.
+
+Related: [[voxiverse-block-lod-design]], [[voxiverse-lod-ladder-smooth]], [[voxiverse-far-smooth-geometry]], [[voxiverse-nb-fullres]], [[voxiverse-tier-depth-priority]].

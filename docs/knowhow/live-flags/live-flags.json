@@ -1,0 +1,2625 @@
+{
+ "format": "voxiverse-live-flags/1",
+ "pack": {
+  "name": "index.pck",
+  "sha256": "b5050e421cf7cd0a4167d3eb569a622ad78eae8f4ed014a0e8a50f11a01306d0",
+  "godot_version": "4.4.1",
+  "gdscript_tokenizer_version": [
+   100
+  ],
+  "scripts": 311
+ },
+ "source_revision": "f305400edd575489a5191876edab5d8d771e8e45",
+ "counts": {
+  "bool_consts_in_pack": 370,
+  "live_true": 279,
+  "live_false": 91,
+  "flips_false_to_true": 234,
+  "flips_by_file": {
+   "godot/src/cosmos/cube_sphere.gd": 233,
+   "godot/src/net/remote_bridge.gd": 1
+  },
+  "default_true_live_true": 45,
+  "live_differs_other": 0,
+  "missing_in_source": 0
+ },
+ "must_stay_off": [
+  "FP_RADIAL_DATUM",
+  "FP_CLOUDS",
+  "FP_PRECIP",
+  "FP_STORMS",
+  "FP_TIER_DEPTH_BIAS"
+ ],
+ "records": [
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FACETED_SPIKE",
+   "source_default": false,
+   "live_value": false,
+   "line": 41
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FACETED",
+   "source_default": false,
+   "live_value": true,
+   "line": 47
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FACET_TWIST",
+   "source_default": false,
+   "live_value": false,
+   "line": 49
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_R0",
+   "source_default": false,
+   "live_value": false,
+   "line": 54
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_M1_POOL",
+   "source_default": false,
+   "live_value": true,
+   "line": 63
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_NB_FULLRES",
+   "source_default": false,
+   "live_value": true,
+   "line": 89
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_NB_WELD",
+   "source_default": false,
+   "live_value": true,
+   "line": 108
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_M2_LOD",
+   "source_default": false,
+   "live_value": true,
+   "line": 139
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_BULK_UNDERGROUND",
+   "source_default": false,
+   "live_value": true,
+   "line": 153
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_COLBULK",
+   "source_default": false,
+   "live_value": false,
+   "line": 173
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_STAMP",
+   "source_default": false,
+   "live_value": false,
+   "line": 194
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_CPPGEN",
+   "source_default": false,
+   "live_value": true,
+   "line": 224
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_GEN_PROFS_TLS",
+   "source_default": false,
+   "live_value": false,
+   "line": 233
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_GEN_ALLOC_PROBE",
+   "source_default": false,
+   "live_value": false,
+   "line": 242
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_GEN_LOCK_PROBE",
+   "source_default": false,
+   "live_value": false,
+   "line": 247
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_CLIMATE_BIOMES",
+   "source_default": false,
+   "live_value": true,
+   "line": 259
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_NEIGHBOUR_SEAM_POLISH",
+   "source_default": true,
+   "live_value": true,
+   "line": 270
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_NO_NEAR_LOD",
+   "source_default": false,
+   "live_value": true,
+   "line": 283
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FULLRES_256",
+   "source_default": false,
+   "live_value": false,
+   "line": 292
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_NEAR_RADIUS_DIET",
+   "source_default": false,
+   "live_value": true,
+   "line": 303
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_ATLAS_MATERIAL",
+   "source_default": false,
+   "live_value": true,
+   "line": 319
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FARRING_FAST_REBUILD",
+   "source_default": false,
+   "live_value": true,
+   "line": 334
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FARRING_ASYNC_REBUILD",
+   "source_default": false,
+   "live_value": true,
+   "line": 351
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FARRING_BULK_EMIT",
+   "source_default": false,
+   "live_value": true,
+   "line": 366
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FARRING_SECTORS",
+   "source_default": false,
+   "live_value": true,
+   "line": 386
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FARRING_EMIT_ACCUM",
+   "source_default": false,
+   "live_value": true,
+   "line": 402
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SHELL_STAGE_REEMIT",
+   "source_default": false,
+   "live_value": true,
+   "line": 414
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SHELL_PREWARM_DESCENT",
+   "source_default": false,
+   "live_value": true,
+   "line": 432
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SHELL_ASCENT_LAZY",
+   "source_default": false,
+   "live_value": false,
+   "line": 459
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_OFFSURF_MAT_PREWARM",
+   "source_default": false,
+   "live_value": false,
+   "line": 467
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SHELL_SECTOR_FINE",
+   "source_default": false,
+   "live_value": true,
+   "line": 478
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FARRING_FULL_COVER",
+   "source_default": false,
+   "live_value": true,
+   "line": 492
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FARRING_LIMB_DENSE",
+   "source_default": false,
+   "live_value": false,
+   "line": 508
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SHELL_WELD",
+   "source_default": false,
+   "live_value": true,
+   "line": 528
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_RADIAL_DATUM",
+   "source_default": false,
+   "live_value": false,
+   "line": 543
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_DATUM_BAKE",
+   "source_default": false,
+   "live_value": true,
+   "line": 559
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_DATUM_EDGE_WELD",
+   "source_default": false,
+   "live_value": true,
+   "line": 576
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_TIER_STICKY_BACKSTOP",
+   "source_default": false,
+   "live_value": true,
+   "line": 589
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_TIER_ENVELOPE",
+   "source_default": false,
+   "live_value": true,
+   "line": 604
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_TIER_DEPTH_BIAS",
+   "source_default": false,
+   "live_value": false,
+   "line": 615
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_TIER_WARM_CONVERGE",
+   "source_default": false,
+   "live_value": true,
+   "line": 633
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_ENV_ALL",
+   "source_default": false,
+   "live_value": true,
+   "line": 640
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_ENV_WARM_ASYNC",
+   "source_default": false,
+   "live_value": true,
+   "line": 649
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_ENV_FALLBACK_EMIT",
+   "source_default": false,
+   "live_value": true,
+   "line": 662
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_ENV_FLOORED_ASYNC",
+   "source_default": false,
+   "live_value": true,
+   "line": 677
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_MID_DENSE",
+   "source_default": false,
+   "live_value": false,
+   "line": 691
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SKIN_TIER",
+   "source_default": false,
+   "live_value": false,
+   "line": 703
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FACET_TEX",
+   "source_default": false,
+   "live_value": true,
+   "line": 717
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SKIN_TEXTURE_MEAN",
+   "source_default": false,
+   "live_value": true,
+   "line": 724
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SKIN_BLOCK_EXACT",
+   "source_default": false,
+   "live_value": true,
+   "line": 735
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FAR_COLOR_UNIFIED",
+   "source_default": false,
+   "live_value": true,
+   "line": 750
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SKIN_BLOCK_COLOR",
+   "source_default": false,
+   "live_value": true,
+   "line": 765
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_BLOCKY_FARRING",
+   "source_default": false,
+   "live_value": true,
+   "line": 776
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_BLOCKY_TEX",
+   "source_default": false,
+   "live_value": true,
+   "line": 789
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_BLOCK_DETAIL",
+   "source_default": false,
+   "live_value": false,
+   "line": 806
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_DETAIL_GRID",
+   "source_default": false,
+   "live_value": false,
+   "line": 817
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_BAND_BLOCK_MAP",
+   "source_default": false,
+   "live_value": true,
+   "line": 836
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SKIN_FLATCOLOR",
+   "source_default": false,
+   "live_value": true,
+   "line": 843
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_BAND_META_TEX",
+   "source_default": false,
+   "live_value": true,
+   "line": 849
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_PLANET_MAP",
+   "source_default": false,
+   "live_value": true,
+   "line": 856
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_CPP_FINE_BAKE",
+   "source_default": false,
+   "live_value": false,
+   "line": 864
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_CPP_TILE_BAKE",
+   "source_default": false,
+   "live_value": true,
+   "line": 872
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FT_SKIN_CHOP",
+   "source_default": false,
+   "live_value": true,
+   "line": 880
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SKIN_SHADE_PACK",
+   "source_default": false,
+   "live_value": true,
+   "line": 894
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_OBJ_LOD",
+   "source_default": false,
+   "live_value": true,
+   "line": 906
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_OBJ_LOD_DEBRIS",
+   "source_default": false,
+   "live_value": true,
+   "line": 917
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_OBJ_LOD_SPACE",
+   "source_default": false,
+   "live_value": false,
+   "line": 930
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_CPP_SMOOTH_BAKE",
+   "source_default": false,
+   "live_value": false,
+   "line": 964
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_GLOBAL_RELIEF_DATA",
+   "source_default": false,
+   "live_value": true,
+   "line": 990
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SKIN_RELIEF_SHADE",
+   "source_default": false,
+   "live_value": false,
+   "line": 991
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_RELIEF_REEMIT",
+   "source_default": false,
+   "live_value": false,
+   "line": 1008
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_ORBIT_RELIEF",
+   "source_default": false,
+   "live_value": true,
+   "line": 1081
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_OR_FLIP_STAGE",
+   "source_default": false,
+   "live_value": false,
+   "line": 1110
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_OR_WORKER_DECODE",
+   "source_default": false,
+   "live_value": false,
+   "line": 1126
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_OR_COMMIT_PARTIAL",
+   "source_default": false,
+   "live_value": true,
+   "line": 1148
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_ORBIT_RELIEF_SURFACE_HIDE",
+   "source_default": false,
+   "live_value": true,
+   "line": 1159
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FAR_TREES",
+   "source_default": false,
+   "live_value": true,
+   "line": 1172
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FAR_TREES_CARDS",
+   "source_default": false,
+   "live_value": true,
+   "line": 1173
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FAR_TREES_MESH",
+   "source_default": false,
+   "live_value": true,
+   "line": 1174
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FAR_TREES_FADE",
+   "source_default": false,
+   "live_value": true,
+   "line": 1175
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FAR_TREES_SNOW",
+   "source_default": false,
+   "live_value": true,
+   "line": 1176
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FAR_TREES_COLORFIX",
+   "source_default": false,
+   "live_value": true,
+   "line": 1200
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FAR_TREES_DELTA",
+   "source_default": false,
+   "live_value": true,
+   "line": 1215
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FT_MOVE_HYST",
+   "source_default": false,
+   "live_value": true,
+   "line": 1225
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FT_WALK_CALM",
+   "source_default": false,
+   "live_value": false,
+   "line": 1242
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FT_NEARCULL_XFADE",
+   "source_default": false,
+   "live_value": false,
+   "line": 1249
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SLOPE_ALL_MATERIALS",
+   "source_default": false,
+   "live_value": true,
+   "line": 1258
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FAR_TREES_ALIGN",
+   "source_default": false,
+   "live_value": true,
+   "line": 1278
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FAR_TREES_NEARCULL",
+   "source_default": false,
+   "live_value": true,
+   "line": 1279
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FT_FRAME_WELD",
+   "source_default": false,
+   "live_value": true,
+   "line": 1289
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FT_XFADE_COMPL",
+   "source_default": false,
+   "live_value": true,
+   "line": 1296
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FT_NEAR_GUARD",
+   "source_default": false,
+   "live_value": true,
+   "line": 1315
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FT_TEXMEAN_COLOR",
+   "source_default": false,
+   "live_value": true,
+   "line": 1323
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FT_STALE_REBUILD",
+   "source_default": false,
+   "live_value": true,
+   "line": 1332
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FT_STALE_PARKED",
+   "source_default": false,
+   "live_value": false,
+   "line": 1345
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FT_SHELL_BAND",
+   "source_default": false,
+   "live_value": true,
+   "line": 1357
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FT_SHELL_FLIP_CALM",
+   "source_default": false,
+   "live_value": true,
+   "line": 1377
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_STRUCT_DETECT",
+   "source_default": false,
+   "live_value": true,
+   "line": 1407
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_STRUCT_FAR",
+   "source_default": false,
+   "live_value": true,
+   "line": 1408
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_STRUCT_NEAR_GUARD",
+   "source_default": false,
+   "live_value": true,
+   "line": 1419
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_STRUCT_GEN",
+   "source_default": false,
+   "live_value": true,
+   "line": 1420
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_STRUCT_LOD",
+   "source_default": false,
+   "live_value": true,
+   "line": 1421
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_STRUCT_COARSE_FAR",
+   "source_default": false,
+   "live_value": true,
+   "line": 1441
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_STRUCT_SHADER_LITE",
+   "source_default": false,
+   "live_value": false,
+   "line": 1464
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_STRUCT_CULL_BACK",
+   "source_default": false,
+   "live_value": false,
+   "line": 1465
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_STRUCT_VIS_ABTEST",
+   "source_default": false,
+   "live_value": false,
+   "line": 1466
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_STRUCT_SHELL_BAND",
+   "source_default": false,
+   "live_value": true,
+   "line": 1482
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_STRUCT_NEAR_HOLD",
+   "source_default": false,
+   "live_value": true,
+   "line": 1495
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_STRUCT_BAKE_STAGE",
+   "source_default": false,
+   "live_value": true,
+   "line": 1496
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_STRUCT_GATE_MEMO",
+   "source_default": false,
+   "live_value": true,
+   "line": 1511
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_STRUCT_WALK_CALM",
+   "source_default": false,
+   "live_value": true,
+   "line": 1521
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_STRUCT_HANDOFF_HYST",
+   "source_default": false,
+   "live_value": true,
+   "line": 1528
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_STRUCT_REG_EPOCH",
+   "source_default": false,
+   "live_value": true,
+   "line": 1547
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_STRUCT_XFADE",
+   "source_default": false,
+   "live_value": false,
+   "line": 1553
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_STRUCT_CARDS",
+   "source_default": false,
+   "live_value": true,
+   "line": 1567
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_STRUCT_CARD_ALT_BAND",
+   "source_default": false,
+   "live_value": true,
+   "line": 1583
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SKIN_READY_GATE",
+   "source_default": false,
+   "live_value": true,
+   "line": 1591
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SKIN_HANDOFF_PREWARM",
+   "source_default": false,
+   "live_value": true,
+   "line": 1592
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_STRUCT_CARD_STAGE",
+   "source_default": false,
+   "live_value": true,
+   "line": 1616
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_STRUCT_EDIT_DEBOUNCE",
+   "source_default": false,
+   "live_value": true,
+   "line": 1631
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_DEM_DEFER",
+   "source_default": false,
+   "live_value": true,
+   "line": 1656
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_LOAD_DEFER",
+   "source_default": false,
+   "live_value": true,
+   "line": 1673
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_STREAM_TICK_ONCE",
+   "source_default": false,
+   "live_value": true,
+   "line": 1684
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SMOOTH_V2_PACE",
+   "source_default": false,
+   "live_value": true,
+   "line": 1694
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SV2_SHELL_YIELD",
+   "source_default": false,
+   "live_value": true,
+   "line": 1705
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SMOOTH_V2_ASYNC_MERGE",
+   "source_default": false,
+   "live_value": true,
+   "line": 1716
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FAR_SMOOTH",
+   "source_default": false,
+   "live_value": false,
+   "line": 1724
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FAR_SMOOTH_OVERHANG",
+   "source_default": false,
+   "live_value": false,
+   "line": 1727
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SMOOTH_NORMAL_LIT",
+   "source_default": false,
+   "live_value": false,
+   "line": 1743
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SMOOTH_RIM",
+   "source_default": false,
+   "live_value": false,
+   "line": 1776
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SMOOTH_STICKY",
+   "source_default": false,
+   "live_value": false,
+   "line": 1782
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SMOOTH_MESH_INC",
+   "source_default": false,
+   "live_value": false,
+   "line": 1785
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SMOOTH_SKIN_SLOT",
+   "source_default": false,
+   "live_value": false,
+   "line": 1788
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SMOOTH_HORIZON_COVER",
+   "source_default": false,
+   "live_value": false,
+   "line": 1803
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SMOOTH_IDLE",
+   "source_default": false,
+   "live_value": false,
+   "line": 1838
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SHELL_SNAP_GEN",
+   "source_default": false,
+   "live_value": false,
+   "line": 1850
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SMOOTH_TXN",
+   "source_default": false,
+   "live_value": false,
+   "line": 1869
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SLOT_INDIRECT",
+   "source_default": false,
+   "live_value": false,
+   "line": 1894
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SMOOTH_WELD_REFRESH",
+   "source_default": false,
+   "live_value": false,
+   "line": 1920
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SMOOTH_SNAP_SELFHEAL",
+   "source_default": false,
+   "live_value": false,
+   "line": 1934
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_RING_QUIESCE",
+   "source_default": false,
+   "live_value": false,
+   "line": 1958
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_ENV_DEMAND_DISC",
+   "source_default": false,
+   "live_value": false,
+   "line": 1982
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_WARM_EMIT_SPLIT",
+   "source_default": false,
+   "live_value": false,
+   "line": 2010
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FINE_BAKE_SURFACE_PAUSE",
+   "source_default": false,
+   "live_value": true,
+   "line": 2031
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_BG_PREBAKE",
+   "source_default": false,
+   "live_value": true,
+   "line": 2061
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_BG_PREBAKE_CPP",
+   "source_default": false,
+   "live_value": true,
+   "line": 2062
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "BG_VIEWFIRST",
+   "source_default": true,
+   "live_value": true,
+   "line": 2065
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_BG_OFFSURF_CALM",
+   "source_default": false,
+   "live_value": true,
+   "line": 2082
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_PREBAKE_COAST_CAP",
+   "source_default": false,
+   "live_value": true,
+   "line": 2096
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_PREBAKE_VIEW_SCOPE",
+   "source_default": false,
+   "live_value": true,
+   "line": 2110
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_RIM_NEAR_WELD",
+   "source_default": false,
+   "live_value": false,
+   "line": 2137
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SMOOTH_SLOT_MESH",
+   "source_default": false,
+   "live_value": false,
+   "line": 2161
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SMOOTH_TILE_SURF",
+   "source_default": false,
+   "live_value": false,
+   "line": 2190
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_RIM_CHEAP",
+   "source_default": false,
+   "live_value": false,
+   "line": 2227
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SMOOTH_GROW_PACE",
+   "source_default": false,
+   "live_value": false,
+   "line": 2267
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SMOOTH_V2",
+   "source_default": false,
+   "live_value": true,
+   "line": 2287
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SMOOTH_V2_LIT",
+   "source_default": false,
+   "live_value": false,
+   "line": 2300
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SMOOTH_V2_REACH",
+   "source_default": false,
+   "live_value": true,
+   "line": 2305
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SMOOTH_V2_EXCL_BLKLOD",
+   "source_default": false,
+   "live_value": false,
+   "line": 2313
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_M2_SMOOTH_DEFER",
+   "source_default": false,
+   "live_value": true,
+   "line": 2327
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_M2_EDGE_DIST",
+   "source_default": false,
+   "live_value": true,
+   "line": 2333
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SMOOTH_V2_NEARFILL",
+   "source_default": false,
+   "live_value": true,
+   "line": 2342
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_V2_NEARFILL_UNSINK",
+   "source_default": false,
+   "live_value": true,
+   "line": 2357
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_V2_EDGE_APRON",
+   "source_default": false,
+   "live_value": true,
+   "line": 2372
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FAR_TERMINATOR_WELD",
+   "source_default": false,
+   "live_value": true,
+   "line": 2390
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_VIEWER_RELIEF_REACH",
+   "source_default": false,
+   "live_value": true,
+   "line": 2403
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_BAND_SHOT",
+   "source_default": false,
+   "live_value": false,
+   "line": 2422
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SHADE_UNIFIED",
+   "source_default": false,
+   "live_value": true,
+   "line": 2438
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_TWILIGHT_AMBIENT",
+   "source_default": false,
+   "live_value": true,
+   "line": 2448
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FARRING_CULL_COVERED",
+   "source_default": false,
+   "live_value": false,
+   "line": 2465
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_APPLIED_PROBE_CALM",
+   "source_default": false,
+   "live_value": true,
+   "line": 2494
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FARRING_LEVEL",
+   "source_default": false,
+   "live_value": false,
+   "line": 2513
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FARRING_ACTIVE_NOBLACK",
+   "source_default": false,
+   "live_value": true,
+   "line": 2531
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FARRING_UNCOVERED_TRUE",
+   "source_default": false,
+   "live_value": true,
+   "line": 2555
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_UNSINK_DRIFT_CALM",
+   "source_default": false,
+   "live_value": true,
+   "line": 2571
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FARRING_APPLIED_COVER",
+   "source_default": false,
+   "live_value": true,
+   "line": 2585
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_APPLIED_PROBE_SLAB",
+   "source_default": false,
+   "live_value": true,
+   "line": 2605
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_APPLIED_VIEW_BAND",
+   "source_default": false,
+   "live_value": true,
+   "line": 2621
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_BLOCK_LOD",
+   "source_default": false,
+   "live_value": false,
+   "line": 2631
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_BLOCK_LOD_RINGS",
+   "source_default": false,
+   "live_value": false,
+   "line": 2675
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_BLOCK_LOD_GLOBAL",
+   "source_default": false,
+   "live_value": false,
+   "line": 2676
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "BLOCK_LOD_EXPANDED_ENABLED",
+   "source_default": false,
+   "live_value": false,
+   "line": 2699
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FARLOD_QUALITY",
+   "source_default": false,
+   "live_value": true,
+   "line": 2727
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_BLOCK_LOD_ORBIT",
+   "source_default": false,
+   "live_value": false,
+   "line": 2758
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FACET_TEX_CLOSEUP",
+   "source_default": false,
+   "live_value": false,
+   "line": 2824
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_PAGES_SHOT",
+   "source_default": false,
+   "live_value": false,
+   "line": 2844
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SKIN_SSE",
+   "source_default": false,
+   "live_value": true,
+   "line": 2858
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_JOB_LANE",
+   "source_default": false,
+   "live_value": true,
+   "line": 2897
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_TEX_BAKE_WORKER",
+   "source_default": false,
+   "live_value": true,
+   "line": 2912
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_CTRL_ADAPTIVE",
+   "source_default": false,
+   "live_value": true,
+   "line": 2944
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_CTRL_FLOOR_VSYNC",
+   "source_default": false,
+   "live_value": true,
+   "line": 2956
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_TELEM_FRAME_DECOMP",
+   "source_default": false,
+   "live_value": true,
+   "line": 2967
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FIXED_FRAME",
+   "source_default": false,
+   "live_value": true,
+   "line": 2987
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "POOL_CROSSING_PREGEN",
+   "source_default": true,
+   "live_value": true,
+   "line": 3012
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_PREFILL_112",
+   "source_default": false,
+   "live_value": true,
+   "line": 3023
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_VEL_PREDICT",
+   "source_default": false,
+   "live_value": true,
+   "line": 3033
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_INFLIGHT_GATE",
+   "source_default": false,
+   "live_value": true,
+   "line": 3073
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_WALK_STEP_GATE",
+   "source_default": false,
+   "live_value": false,
+   "line": 3096
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_LOAD_RAMP",
+   "source_default": false,
+   "live_value": true,
+   "line": 3118
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_BOOT_ASYNC",
+   "source_default": false,
+   "live_value": true,
+   "line": 3134
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_MANIFEST_SLICE",
+   "source_default": false,
+   "live_value": true,
+   "line": 3151
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SLOPE_MANIFEST_HEAL",
+   "source_default": false,
+   "live_value": true,
+   "line": 3169
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_LANDING_STREAM_KICK",
+   "source_default": false,
+   "live_value": true,
+   "line": 3186
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_APPROACH_ANCHOR",
+   "source_default": false,
+   "live_value": true,
+   "line": 3212
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SUMMIT_STREAM",
+   "source_default": false,
+   "live_value": true,
+   "line": 3237
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_REENTRY_BACKLOG_GATE",
+   "source_default": false,
+   "live_value": false,
+   "line": 3276
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_REENTRY_REGROW_DEFER",
+   "source_default": false,
+   "live_value": false,
+   "line": 3324
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "ORBITAL_SKY",
+   "source_default": false,
+   "live_value": true,
+   "line": 3347
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_M3_ORBIT",
+   "source_default": false,
+   "live_value": true,
+   "line": 3358
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SCALED_BODY",
+   "source_default": false,
+   "live_value": true,
+   "line": 3376
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SHELL_CAMERA_SET",
+   "source_default": false,
+   "live_value": true,
+   "line": 3395
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SHELL_SURF_CAP",
+   "source_default": false,
+   "live_value": true,
+   "line": 3408
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SHELL_PREWARM",
+   "source_default": false,
+   "live_value": true,
+   "line": 3417
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SHELL_ORBIT_IDLE",
+   "source_default": false,
+   "live_value": true,
+   "line": 3442
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SHELL_FALL_HOLD",
+   "source_default": false,
+   "live_value": true,
+   "line": 3459
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SHELL_CLIMB_NO_CHURN",
+   "source_default": false,
+   "live_value": true,
+   "line": 3474
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SNOW_SKIP_AIRBORNE",
+   "source_default": false,
+   "live_value": true,
+   "line": 3483
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_WARM_TRUE_BUDGET",
+   "source_default": false,
+   "live_value": true,
+   "line": 3498
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SNOW_SLICED",
+   "source_default": false,
+   "live_value": true,
+   "line": 3512
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SNOW_PRECIP_GATE",
+   "source_default": false,
+   "live_value": true,
+   "line": 3525
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_ALT_REGIME",
+   "source_default": false,
+   "live_value": true,
+   "line": 3542
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_EDIT_FID_INDEX",
+   "source_default": false,
+   "live_value": true,
+   "line": 3574
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SHRINK_PACED",
+   "source_default": false,
+   "live_value": true,
+   "line": 3588
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "SN_NAV_MODES",
+   "source_default": false,
+   "live_value": true,
+   "line": 3600
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "SN_DEVNAV",
+   "source_default": false,
+   "live_value": true,
+   "line": 3612
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_DEVNAV_GUIDE_FRAME",
+   "source_default": false,
+   "live_value": true,
+   "line": 3619
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "ATMO_VISUAL_RAMP",
+   "source_default": false,
+   "live_value": true,
+   "line": 3630
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "SN_SUN_OCCLUSION",
+   "source_default": false,
+   "live_value": true,
+   "line": 3640
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "SKY_MOONSHINE",
+   "source_default": false,
+   "live_value": true,
+   "line": 3651
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "SKY_MOONSHINE_LIGHT",
+   "source_default": false,
+   "live_value": true,
+   "line": 3659
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "SKY_SCATTER_RAMP",
+   "source_default": false,
+   "live_value": true,
+   "line": 3669
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "SHELL_TERMINATOR_TINT",
+   "source_default": false,
+   "live_value": false,
+   "line": 3679
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_BODY_LOD",
+   "source_default": false,
+   "live_value": false,
+   "line": 3692
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_MOON_RING",
+   "source_default": false,
+   "live_value": false,
+   "line": 3705
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SKY_DSKY_R",
+   "source_default": false,
+   "live_value": true,
+   "line": 3718
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SKY_DSKY_ALT",
+   "source_default": false,
+   "live_value": true,
+   "line": 3731
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SKY_PLANET_CENTRE",
+   "source_default": false,
+   "live_value": true,
+   "line": 3743
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_HUD_VACUUM_TEMP",
+   "source_default": false,
+   "live_value": true,
+   "line": 3751
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SEASONS",
+   "source_default": false,
+   "live_value": true,
+   "line": 3761
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SN3_MAIN_LIVE",
+   "source_default": false,
+   "live_value": true,
+   "line": 3781
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SKY_PLANET_OCCLUDE",
+   "source_default": false,
+   "live_value": true,
+   "line": 3791
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SUN_PRESENCE",
+   "source_default": false,
+   "live_value": true,
+   "line": 3799
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_TERM_SUN_CONT",
+   "source_default": false,
+   "live_value": true,
+   "line": 3812
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_ATMO_SPACE_ZERO",
+   "source_default": false,
+   "live_value": true,
+   "line": 3820
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_LIGHT_ABSOLUTE",
+   "source_default": false,
+   "live_value": true,
+   "line": 3830
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SHELL_ABSOLUTE",
+   "source_default": false,
+   "live_value": true,
+   "line": 3839
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_ATMO_SHELL",
+   "source_default": false,
+   "live_value": true,
+   "line": 3849
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SUN_PATHLIGHT",
+   "source_default": false,
+   "live_value": true,
+   "line": 3859
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SUN_DISC_WARM",
+   "source_default": false,
+   "live_value": true,
+   "line": 3872
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SUN_APPARENT",
+   "source_default": false,
+   "live_value": true,
+   "line": 3880
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SUN_GLOW",
+   "source_default": false,
+   "live_value": false,
+   "line": 3886
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FOG_ARBITER",
+   "source_default": false,
+   "live_value": true,
+   "line": 3894
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_MOON_PRESENCE",
+   "source_default": false,
+   "live_value": true,
+   "line": 3903
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_ATMO_PATH_SHELL",
+   "source_default": false,
+   "live_value": true,
+   "line": 3913
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_ATMO_GROUND_BUDGET",
+   "source_default": false,
+   "live_value": true,
+   "line": 3924
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_ATMO_RIM",
+   "source_default": false,
+   "live_value": true,
+   "line": 3937
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_NEAR_DAYLIGHT",
+   "source_default": false,
+   "live_value": true,
+   "line": 3947
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_NIGHT_TERRAIN_CENTRE",
+   "source_default": false,
+   "live_value": true,
+   "line": 3963
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_LEAF_CUTOUT",
+   "source_default": false,
+   "live_value": true,
+   "line": 3985
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_BORDER_SHADE_WELD",
+   "source_default": false,
+   "live_value": true,
+   "line": 4005
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_CLIMATE_GRID",
+   "source_default": false,
+   "live_value": false,
+   "line": 4023
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_CLOUDS",
+   "source_default": false,
+   "live_value": false,
+   "line": 4032
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_PRECIP",
+   "source_default": false,
+   "live_value": false,
+   "line": 4042
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_STORMS",
+   "source_default": false,
+   "live_value": false,
+   "line": 4052
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_WEATHER_THREAD",
+   "source_default": false,
+   "live_value": false,
+   "line": 4066
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "SN_HUD_NAV",
+   "source_default": false,
+   "live_value": true,
+   "line": 4073
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_CROSS_KEEP_HEADING",
+   "source_default": false,
+   "live_value": true,
+   "line": 4082
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_TWIST_FRAME_AWARE",
+   "source_default": false,
+   "live_value": true,
+   "line": 4094
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_CROSS_CORNER_COMMIT",
+   "source_default": false,
+   "live_value": true,
+   "line": 4107
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "SN_NO_CEILING_BOUNCE",
+   "source_default": false,
+   "live_value": true,
+   "line": 4125
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "SN_ATMO_BRAKING",
+   "source_default": false,
+   "live_value": true,
+   "line": 4141
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "SN_FOFF_RADIAL_FALL",
+   "source_default": false,
+   "live_value": true,
+   "line": 4150
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "CRUISE_MODE",
+   "source_default": false,
+   "live_value": true,
+   "line": 4167
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_CRUISE_LOOKDIR",
+   "source_default": false,
+   "live_value": true,
+   "line": 4173
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_DEV_TP_REFRAME",
+   "source_default": false,
+   "live_value": true,
+   "line": 4196
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_TP_FLOOR_WELD",
+   "source_default": false,
+   "live_value": true,
+   "line": 4211
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_DESCENT_FACET_RESYNC",
+   "source_default": false,
+   "live_value": true,
+   "line": 4228
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_QUERY_FRAME_GUARD",
+   "source_default": false,
+   "live_value": true,
+   "line": 4244
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FLOOR_SURFACE_WELD",
+   "source_default": false,
+   "live_value": true,
+   "line": 4261
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_SEAM_SLOPE_WELD",
+   "source_default": false,
+   "live_value": true,
+   "line": 4288
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FALLTHRU_PROBE",
+   "source_default": false,
+   "live_value": true,
+   "line": 4304
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_UPVECTOR_FACET_HEAL",
+   "source_default": false,
+   "live_value": true,
+   "line": 4321
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_CAMERA_RADIAL_LEVEL",
+   "source_default": false,
+   "live_value": true,
+   "line": 4337
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_BIOME_SPACE_FIX",
+   "source_default": false,
+   "live_value": true,
+   "line": 4358
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_GRAV_BOX_COVER",
+   "source_default": false,
+   "live_value": true,
+   "line": 4370
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_CHOP_COLLIDER_CARVE",
+   "source_default": false,
+   "live_value": true,
+   "line": 4385
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_CHOP_DEBRIS_CALM",
+   "source_default": false,
+   "live_value": true,
+   "line": 4404
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_LOOSE_BODY_ANALYTIC_FLOOR",
+   "source_default": false,
+   "live_value": true,
+   "line": 4423
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "ORBIT_ATTITUDE",
+   "source_default": false,
+   "live_value": true,
+   "line": 4438
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "ORBIT_6DOF_FLY",
+   "source_default": false,
+   "live_value": true,
+   "line": 4450
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "ORBIT_LAND_RECOVER",
+   "source_default": false,
+   "live_value": true,
+   "line": 4458
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "ORBIT_COAST",
+   "source_default": false,
+   "live_value": true,
+   "line": 4473
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_COAST_FULL_DT",
+   "source_default": false,
+   "live_value": true,
+   "line": 4486
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_COAST_BATCH",
+   "source_default": false,
+   "live_value": true,
+   "line": 4503
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FREEFALL_RAILS",
+   "source_default": false,
+   "live_value": true,
+   "line": 4525
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FALL_CAMFAR_HOLD",
+   "source_default": false,
+   "live_value": false,
+   "line": 4551
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FALL_ATMO_THROTTLE",
+   "source_default": false,
+   "live_value": false,
+   "line": 4557
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FALL_RING_HOLD",
+   "source_default": false,
+   "live_value": false,
+   "line": 4562
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FALL_SHELL_OFF",
+   "source_default": false,
+   "live_value": false,
+   "line": 4588
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FALL_SCALE_FREEZE",
+   "source_default": false,
+   "live_value": false,
+   "line": 4605
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FALL_FREEZE_CAM",
+   "source_default": true,
+   "live_value": true,
+   "line": 4606
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FALL_FREEZE_RING",
+   "source_default": true,
+   "live_value": true,
+   "line": 4607
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FALL_TIMING",
+   "source_default": false,
+   "live_value": true,
+   "line": 4627
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_WORST_FRAME_ATTR",
+   "source_default": false,
+   "live_value": true,
+   "line": 4641
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_WF_TIER_ATTR",
+   "source_default": false,
+   "live_value": true,
+   "line": 4654
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FALL_ATT_GATE",
+   "source_default": false,
+   "live_value": true,
+   "line": 4662
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FLOOR_BOUNDED",
+   "source_default": false,
+   "live_value": true,
+   "line": 4682
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_FLOOR_MEMO",
+   "source_default": false,
+   "live_value": true,
+   "line": 4705
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_MOVE_PROBE_CACHE",
+   "source_default": false,
+   "live_value": true,
+   "line": 4717
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_TELEM_10HZ",
+   "source_default": false,
+   "live_value": true,
+   "line": 4728
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_TELEM_LITE",
+   "source_default": false,
+   "live_value": true,
+   "line": 4742
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_AGENT_POSE",
+   "source_default": false,
+   "live_value": true,
+   "line": 4747
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_AGENT_QUERY",
+   "source_default": false,
+   "live_value": true,
+   "line": 4753
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_AGENT_ACT",
+   "source_default": false,
+   "live_value": true,
+   "line": 4765
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_AGENT_NAV",
+   "source_default": false,
+   "live_value": true,
+   "line": 4768
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_AGENT_SKILL",
+   "source_default": false,
+   "live_value": true,
+   "line": 4776
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_ANALYTIC_COL_MEMO",
+   "source_default": false,
+   "live_value": true,
+   "line": 4790
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_ENV_FALL_HOLD",
+   "source_default": false,
+   "live_value": true,
+   "line": 4800
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_LAND_RAMP_HOLD",
+   "source_default": false,
+   "live_value": true,
+   "line": 4813
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_ENV_RESUME_PACED",
+   "source_default": false,
+   "live_value": true,
+   "line": 4822
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "M5C_CORNER",
+   "source_default": false,
+   "live_value": false,
+   "line": 4825
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "M5C_TELEPORT",
+   "source_default": true,
+   "live_value": true,
+   "line": 4826
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "MULTI_BODY",
+   "source_default": false,
+   "live_value": false,
+   "line": 4909
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "SOI_SWAP",
+   "source_default": false,
+   "live_value": false,
+   "line": 4922
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FLAT_WORLD",
+   "source_default": true,
+   "live_value": true,
+   "line": 4946
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "M5_RENDER",
+   "source_default": false,
+   "live_value": false,
+   "line": 4953
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "M5_REAL",
+   "source_default": false,
+   "live_value": false,
+   "line": 4962
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "DEV_HIDE_NEAR",
+   "source_default": false,
+   "live_value": false,
+   "line": 4968
+  },
+  {
+   "file": "godot/src/cosmos/cube_sphere.gd",
+   "const": "FP_TREEPHYS_BOUND",
+   "source_default": false,
+   "live_value": true,
+   "line": 5543
+  },
+  {
+   "file": "godot/src/net/remote_bridge.gd",
+   "const": "CONTROL_ENABLED",
+   "source_default": false,
+   "live_value": true,
+   "line": 63
+  },
+  {
+   "file": "godot/src/net/remote_bridge.gd",
+   "const": "CAPTURE_THREADED_ENCODE",
+   "source_default": true,
+   "live_value": true,
+   "line": 112
+  },
+  {
+   "file": "godot/src/tools/verify_applied_band.gd",
+   "const": "LIVE_FACETED",
+   "source_default": true,
+   "live_value": true,
+   "line": 39
+  },
+  {
+   "file": "godot/src/tools/verify_applied_band.gd",
+   "const": "LIVE_FP_FARRING_FULL_COVER",
+   "source_default": true,
+   "live_value": true,
+   "line": 40
+  },
+  {
+   "file": "godot/src/tools/verify_applied_band.gd",
+   "const": "LIVE_FP_BLOCKY_FARRING",
+   "source_default": true,
+   "live_value": true,
+   "line": 41
+  },
+  {
+   "file": "godot/src/tools/verify_applied_band.gd",
+   "const": "LIVE_FP_FARRING_APPLIED_COVER",
+   "source_default": true,
+   "live_value": true,
+   "line": 42
+  },
+  {
+   "file": "godot/src/tools/verify_applied_band.gd",
+   "const": "LIVE_FP_FARRING_UNCOVERED_TRUE",
+   "source_default": true,
+   "live_value": true,
+   "line": 43
+  },
+  {
+   "file": "godot/src/tools/verify_applied_band.gd",
+   "const": "LIVE_FP_APPLIED_PROBE_SLAB",
+   "source_default": true,
+   "live_value": true,
+   "line": 44
+  },
+  {
+   "file": "godot/src/tools/verify_applied_slab.gd",
+   "const": "LIVE_FACETED",
+   "source_default": true,
+   "live_value": true,
+   "line": 32
+  },
+  {
+   "file": "godot/src/tools/verify_applied_slab.gd",
+   "const": "LIVE_FP_FARRING_FULL_COVER",
+   "source_default": true,
+   "live_value": true,
+   "line": 33
+  },
+  {
+   "file": "godot/src/tools/verify_applied_slab.gd",
+   "const": "LIVE_FP_BLOCKY_FARRING",
+   "source_default": true,
+   "live_value": true,
+   "line": 34
+  },
+  {
+   "file": "godot/src/tools/verify_applied_slab.gd",
+   "const": "LIVE_FP_FARRING_APPLIED_COVER",
+   "source_default": true,
+   "live_value": true,
+   "line": 35
+  },
+  {
+   "file": "godot/src/tools/verify_applied_slab.gd",
+   "const": "LIVE_FP_FARRING_UNCOVERED_TRUE",
+   "source_default": true,
+   "live_value": true,
+   "line": 36
+  },
+  {
+   "file": "godot/src/tools/verify_applied_slab.gd",
+   "const": "LIVE_FP_NB_FULLRES",
+   "source_default": true,
+   "live_value": true,
+   "line": 37
+  },
+  {
+   "file": "godot/src/tools/verify_cosmos_seam.gd",
+   "const": "CORNER_CANONICAL_FIX",
+   "source_default": true,
+   "live_value": true,
+   "line": 31
+  },
+  {
+   "file": "godot/src/tools/verify_far_trees.gd",
+   "const": "LIVE_FACETED",
+   "source_default": true,
+   "live_value": true,
+   "line": 37
+  },
+  {
+   "file": "godot/src/tools/verify_far_trees.gd",
+   "const": "LIVE_FAR_TREES",
+   "source_default": true,
+   "live_value": true,
+   "line": 38
+  },
+  {
+   "file": "godot/src/tools/verify_far_trees.gd",
+   "const": "LIVE_FAR_TREES_CARDS",
+   "source_default": true,
+   "live_value": true,
+   "line": 39
+  },
+  {
+   "file": "godot/src/tools/verify_far_trees.gd",
+   "const": "LIVE_FAR_TREES_MESH",
+   "source_default": true,
+   "live_value": true,
+   "line": 40
+  },
+  {
+   "file": "godot/src/tools/verify_far_trees.gd",
+   "const": "LIVE_FAR_TREES_FADE",
+   "source_default": true,
+   "live_value": true,
+   "line": 41
+  },
+  {
+   "file": "godot/src/tools/verify_far_trees.gd",
+   "const": "LIVE_FAR_TREES_SNOW",
+   "source_default": true,
+   "live_value": true,
+   "line": 42
+  },
+  {
+   "file": "godot/src/tools/verify_far_trees.gd",
+   "const": "LIVE_FAR_TREES_COLORFIX",
+   "source_default": true,
+   "live_value": true,
+   "line": 43
+  },
+  {
+   "file": "godot/src/tools/verify_far_trees.gd",
+   "const": "LIVE_FAR_TREES_DELTA",
+   "source_default": true,
+   "live_value": true,
+   "line": 44
+  },
+  {
+   "file": "godot/src/tools/verify_leaf_cutout.gd",
+   "const": "LIVE_ATLAS",
+   "source_default": true,
+   "live_value": true,
+   "line": 29
+  },
+  {
+   "file": "godot/src/tools/verify_leaf_cutout.gd",
+   "const": "LIVE_NEAR_DAYLIGHT",
+   "source_default": true,
+   "live_value": true,
+   "line": 30
+  },
+  {
+   "file": "godot/src/tools/verify_leaf_cutout.gd",
+   "const": "LIVE_SHADE_UNIFIED",
+   "source_default": true,
+   "live_value": true,
+   "line": 31
+  },
+  {
+   "file": "godot/src/tools/verify_leaf_cutout.gd",
+   "const": "LIVE_LEAF",
+   "source_default": true,
+   "live_value": true,
+   "line": 32
+  },
+  {
+   "file": "godot/src/tools/verify_lod_ladder.gd",
+   "const": "LIVE_NB_FULLRES",
+   "source_default": true,
+   "live_value": true,
+   "line": 43
+  },
+  {
+   "file": "godot/src/tools/verify_lod_ladder.gd",
+   "const": "LIVE_M2_LOD",
+   "source_default": true,
+   "live_value": true,
+   "line": 44
+  },
+  {
+   "file": "godot/src/tools/verify_lod_ladder.gd",
+   "const": "LIVE_SMOOTH_V2",
+   "source_default": true,
+   "live_value": true,
+   "line": 45
+  },
+  {
+   "file": "godot/src/tools/verify_lod_ladder.gd",
+   "const": "LIVE_BLOCKY_FARRING",
+   "source_default": true,
+   "live_value": true,
+   "line": 46
+  },
+  {
+   "file": "godot/src/tools/verify_seam_slope_weld.gd",
+   "const": "LIVE_DATUM_BAKE",
+   "source_default": true,
+   "live_value": true,
+   "line": 58
+  },
+  {
+   "file": "godot/src/tools/verify_seam_slope_weld.gd",
+   "const": "LIVE_RADIAL_DATUM",
+   "source_default": false,
+   "live_value": false,
+   "line": 59
+  },
+  {
+   "file": "godot/src/world/cosmos_border_overlay.gd",
+   "const": "DEV_BORDERS",
+   "source_default": true,
+   "live_value": true,
+   "line": 22
+  },
+  {
+   "file": "godot/src/world/facet_far_ring.gd",
+   "const": "ENABLED",
+   "source_default": true,
+   "live_value": true,
+   "line": 18
+  },
+  {
+   "file": "godot/src/world/far/far_terrain.gd",
+   "const": "ENABLED",
+   "source_default": true,
+   "live_value": true,
+   "line": 22
+  },
+  {
+   "file": "godot/src/world/far/far_terrain.gd",
+   "const": "HANDOFF_ENABLED",
+   "source_default": true,
+   "live_value": true,
+   "line": 56
+  },
+  {
+   "file": "godot/src/world/terrain_config.gd",
+   "const": "SMOOTHING_ENABLED",
+   "source_default": true,
+   "live_value": true,
+   "line": 63
+  },
+  {
+   "file": "godot/src/world/terrain_config.gd",
+   "const": "DOWNWARD_REACH_CLAMP_ENABLED",
+   "source_default": true,
+   "live_value": true,
+   "line": 205
+  },
+  {
+   "file": "godot/src/world/voxel_module/module_world.gd",
+   "const": "NEAR_COVER_ENABLED",
+   "source_default": false,
+   "live_value": false,
+   "line": 130
+  },
+  {
+   "file": "godot/src/world/world_manager.gd",
+   "const": "CORNER_EDIT_LOCK",
+   "source_default": true,
+   "live_value": true,
+   "line": 218
+  }
+ ]
+}

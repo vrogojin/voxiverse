@@ -1,0 +1,23 @@
+---
+name: voxiverse-remote-bridge
+description: "How the agent observes/instruments a live real-GPU VOXIVERSE session in the user's browser (remote-play bridge)"
+metadata: 
+  node_type: memory
+  type: reference
+---
+
+Since the build host has no GPU ([[voxiverse-gpu-headless-testing]]), the agent instruments performance from the USER's browser via a dial-out **remote-play bridge** (Phase 1 shipped + deployed 2026-07-15; observe-only). Code: `godot/src/net/remote_bridge.gd` + `remote_bridge_activator.gd` (game), `tools/remote-bridge/relay.mjs` (relay). Steelmanned before deploy (record-only relay = no cross-connection leak; auth-ack before any capture; timing-safe token; authed/pending pool split).
+
+**Activate (user):** open `https://voxiverse.game-host.org/?remote=<token>`, OR press **Ctrl+Shift+F9** in-game and paste the token. A red "● REMOTE ACTIVE" badge shows while the (auth'd) socket is open; toggle off with the hotkey or close the tab. Dead in normal play (no param/hotkey → the streaming node never instantiates → FLAT byte-identity).
+
+**Path:** game dials OUT `wss://voxiverse.game-host.org/remote` → HAProxy → the game's nginx (`location = /remote`, autossl + same-origin, adds no header so COOP/COEP for the game are untouched) → the PRIVATE `voxiverse-relay` sibling container on `haproxy-net` (NEVER host-published — verify `docker port voxiverse-relay` is EMPTY). Token in `tools/remote-bridge/.token` (gitignored, 0600); `REMOTE_BRIDGE_TOKEN` env in the container.
+
+**Agent reads:** `tools/remote-bridge/results/telemetry.jsonl` (append-only, [PERF] + player pos/facet + lod_stats + controller credit, `_rx` stamped) and `results/frame-latest.jpg` (+ `frames/` ring) — frames only if web WebGL2 `get_viewport()...get_image()` readback works (null-guarded; telemetry is the hard signal regardless). Relay run: `docker run -d --name voxiverse-relay --network haproxy-net -e REMOTE_BRIDGE_TOKEN=$(cat .token) -v .../tools/remote-bridge:/app -w /app node:22-slim node relay.mjs --host 0.0.0.0 --port 8090 --results /app/results` (NO `-p`).
+
+**Phase 2 (controls) is GATED** on replacing the single shared URL token with per-session short-TTL server-issued grants + explicit re-consent when the badge upgrades to CONTROLLING — see task #113. Do NOT let control ride the observe token. Vast.ai cloud-GPU harness (`tools/web-soak-gpu`) kept as a CI fallback.
+
+**Flight op schema (2026-08-10, cost me ~5 wasted captures getting it wrong — the relay REJECTS a bad key with `reason=caps` and the leg fails silently-ish, leaving prior state):** `tools/remote-bridge/flight.mjs` legs use these EXACT param names — `set_time` → **`local_hours`** (0-24), NOT `hours` (a wrong key = undefined = out-of-range reject, time stays at reload default = NIGHT → whole planet renders dark, easily mistaken for a colour bug); `freeze_time` / `dev_nav` / `freeze_player` each REQUIRE **`on: <bool>`** (omitting it rejects the leg → e.g. freeze_player never holds → player DE-ORBITS and falls to the surface mid-flight); `set_alt` → `alt`; `look` → `pitch_deg` [-85,85] and/or `planet_lock: true` (planet_lock aims at NADIR/planet — do NOT also pass `pitch_deg:-90`, that aims at ZENITH = empty space/stars); `screenshot` → `label:[a-z0-9-]`. A dark far-render frame is almost always night (wrong/failed set_time), NOT a render regression — verify the time leg PASSED before diagnosing colour/lighting.
+
+**Control channel design:** `docs/COSMOS-REMOTE-CONTROL-DESIGN.md` (agent→game timed command sequences, half-duplex closed loop; user-resolved D1–D5 in §8: grant persists UNTIL REVOKED, override ENDS grant→full re-consent, preempt allowed, full-agency incl. break/place/inventory). Phased P1–P5 in §7.
+
+**P1 relay control core LANDED (2026-07-15, branch fix/voxiverse-crossing-hitches, NOT deployed):** `relay.mjs` gained the agent→game command path — outbox poller (`control/outbox/<seq>.json`, atomic-rename ingress, host-FS is the ONLY command source), schema+caps validation (≤64 steps/≤128 blocks/≤180s/≤16KiB/120s-stale/closed op whitelist), per-socket consent state machine (none/granted/override→none), forward gate is DEFAULT-DENY (forwards ONLY host-written outbox bytes to an authed+granted socket; game msgs record-only), result routing to `control/results/<seq>/{ack,events.jsonl,done,shot-*.jpg}` (0x02 shot tag), `control/audit.log`. `control/` gitignored. Headless `smoke.mjs` (66 assertions, fake game client) proves the key assertion: no grant ⇒ NEVER forwarded. Live control still OFF (game `CONTROL_ENABLED` is P2/P4). P2 = game receiver+consent modal+badge; P3 = locomotion executor+player intent seam; P4 = steelman+security-review+enable.

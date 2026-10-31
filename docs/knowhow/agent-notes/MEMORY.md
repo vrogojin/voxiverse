@@ -1,0 +1,133 @@
+# Memory Index
+
+- [Building-render perf struggle DOC](voxiverse-village-bake-memo.md) — 2026-09-01 THRESHOLD signal: game smooth until the FIRST far village house renders (~alt 500), then jerky; without villages "blazingly fast". Far buildings = ONE merged ArrayMesh of full-res decimated CUBE VOXELS (STRUCT_TARGET_RES=16 = no decimation ≤16blk) + custom voxi_shade shader, main-thread rebuilt (facet_far_structures.gd). Tried WALK_CALM(motion re-upload)/GATE_MEMO(bake 6×)/COARSE_FAR(prims −70%)/NEAR_DIET — STILL jerky ⇒ ARCHITECTURE likely wrong (buildings need far-tree-style IMPOSTORS not cube meshes). Full brief: docs/COSMOS-BUILDING-RENDER-PERF-STRUGGLE.md (for Codex multi-model). Open Q: GPU-fill vs main-thread (observer effect blocks the split)
+
+- [Near-radius diet lever](voxiverse-near-radius-diet.md) — 2026-08-31 near voxel field = MAJOR ground/descent jerkiness (DEV_HIDE_NEAR bisection, user-confirmed); FP_NEAR_RADIUS_DIET (live faceted near=128); descent peak vox_gen scales r²: 128→3953, 96→2190, 64→900 (−77%); byte-off 46c11a7; far tier = residual; ground vox_gen=0 (pre-warm) so use bare-URL feel + counters not ?remote frame-time
+
+- [Village bake memo SHIPPED](voxiverse-village-bake-memo.md) — 2026-08-31 "descent jerky = village" ROOT = far-structure bake decimate O(volume) recompute of has_village/house_info gate hashes; fix FP_STRUCT_GATE_MEMO (memoize per (vx,vz)/(hx,hz) in GenCtx) = _ensure_bake 38→6ms/house 6.3× byte-identical (bench_struct_bake); LESSON uncontrolled live st_bms A/B is noise (house-count confound) — use headless flag A/B on same bboxes
+
+- [Gen-convoy alloc census + gen probe](voxiverse-gen-convoy-alloc-census.md) — 2026-08-30 ground-walk dlmalloc convoy = gen path; C++ gen LIVE (probe: gen_ct_* ABSENT in telemetry); per-block ranking #1 mesher CoW 7×M, #2 VoxelBuffer wrapper, #4 profs vector; channel ALREADY pooled (don't double-count); census doc COSMOS-GEN-CONVOY-ALLOC-CENSUS.md
+- [mimalloc arena hypothesis REFUTED](voxiverse-mimalloc-arena-root.md) — 2026-08-23 arena_reserve cap 128→16MiB MEASURED-USELESS at peak: live fall peak 842MB ≈ uncapped 834, +430 over dlmalloc = 3.6× ceiling; arena_reserve is per-step SIZE not total; mimalloc STAYS rejected, dlmalloc ships; pivot to streaming/gen levers
+- [Fall mesh-stall ROOT + design](voxiverse-fall-mesh-stall.md) — 2026-08-23 de-orbit 3fps = anchor re-grow floods 6-7k GenerateBlock (vox_gen convoy); FP_REENTRY_BACKLOG_GATE shelved (falling_fast stale at ATMO crossing); LESSON pace producers by consumer backlog
+- [Fall stream-pacing DESIGN #144](voxiverse-fall-stream-pacing.md) — 2026-08-22 fall jerk = update_streaming tail + alt-700 ANCHOR_REL_LO knee; FP_STREAM_FALL_PACE + FP_REENTRY_VIEW_RAMP
+- [Agent autonomy A1-A4 SHIPPED](voxiverse-agent-autonomy.md) — 2026-08-17 break_cell/aim_cell/goto/chop_tree scripted play-loop (NO narrow model); deployed, gates green; live chop_tree A/B pending
+- [Agent-autonomy DESIGN #140](voxiverse-agent-autonomy-design.md) — 2026-08-17 break-by-cell no-op ROOT = _target_arg array→"aim" silent downgrade; scripted A*+skills+LLM, all-LATTICE params
+- [Fartree-chop DESIGN #137](voxiverse-fartree-chop-design.md) — 2026-08-15 rung-3 = FacetTexBaker band/fine L8 maps; fix FP_FT_SKIN_CHOP Stage-B snap writer + invalidate_far_skin, no engine rebuild
+- [Chopped tree FAR-render leak ROOT](voxiverse-fartree-chop-farrender.md) — 2026-08-15 fine-map SKIN bakes canopy edit-UNAWARE; rungs 1-2 chop-filtered; fix = skin-tile edit-aware, flag FP_FT_SKIN_CHOP
+- [Agent-control merged PR #72](voxiverse-agent-control-design.md) — SHIPPED f338706: P0 fs.watch (576→~100ms), P1 FP_AGENT_POSE two-frame rule, P2 FP_AGENT_QUERY consent-gated
+- [Far-tree orbit dropout ROOT](voxiverse-fartree-orbit-dropout.md) — 2026-08-15 far-trees vanish above alt 256 = OFFSURFACE_Y hard-suspend fires ~350blk low; fix = render cards off-surface to natural fade
+- [Far-height #72/#73 verdict](voxiverse-far-height-72-73.md) — 2026-08-15 #73 no code (needs REPRO); #72 residual = NEARFILL 6-blk sink → FP_V2_NEARFILL_UNSINK per-vertex COLOR.a; DEFERRED (fragile, needs user A/B)
+- [Far-height verdict (pck audit)](voxiverse-far-height-verdict.md) — 2026-08-15 #72 chain-fixed, residual V2_NEARFILL_SINK skirt; #73 structural classes excluded; LESSON wrong-height vs deliberate-sink class
+- [Tasks #72/#73 state](voxiverse-tasks-72-73-state.md) — never tighten ε-sink, check sh_applied_r first; #73 gate must be scripted flight
+- [Move-probe cache P2b design](voxiverse-move-probe-cache.md) — #129 t_move 8.8ms = un-memoized cell_value_at; FP_MOVE_PROBE_CACHE; LESSON check mutable layer BEFORE the cache
+- [Motion-phys ROOT](voxiverse-motion-phys-root.md) — phys_ms = 1Hz MAX monitor (NOT additive); real cost = update_streaming ×2 catch-up; FP_STREAM_TICK_ONCE + FP_FALL_TIMING
+- [Forest-fps limiter ROOT #129](voxiverse-forest-fps-limiter.md) — 2026-08-14 rest stall = 4Hz telemetry + controller floor-trap; FP_TELEM_FRAME_DECOMP, FP_CTRL_FLOOR_VSYNC pairs with FT_DELTA_MIN_MOVE
+- [Backstop-diet #129 SHIPPED-not-MERGED](voxiverse-backstop-diet.md) — FP_SHELL_SURF_CAP −72% verts but fps unlock FALSIFIED (vsync-bound); LESSON A/B the perf premise first
+- [Fartree-polish #132 SHIPPED](voxiverse-fartree-polish132.md) — PRs #62/#63 FT_NEAR_GUARD + TEXMEAN_COLOR + STALE_REBUILD; GOTCHA set_instance_transform NO-OP on set_buffer MM
+- [Far-tree frame weld ROOT](voxiverse-fartree-frame.md) — #131 = datum_lift omission + world-axis basis; FP_FT_FRAME_WELD; LESSON dump the DEPLOY WORKTREE pck
+- [Far-tree shift residual ROOT](voxiverse-fartree-shift-residual.md) — #120/#130 FT_SINK_MAX + card dither + state-fold streak; pck const dump via load_resource_pack
+- [Idle-diet + probe-calm designs](voxiverse-stream-idle-diet.md) — FP_STREAM_IDLE_DIET + FP_APPLIED_PROBE_CALM R2; LESSON filter root-cause through served flags
+- [Structures design #121](voxiverse-structures-design.md) — P0 edit-cluster union-find at _write_cell (snow filter!) + OR-occupancy far models; P1 village gen
+- [Far-tree align+cull ROOT](voxiverse-fartree-align.md) — #120 sunk = 3 constants; FP_FAR_TREES_ALIGN + NEARCULL
+- [Slope-material root + design](voxiverse-slope-material-design.md) — #122 = B_MOUNTAINS-only biome gate (terrain_config + patch 0007 twin); FP_SLOPE_ALL_MATERIALS
+- [Web TRUE core count](voxiverse-web-core-count.md) — TRUE cores = navigator.hardwareConcurrency; OS.get_processor_count() UNDER-REPORTS
+- [Forest-fps ROOT](voxiverse-forest-fps-root.md) — #119 = FacetFarTrees 250ms UNCONDITIONAL rebuild PWM'd by credit cycle; FP_FAR_TREES_DELTA
+- [Mesa view-band SHIPPED](voxiverse-mesa-viewband.md) — PR #56 FP_APPLIED_VIEW_BAND; LESSON gate synthetics must model the ENGINE loadable set
+- [Forest snow precip-gate SHIPPED](voxiverse-forest-snow-warmskip.md) — PR #56 FP_SNOW_PRECIP_GATE; snow NOT the forest limiter
+- [Far-trees colorfix SHIPPED](voxiverse-far-trees-colorfix.md) — PR #55 GLES3 MM color-slot aliasing; gl_compat MM needs BOTH colors+custom
+- [Near-leaf cutout V2 SHIPPED](voxiverse-near-leaf-cutout.md) — PR #55; LAW: discard kills early-Z WRITE only — count draws before fill theory
+- [Grass-base backstop SHIPPED](voxiverse-grassbase-backstop.md) — PR #50 applied-cover ladder DEAD; FP_APPLIED_PROBE_SLAB
+- [Far-trees P0-P3 SHIPPED](voxiverse-far-trees-design.md) — trees-to-orbit PRs #51-54; ladder voxel→mesh→cards→fine-map
+- [Seam-slope weld ROOT](voxiverse-seam-slope-weld.md) — #112 seam floor step; BOTH datum flags on DOUBLES it; FP_SEAM_SLOPE_WELD
+- [Sharp-slope ladder+fall-under ROOT](voxiverse-sharp-slope-manifest-stale.md) — #111 = FP_MANIFEST_SLICE defers slope bake; FP_SLOPE_MANIFEST_HEAL
+- [Summit-stream priority SHIPPED](voxiverse-summit-stream-priority.md) — PR #46 anchor pins viewer to DATUM not ground; FP_SUMMIT_STREAM
+- [Far-over-near mountain blob ROOT](voxiverse-far-near-coverage.md) — #110 FacetOrbitRelief frozen un-sunk; FP_ORBIT_RELIEF_SURFACE_HIDE
+- [LOD-ladder smooth fix SHIPPED](voxiverse-lod-ladder-smooth.md) — PR #45 FP_M2_SMOOTH_DEFER + FP_M2_EDGE_DIST + FP_SMOOTH_V2_NEARFILL
+- [LOD-ladder mid-band ROOT](voxiverse-lod-ladder-midband.md) — #107 giant blocks = 26-blk BLOCKY backstop on live-pool facets
+- [Border shade weld SHIPPED](voxiverse-border-shade-weld.md) — PR #44 carve-sentinel material twin; LESSON dump served-pck flags
+- [NB junction weld ROOT](voxiverse-nb-junction-weld.md) — tilted slab = dead CORRECTION-2 latch; FP_NB_WELD
+- [Fast fresh-load SHIPPED](voxiverse-fast-load.md) — PRs #42/#43 FP_LOAD_DEFER + V2_PACE/ASYNC_MERGE
+- [Fast fresh-load design](voxiverse-fast-load-design.md) — pile-up = O(N²) commit + env/snow on main + controller inversion
+- [Neighbour-facet full-res SHIPPED](voxiverse-nb-fullres.md) — PR #41 FP_NB_FULLRES + 32MB ledger; FP_DEM_DEFER PR #40
+- [NB-FULLRES Phase C spec](voxiverse-nb-fullres-design.md) — get_statistics has NO memory counters (use get_stats().memory_pools.voxel_used)
+- [Stream-parallel design](voxiverse-stream-parallel-design.md) — fresh-reload 2-3min = G2 DEM main-thread duty-cycle; FP_DEM_DEFER/ASYNC + JobLane
+- [G3 orbit relief SHIPPED](voxiverse-orbit-relief-g3.md) — PR #39 FP_ORBIT_RELIEF; assert commit DURATION not rate
+- [Far skin BLOCK colour SHIPPED](voxiverse-far-skin-block-color.md) — PR #38 FP_SKIN_BLOCK_COLOR pure GDScript
+- [BG prebake design + ugly-facet ROOT](voxiverse-bg-prebake-design.md) — ugly facet = coarse-base fallback; FP_BG_PREBAKE governed pacer
+- [Tree bugs root-caused](voxiverse-tree-bugs-rootcause.md) — acacia no-collision = biome enum collision; canopy flip = gravity box vs rescaled facets
+- [Up-vector strip tilt ROOT](voxiverse-upvector-strip-tilt.md) — horizon cant = hysteresis-strip facet desync; FP_UPVECTOR_FACET_HEAL
+- [Floor/surface fall-through ROOT](voxiverse-floor-surface-root-cause.md) — cross-frame reads; FP_QUERY_FRAME_GUARD + FP_FLOOR_SURFACE_WELD
+- [Seam-mask theory FALSIFIED](voxiverse-seam-mask-fallthru-law.md) — LESSON parameter-fit to observed number is zero evidence
+- [Flight fall-through + dim sun SOLVED](voxiverse-flight-fallthrough-sun.md) — FP_DESCENT_FACET_RESYNC + FP_SUN_DISC_WARM
+- [Night terrain lit / red water SOLVED](voxiverse-night-terrain-centre.md) — shader assumed centre=origin → FP_NIGHT_TERRAIN_CENTRE
+- [Fall-through teleport SOLVED](voxiverse-fallthrough-loc-bug.md) — FP_TP_FLOOR_WELD; LESSON deploy_cheats.sh git-checkout-reverts cube_sphere.gd+remote_bridge.gd
+- [Orbit real-space fix](voxiverse-orbit-real-space.md) — star dome static-far collapse → FP_SKY_DSKY_ALT + FP_HUD_VACUUM_TEMP
+- [Seamless transition design](voxiverse-seamless-transition-design.md) — fly-up pop = viewer-child unload; FP_APPROACH_ANCHOR
+- [Textured LOD design](voxiverse-textured-lod-design.md) — far-skin pyramid (FP_SKIN_SSE, FP_SHADE_UNIFIED) V1-V4 SHIPPED
+- [Block-LOD design accepted](voxiverse-block-lod-design.md) — FacetBlockLod pyramid P0-P2 SHIPPED; LESSON never restart relay mid-session
+- [De-orbit phys fix](voxiverse-deorbit-phys-fix.md) — FP_ANALYTIC_COL_MEMO + FP_ENV_FALL_HOLD + FP_LAND_RAMP_HOLD
+- [Terminator sun-pop fix](voxiverse-terminator-sun-fix.md) — binary occ flip + dep(h) singularity → FP_TERM_SUN_CONT
+- [WebGPU-fork spike](voxiverse-webgpu-fork-spike.md) — module compat GREEN, overall YELLOW; real WebGPU+compute on web = RED
+- [Live-review 2026-07-20](voxiverse-live-review-2026-07-20.md) — user: keep smooth build, fix forward
+- [LOD texture feature](voxiverse-lod-texture.md) — per-facet baked textures; Phase 1 SHIPPED (FP_FACET_TEX)
+- [Fall-fps SOLVED](voxiverse-unattended-perf-2026-07-21.md) — floor_under cost ∝ altitude → FP_FALL_ATT_GATE + FP_FLOOR_BOUNDED/MEMO
+- [Re-entry blowup root cause](voxiverse-reentry-blowup.md) — fid/pose desync + FD-velocity latch; headless: --import first
+- [Facet seams root-caused](voxiverse-facet-seams.md) — seam cliffs = plane-datum step ∝R → FP_RADIAL_DATUM + FP_SHELL_WELD + One-Surface Law
+- [Space-fly self-test](voxiverse-spacefly-selftest.md) — injectable space-nav verbs + verify_spacefly + relay flight.mjs
+- [Atmo-sky design](voxiverse-atmo-sky-design.md) — 4 sky bugs (pck flag-dump technique) + A0-A6
+- [O4c SOI-swap + walkable Moon](voxiverse-o4c-soi-walk.md) — Earth↔Moon SOI handoff behind SOI_SWAP
+- [Climate W0-W4](voxiverse-climate-w0-w4.md) — bounded weather sim flags default-off
+- [Overnight 2026-07-19](voxiverse-overnight-2026-07-19.md) — 4-feature order (Moon, sky, weather, biomes)
+- [Two gravity systems](voxiverse-two-gravity-systems.md) — orbital uses gm_dyn (72× compressed); v_circ=569 b/s
+- [Orbital shell](voxiverse-orbital-shell.md) — far-side blank = camera-set POLICY (FP_SHELL_CAMERA_SET)
+- [SN1 orbital substrate](voxiverse-sn1-orbital-substrate.md) — FP_M3_ORBIT f64 kernel
+- [P1 sticky isolation](voxiverse-p1-sticky-isolation.md) — sticky-alone doesn't hitch
+- [Space-nav design](voxiverse-spacenav-design.md) — five-frame nav continuum over one BCI f64 state
+- [Post-port apply-bound](voxiverse-postport-applybound.md) — C++ port inverted bottleneck to main-thread apply; measure with ?frames=0
+- [Seamless scales](voxiverse-seamless-scales.md) — LOCKED: walk→fly→orbit ONE continuum, no impostor swap
+- [Gen class costs](voxiverse-gen-class-costs.md) — surface 46% + underground 51%; web ×25; L5 C++ port
+- [Streaming supply<demand](voxiverse-streaming-supply-demand.md) — LESSON never judge perf on stats conditioned on streaming state
+- [Orbital O1/O4 staging](voxiverse-orbital-o1o4-staging.md) — 6-stage orbit+Moon plan
+- [GPU headless testing](voxiverse-gpu-headless-testing.md) — no GPU on host; Xvfb+llvmpipe now, cloud-T4 later
+- [Remote-play bridge](voxiverse-remote-bridge.md) — `?remote=<token>` / Ctrl+Shift+F9 → relay telemetry.jsonl + frames
+- [Overnight plan 2026-07-16](voxiverse-overnight-plan.md) — on-planet mechanics via live loop, then 1:1000 orbital
+- [Mission control channel](voxiverse-mission-control.md) — Houston→rover P1-P3 security-audited
+- [Remote telemetry launch](voxiverse-remote-telemetry-launch.md) — token in tools/remote-bridge/.token; needs FP flags baked at export
+- [Godot migration decision](voxiverse-godot-migration.md) — 4.6+voxel1.6 AFTER FP-M2; dual-target Forward+
+- [Web perf architecture](voxiverse-web-perf-architecture.md) — GL-compat vsync ladder + far-ring re-emit bomb, NOT generation
+- [Walk-perf root cause](voxiverse-walk-perf-root-cause.md) — WASM dlmalloc convoy; fix = mimalloc + alloc diet
+- [Perf next-architecture](voxiverse-perf-next-architecture.md) — far-ring binary exclusion → underlay+bubble-mask
+- [Crossing phys spike](voxiverse-crossing-phys-spike.md) — crossing = PlanetRoot transform re-placing mesh blocks; FIXED-FRAME design
+- [Neighbour/underground direction](voxiverse-neighbour-underground-direction.md) — user: neighbours full-res; underground stone-fill + lazy exposure
+- [VOXIVERSE project](voxiverse-project.md) — locked spec + live deploy target
+- [VOXIVERSE long-term engine spec](voxiverse-engine-longterm-spec.md) — physical objects, voxel materials/states, per-voxel fields
+- [VOXIVERSE physics scale](voxiverse-physics-scale.md) — physics dormant-by-default
+- [Never-OOM web constraint](voxiverse-never-oom-web.md) — memory safety outranks visuals
+- [COSMOS corner-seam misalignment](voxiverse-corner-seam.md) — 90° turn on first flip = frame-rotation bug
+- [Web-testing host constraints](voxiverse-web-testing-host.md) — no GPU/sudo; rootless Playwright; real soak needs cloud T4
+- [FACETED planet pivot](voxiverse-faceted-planet.md) — piecewise-flat faceted planet FP0–FP-M2 SHIPPED
+- [Web TIME_PROCESS invalid](voxiverse-web-time-process-invalid.md) — TIME_PROCESS reads whole-frame on threaded web; use real deltas + p90
+- [Atlas draw-call staging](voxiverse-atlas-staging.md) — FP_ATLAS_MATERIAL Stage1+2 shipped
+- [L5(a) C++ worldgen port](voxiverse-l5a-cppgen.md) — SHIPPED byte-equal behind FP_CPPGEN (patch 0007), 8-20x native
+- [Tier depth-priority](voxiverse-tier-depth-priority.md) — far-ring-over-blocks = skew+staleness
+- [GDScript closure trap](voxiverse-gdscript-closure-trap.md) — verify drivers: inline loops, not lambdas
+- [FLAT gate import gotcha](voxiverse-flat-gate-import.md) — fresh worktree needs `godot --import` first
+- [ATMO2 design](voxiverse-atmo2-design.md) — night "artifact" IS the Sun; NO HDR on gl_compat
+- [Far-render overhaul](voxiverse-far-render-overhaul.md) — whole-planet fine map shipped; fine-bake wall → C++ bake
+- [C++ tile-bake + block-exact far](voxiverse-cpp-tile-bake-block-exact.md) — FP_CPP_TILE_BAKE (web WTP 1-thread root cause) + FP_SKIN_BLOCK_EXACT
+- [Far smooth-geometry ladder P0-P3](voxiverse-far-smooth-geometry.md) — far relief + lit + collar deployed; seams = node_at per-facet corners
+- [Far terminator day-lit-at-night ROOT](voxiverse-far-terminator.md) — RUNTIME sun_dir staleness; FP_FAR_TERMINATOR_WELD
+- [Far-GEOMETRY prebake design](voxiverse-far-geometry-prebake.md) — flat-from-orbit = shell under-sampled + unshaded; 7.5MB global DEM
+- [Far-render LOD ladder defects](voxiverse-far-lod-ladder-defects.md) — 2026-08-21 houses-vanish (FP_STRUCT_SHELL_BAND) + black facet seam (FP_V2_EDGE_APRON wip) + near/far colour step
+- [Deploy-cheats live-A/B pipeline](voxiverse-deploy-cheats-pipeline.md) — deploy_cheats.sh (scratchpad ONLY, not git) seds ~217 CS_FLAGS + env CLITE_FLAGS ON → export-web → deploy.sh --no-build → git-revert → curl-verify; source stays byte-off; new flag families ship ON via CLITE_FLAGS env per arm; GDScript-only = NO engine rebuild
+- [Ground-walk jerkiness near villages ROOT](voxiverse-ground-walk-perf.md) — 2026-08-30 walking near village median 150/max 378ms = far-tier (far-trees+far-structures) REBUILD churn every 2 blocks + credit-starvation (=SAME root as the LOD flicker); draws are a symptom; chunk-baking already done for near geom; cheap levers (INFLIGHT_GATE etc) all already ON; ~285ms of 378 UNATTRIBUTED → FP_WORST_FRAME_ATTR instr to break the ceiling, then unified far-tier move-churn-diet + credit-independent cross-faded handoff
+- [De-orbit shell re-emit ROOT + 3 rejects](voxiverse-deorbit-shell-reemit.md) — 2026-08-23/29 de-orbit knee stall (~2440ms @ alt 590) = far-ring shell OPENING from collapsed (applied_r 0→full) = class-0 GROWTH burst; 3 fixes measured-rejected (mimalloc-FIT heap, C-lite gen-gate no-benefit, shell-staging misses knee/class-0-exempt); real fix = pre-warm shell on descent OR don't collapse at orbit; UNSOLVED
+- [mimalloc-FIT build plumbing](voxiverse-mimalloc-fit-build.md) — 2026-08-23 arena_reserve 128→16 MiB build; FIT REJECTED on heap (peak 842MB); 3 silent-staleness traps guarded (baked-not-mounted build-engine.sh, emsdk unsets EM_CACHE, libmimalloc invisible to scons → git-clean keeps stale bin/*.wasm); verify fresh link via `Linking Program` + ~1m45s (not 5s/cache-retrieval)
+- [Orbit/fall perf: far-ring churn](voxiverse-orbit-perf-farring-churn.md) — 2026-08-21 ROOT = FacetFarRing SRC_UNSINK rebuild churn; P0 FP_UNSINK_DRIFT_CALM SHIPPED (fps 10→53); P2/P3/P5 in flight
+- [mimalloc re-A/B REJECTED](voxiverse-mimalloc-reab-rejected.md) — 2026-08-22 P6 heap +398MB over NEVER-OOM ceiling + no orbit win; dlmalloc stays; mechanism since corrected — see mimalloc-arena-root
+- [Prebake pacing/scoping P7 SHIPPED](voxiverse-prebake-pacing-p7.md) — 2026-08-22 FP_PREBAKE_VIEW_SCOPE + FP_PREBAKE_COAST_CAP; orbit worst frame 147→43ms; merged PR #79
+- [De-orbit fall instrumented](voxiverse-fall-instrumentation.md) — 2026-08-22 t_stream dominates descent; hot bands alt~700 + alt~70; scaled-body REFUTED; needs stepped profile or 10hz
+- [Fall stream-pace SHELVED](voxiverse-fall-stream-pace.md) — 2026-08-23 attempt-1 neutral (targeted t_stream tail not the gen flood); orbit-first fall methodology
+- [GEN-CONVOY Stage-1 patches + memnew-bypass](voxiverse-gen-convoy-stage1-patches.md) — 2026-08-30 probe+profs+prewarm patches (0003/0015/0016), recycler HELD for Build #2; memnew bypasses class operator new → alloc_static; git-ignored cache is volatile, use WORK-copy diff method
+- [Roadmap ⇄ board sync](roadmap-board-sync.md) — docs/ROADMAP.md and the GitHub Project board stay auto-synced (four-state model); run /roadmap-sync to reconcile.
+- [deploy_cheats CS+RB revert trap](voxiverse-deploy-cheats-cs-rb-revert-trap.md) — deploy_cheats.sh git-reverts cube_sphere.gd + remote_bridge.gd every run; UNCOMMITTED flags/consts there get WIPED → parse-error broken build (export exits 0 anyway); COMMIT flag defs + grep export log for "Parse Error"
